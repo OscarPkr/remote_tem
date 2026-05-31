@@ -266,7 +266,7 @@
   .shot .frame-dots { position: absolute; top: 10px; left: 12px; display: flex; gap: 5px; }
   .shot .frame-dots i { width: 8px; height: 8px; border-radius: 50%; background: #39414d; display: inline-block; }
 
-  /* Previews — expanding hover carousel that plays a video on hover */
+  /* Previews — expanding hover carousel that plays a video on hover/tap */
   .previews { display: flex; align-items: center; gap: 12px; height: 480px; max-width: 1000px; margin: 36px auto 0; }
   .preview-panel {
     position: relative; flex: 1 1 0; min-width: 0; height: 360px; overflow: hidden;
@@ -275,7 +275,7 @@
     transition: flex-grow .5s cubic-bezier(.2,.7,.2,1), height .5s cubic-bezier(.2,.7,.2,1), border-color .25s ease;
   }
   .previews:hover .preview-panel { flex-grow: 0.55; height: 300px; }
-  .preview-panel:hover, .preview-panel:focus-visible { flex-grow: 3.4 !important; height: 480px !important; border-color: var(--accent); }
+  .preview-panel:hover, .preview-panel:focus-visible, .preview-panel.is-active { flex-grow: 3.4 !important; height: 480px !important; border-color: var(--accent); }
   .preview-panel .ph {
     position: absolute; inset: 0; display: flex; flex-direction: column;
     align-items: center; justify-content: center; gap: 10px;
@@ -303,10 +303,11 @@
     white-space: normal; max-height: 0; opacity: 0; overflow: hidden;
     transition: max-height .4s ease, opacity .4s ease;
   }
-  .preview-panel:hover .label .desc, .preview-panel:focus-visible .label .desc { max-height: 64px; opacity: 1; }
+  .preview-panel:hover .label .desc, .preview-panel:focus-visible .label .desc, .preview-panel.is-active .label .desc { max-height: 64px; opacity: 1; }
   @media (max-width: 760px) {
-    .previews { flex-direction: column; height: auto; }
-    .preview-panel { height: 200px; flex: none; }
+    .previews { flex-direction: column; height: auto; touch-action: pan-y; }
+    .preview-panel { height: 190px; flex: none; width: 100%; }
+    .preview-panel.is-active { height: 280px !important; }
     .previews:hover .preview-panel, .preview-panel:hover { flex: none !important; }
     .preview-panel .label .desc { max-height: 64px; opacity: 1; }
   }
@@ -579,13 +580,13 @@
     </div>
   </section>
 
-  <!-- PREVIEWS — hover to expand + play -->
+  <!-- PREVIEWS — hover/tap to expand + play -->
   <section id="previews">
     <div class="wrap">
       <div class="center">
         <div class="eyebrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>See it in action</div>
-        <h2 class="h">Hover to take a closer look</h2>
-        <p class="sub center">Each panel expands and plays its preview when you hover it.</p>
+        <h2 class="h">Hover or tap to take a closer look</h2>
+        <p class="sub center">Each panel expands and plays its preview when you hover or tap it. Swipe on mobile to move through them.</p>
       </div>
       <div class="previews">
         <div class="preview-panel" tabindex="0">
@@ -771,22 +772,70 @@
       }
     })();
 
-    // Previews: hovering a panel expands it (CSS) and plays its video; the
+    // Previews: hovering/tapping a panel expands it (CSS) and plays its video; the
     // video only becomes visible once it actually starts playing, so missing
     // files just leave the labeled placeholder.
     (function () {
-      document.querySelectorAll('.preview-panel').forEach(function (p) {
+      var panels = [].slice.call(document.querySelectorAll('.preview-panel'));
+      if (!panels.length) return;
+      var active = -1;
+      function playPanel(p) {
         var v = p.querySelector('video');
         if (!v) return;
-        v.addEventListener('playing', function () { p.classList.add('has-video'); });
-        v.addEventListener('pause', function () { /* keep last frame */ });
-        var play = function () { var pr = v.play(); if (pr && pr.catch) pr.catch(function () {}); };
-        p.addEventListener('mouseenter', play);
-        p.addEventListener('focus', play);
-        p.addEventListener('mouseleave', function () { v.pause(); });
-        p.addEventListener('blur', function () { v.pause(); });
-        p.addEventListener('click', function () { if (v.paused) play(); else v.pause(); });
+        var pr = v.play();
+        if (pr && pr.catch) pr.catch(function () {});
+      }
+      function pausePanel(p) {
+        var v = p.querySelector('video');
+        if (v) v.pause();
+      }
+      function setActive(i, shouldPlay) {
+        active = (i + panels.length) % panels.length;
+        panels.forEach(function (panel, k) {
+          var on = k === active;
+          panel.classList.toggle('is-active', on);
+          panel.setAttribute('aria-expanded', on ? 'true' : 'false');
+          if (!on) pausePanel(panel);
+        });
+        if (shouldPlay !== false) playPanel(panels[active]);
+      }
+      panels.forEach(function (p, i) {
+        var v = p.querySelector('video');
+        if (v) {
+          v.addEventListener('playing', function () { p.classList.add('has-video'); });
+          v.addEventListener('pause', function () { /* keep last frame */ });
+        }
+        p.setAttribute('aria-expanded', 'false');
+        p.addEventListener('mouseenter', function () { setActive(i); });
+        p.addEventListener('focus', function () { setActive(i); });
+        p.addEventListener('mouseleave', function () {
+          if (!window.matchMedia || !window.matchMedia('(hover: none)').matches) {
+            p.classList.remove('is-active');
+            p.setAttribute('aria-expanded', 'false');
+            pausePanel(p);
+          }
+        });
+        p.addEventListener('blur', function () { pausePanel(p); });
+        p.addEventListener('click', function () { setActive(i); });
       });
+      var strip = document.querySelector('.previews');
+      var sx = null, sy = null;
+      if (strip) {
+        strip.addEventListener('touchstart', function (e) {
+          if (!e.touches.length) return;
+          sx = e.touches[0].clientX;
+          sy = e.touches[0].clientY;
+        }, { passive: true });
+        strip.addEventListener('touchend', function (e) {
+          if (sx === null || sy === null || !e.changedTouches.length) return;
+          var dx = e.changedTouches[0].clientX - sx;
+          var dy = e.changedTouches[0].clientY - sy;
+          if (Math.abs(dx) > 42 && Math.abs(dx) > Math.abs(dy) * 1.25) {
+            setActive((active < 0 ? 0 : active) + (dx < 0 ? 1 : -1));
+          }
+          sx = sy = null;
+        }, { passive: true });
+      }
     })();
 
     // Domino reveal: fade/slide each section in as it scrolls into view.
