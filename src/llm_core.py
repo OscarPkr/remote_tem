@@ -142,9 +142,24 @@ ANTHROPIC_MODELS = [
 
 def _detect_provider(url: str) -> str:
     """Detect API provider from URL."""
-    if "anthropic.com" in (url or ""):
+    u = (url or "").lower()
+    if "anthropic.com" in u:
         return "anthropic"
+    if "openrouter.ai" in u:
+        return "openrouter"
+    if "groq.com" in u:
+        return "groq"
     return "openai"
+
+
+def _provider_headers(provider: str, headers: Optional[Dict] = None) -> Dict[str, str]:
+    h = {"Content-Type": "application/json"}
+    if isinstance(headers, dict):
+        h.update(headers)
+    if provider == "openrouter":
+        h.setdefault("HTTP-Referer", "https://github.com/pewdiepie-archdaemon/odysseus")
+        h.setdefault("X-OpenRouter-Title", "Odysseus")
+    return h
 
 
 def _provider_label(url: str) -> str:
@@ -423,7 +438,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
              max_tokens: int = LLMConfig.DEFAULT_MAX_TOKENS, headers: Optional[Dict] = None, 
              timeout: int = LLMConfig.DEFAULT_TIMEOUT, prompt_type: Optional[str] = None) -> str:
     """Synchronous LLM call with optional prompt type enhancement."""
-    h = {"Content-Type": "application/json"}
+    h = _provider_headers(_detect_provider(url))
     # Tolerate headers that arrive as a JSON string (some sessions stored them
     # double-encoded) — otherwise h.update() throws "dictionary update sequence
     # element #0 has length 1; 2 is required".
@@ -570,9 +585,7 @@ async def llm_call_async(
         payload = _build_anthropic_payload(model, messages_copy, temperature, max_tokens)
     else:
         target_url = url
-        h = {"Content-Type": "application/json"}
-        if headers:
-            h.update(headers)
+        h = _provider_headers(provider, headers)
         payload = {
             "model": model,
             "messages": messages_copy,
@@ -667,16 +680,15 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
             "messages": messages_copy,
             "temperature": temperature,
             "stream": True,
-            "stream_options": {"include_usage": True},
         }
+        if provider not in {"openrouter", "groq"}:
+            payload["stream_options"] = {"include_usage": True}
         if max_tokens and max_tokens > 0:
             tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model) else "max_tokens"
             payload[tok_key] = max_tokens
         if tools:
             payload["tools"] = tools
-        h = {"Content-Type": "application/json"}
-        if headers:
-            h.update(headers)
+        h = _provider_headers(provider, headers)
 
     # Short connect timeout: a reachable peer answers SYN in <100ms even on
     # Tailscale. 3s is plenty; 30s let one dead upstream wedge the UI.
