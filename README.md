@@ -109,6 +109,9 @@ uvicorn app:app --host 0.0.0.0 --port 7000
 ```
 
 ### Option 3: Manual install — Windows (PowerShell)
+Windows support is not actively tested. Use it with caution; Docker on Linux
+or a Linux/macOS manual install is the safer path for now.
+
 ```powershell
 git clone <your-odysseus-repo-url>
 cd odysseus
