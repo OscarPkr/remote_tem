@@ -12,6 +12,10 @@ services:
       # Cookbook local model cache. Inside Docker, "Local" means the Odysseus
       # container, so persist its HuggingFace cache under ./data/huggingface.
       - ./data/huggingface:/app/.cache/huggingface
+    extra_hosts:
+      # Lets the container reach local services on the Docker host, including
+      # Ollama at http://host.docker.internal:11434.
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
@@ -38,7 +42,7 @@ services:
   chromadb:
     image: chromadb/chroma:latest
     ports:
-      - "8100:8000"
+      - "${CHROMADB_BIND:-127.0.0.1}:8100:8000"
     volumes:
       - chromadb-data:/chroma/chroma
     environment:
@@ -66,11 +70,11 @@ services:
     image: binwiederhier/ntfy
     command: serve
     ports:
-      - "8091:80"
+      - "${NTFY_BIND:-127.0.0.1}:8091:80"
     volumes:
       - ntfy-cache:/var/cache/ntfy
     environment:
-      - NTFY_BASE_URL=http://localhost:8091
+      - NTFY_BASE_URL=${NTFY_BASE_URL:-http://localhost:8091}
     restart: unless-stopped
 
 volumes:

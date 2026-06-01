@@ -160,6 +160,7 @@ def _provider_label(url: str) -> str:
     if "googleapis.com" in u or "generativelanguage" in u: return "Google"
     if "together.xyz" in u or "together.ai" in u: return "Together"
     if "fireworks.ai" in u: return "Fireworks"
+    if "ollama" in u or ":11434" in u: return "Ollama"
     if "localhost" in u or "127.0.0.1" in u: return "local endpoint"
     try:
         from urllib.parse import urlparse
@@ -375,8 +376,20 @@ def list_model_ids(base_chat_url: str, timeout: int = LLMConfig.DEFAULT_TIMEOUT,
             h.update(headers)
         r = httpx.get(base_chat_url.replace("/chat/completions", "/models"), headers=h, timeout=timeout)
         r.raise_for_status()
-        return [m.get("id") for m in (r.json().get("data") or []) if m.get("id")]
+        data = r.json()
+        ids = [m.get("id") for m in (data.get("data") or []) if m.get("id")]
+        if ids:
+            return ids
+        return [m.get("name") or m.get("model") for m in (data.get("models") or []) if m.get("name") or m.get("model")]
     except Exception:
+        try:
+            if ":11434" in base_chat_url or "ollama" in base_chat_url.lower():
+                root = base_chat_url.replace("/v1/chat/completions", "").replace("/chat/completions", "").rstrip("/")
+                r = httpx.get(root + "/api/tags", timeout=timeout)
+                r.raise_for_status()
+                return [m.get("name") or m.get("model") for m in (r.json().get("models") or []) if m.get("name") or m.get("model")]
+        except Exception:
+            pass
         return []
 
 def normalize_model_id(endpoint_url: str, requested: str, timeout: int = LLMConfig.DEFAULT_TIMEOUT) -> Optional[str]:

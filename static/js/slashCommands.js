@@ -823,7 +823,7 @@ async function _cmdSessionNew(args, ctx) {
     } catch (e) { /* ignore */ }
   }
   if (!endpointUrl || !model) {
-    slashReply('No model available — pick one from the sidebar or run <code>/setup</code> to configure an endpoint');
+    slashReply('No model available — open the model picker and use the <code>+</code> button to add a model endpoint.');
     return true;
   }
 

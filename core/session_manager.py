@@ -308,10 +308,46 @@ class SessionManager:
             if not cached.history and getattr(cached, "message_count", 0) > 0:
                 self._load_session_from_db(session_id)
 
+        # Keep model/endpoint metadata fresh. Endpoint deletion can clear the
+        # DB row while a session object is still cached in RAM.
+        self.sync_session_metadata(session_id)
+
         # Update last_accessed
         self._touch_session(session_id)
 
         return self.sessions[session_id]
+
+    def sync_session_metadata(self, session_id: str) -> bool:
+        """Refresh non-message session fields from the DB into the cached object."""
+        session = self.sessions.get(session_id)
+        if session is None:
+            return False
+        db = SessionLocal()
+        try:
+            db_session = db.query(DbSession).filter(DbSession.id == session_id).first()
+            if db_session is None:
+                return False
+            headers = db_session.headers
+            if isinstance(headers, str):
+                try:
+                    headers = json.loads(headers)
+                except json.JSONDecodeError:
+                    headers = {}
+            session.name = db_session.name
+            session.endpoint_url = db_session.endpoint_url or ""
+            session.model = db_session.model or ""
+            session.headers = headers or {}
+            session.rag = db_session.rag
+            session.archived = db_session.archived
+            session.owner = getattr(db_session, "owner", None)
+            session.is_important = getattr(db_session, "is_important", False) or False
+            session.message_count = getattr(db_session, "message_count", session.message_count) or 0
+            return True
+        except Exception as e:
+            logger.error(f"Error syncing session metadata {session_id}: {e}")
+            return False
+        finally:
+            db.close()
 
     def _load_session_from_db(self, session_id: str):
         """Hydrate a single session (with messages) from the database."""
