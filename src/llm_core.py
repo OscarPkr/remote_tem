@@ -357,6 +357,19 @@ def _parse_anthropic_response(data: dict) -> str:
             return block.get("text", "")
     return ""
 
+
+def _sanitize_llm_messages(messages: List[Dict]) -> List[Dict]:
+    """Strip Odysseus-only metadata before sending messages to providers."""
+    allowed = {"role", "content", "name", "tool_call_id", "tool_calls", "function_call"}
+    cleaned = []
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        item = {k: v for k, v in msg.items() if k in allowed and v is not None}
+        if "role" in item and "content" in item:
+            cleaned.append(item)
+    return cleaned
+
 def _normalize_anthropic_url(url: str) -> str:
     """Ensure Anthropic URL points to /v1/messages."""
     url = url.rstrip("/")
@@ -422,7 +435,7 @@ def llm_call(url: str, model: str, messages: List[Dict], temperature: float = LL
     if isinstance(headers, dict):
         h.update(headers)
 
-    messages_copy = [msg.copy() for msg in messages]
+    messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.
     sys_parts = []
@@ -530,7 +543,7 @@ async def llm_call_async(
 ) -> str:
     """Asynchronous LLM call using httpx with connection pooling, timeout, retry logic, and performance logging."""
     provider = _detect_provider(url)
-    messages_copy = [msg.copy() for msg in messages]
+    messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.
     sys_parts = []
@@ -627,7 +640,7 @@ async def stream_llm(url: str, model: str, messages: List[Dict], temperature: fl
       - data: [DONE]                       — end of stream
     """
     provider = _detect_provider(url)
-    messages_copy = [msg.copy() for msg in messages]
+    messages_copy = _sanitize_llm_messages(messages)
 
     # Consolidate multiple system messages into one at the start.
     # Some models (e.g. Qwen3.5) reject system messages that aren't first.
