@@ -46,7 +46,7 @@ generated and printed on first boot).
 
 ### Option 1: Docker (recommended)
 ```bash
-git clone <your-odysseus-repo-url>
+git clone https://github.com/pewdiepie-archdaemon/odysseus.git
 cd odysseus
 cp .env.example .env       # optional, but recommended for explicit defaults
 docker compose up -d --build
@@ -99,7 +99,7 @@ sudo dnf install tmux
 
 Then install Odysseus:
 ```bash
-git clone <your-odysseus-repo-url>
+git clone https://github.com/pewdiepie-archdaemon/odysseus.git
 cd odysseus
 python3 -m venv venv
 source venv/bin/activate
@@ -113,7 +113,7 @@ Windows support is not actively tested. Use it with caution; Docker on Linux
 or a Linux/macOS manual install is the safer path for now.
 
 ```powershell
-git clone <your-odysseus-repo-url>
+git clone https://github.com/pewdiepie-archdaemon/odysseus.git
 cd odysseus
 python -m venv venv
 venv\Scripts\Activate.ps1
