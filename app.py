@@ -54,7 +54,17 @@ app.add_middleware(
     allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Accept",
+        "Authorization",
+        "Content-Type",
+        "X-API-Key",
+        "X-Auth-Token",
+        "X-Odysseus-Internal-Token",
+        "X-Odysseus-Owner",
+        "X-Requested-With",
+        "X-TZ-Offset",
+    ],
 )
 
 # ========= SECURITY HEADERS MIDDLEWARE =========
