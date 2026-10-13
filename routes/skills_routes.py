@@ -21,6 +21,7 @@ from services.memory.skills import SkillsManager
 from src.auth_helpers import get_current_user
 from src.prompt_security import untrusted_context_message
 from src.text_helpers import strip_closed_think_blocks
+from src.utility_effort import effort_for_call
 from core.middleware import require_admin
 
 logger = logging.getLogger(__name__)
@@ -170,7 +171,7 @@ async def _eval_skill_run(skill_md: str, task: str, transcript: str,
                           baseline_transcript: str = "",
                           skill_stats: Optional[dict] = None,
                           baseline_stats: Optional[dict] = None,
-                          workload: str = "foreground") -> dict:
+                          workload: str = "foreground", owner: Optional[str] = None) -> dict:
     """LLM-as-judge: grade a skill test run from its transcript. Advisory only.
 
     Robust against local reasoning models (strips <think>, lenient JSON,
@@ -349,6 +350,7 @@ async def _eval_skill_run(skill_md: str, task: str, transcript: str,
                 url, model, msgs,
                 temperature=0.1, max_tokens=32768, headers=headers, timeout=180,
                 workload=workload,
+                reasoning_effort=effort_for_call(url, model, owner),
             )
         except Exception as e:
             # Don't give up on a transient first-attempt error — let the second
@@ -368,7 +370,7 @@ async def _eval_skill_run(skill_md: str, task: str, transcript: str,
 
 async def _eval_skill_necessity(skill_md: str, others: list, url: str, model: str,
                                 headers: Optional[dict],
-                                workload: str = "foreground") -> Optional[dict]:
+                                workload: str = "foreground", owner: Optional[str] = None) -> Optional[dict]:
     """Advisory judge: is this skill worth keeping, or is it redundant / trivially
     unnecessary? Sees the OTHER skills' names+descriptions so it can spot
     duplicates. Returns {necessary, redundant_with, reason} or None. Never acts —
@@ -401,6 +403,7 @@ async def _eval_skill_necessity(skill_md: str, others: list, url: str, model: st
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_msg}],
             temperature=0.1, max_tokens=8192, headers=headers, timeout=120,
             workload=workload,
+            reasoning_effort=effort_for_call(url, model, owner),
         )
     except Exception as e:
         logger.warning(f"Necessity check failed: {e}")
@@ -453,7 +456,7 @@ def _should_check_retrieval_precision(skill: dict) -> bool:
 async def _eval_skill_retrieval_precision(skill_md: str, others: list,
                                           url: str, model: str,
                                           headers: Optional[dict],
-                                          workload: str = "foreground") -> Optional[dict]:
+                                          workload: str = "foreground", owner: Optional[str] = None) -> Optional[dict]:
     """Advisory judge: would this skill's metadata make retrieval over-select it?
 
     This is distinct from "does the procedure work?". It asks whether tags,
@@ -491,6 +494,7 @@ async def _eval_skill_retrieval_precision(skill_md: str, others: list,
             [{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_msg}],
             temperature=0.1, max_tokens=4096, headers=headers, timeout=90,
             workload=workload,
+            reasoning_effort=effort_for_call(url, model, owner),
         )
     except Exception as e:
         logger.warning(f"Retrieval precision check failed: {e}")
@@ -667,6 +671,7 @@ async def _run_skill_test_job(
             baseline_transcript=baseline_transcript,
             skill_stats=skill_stats,
             baseline_stats=baseline_stats,
+            owner=owner,
         )
     except Exception as e:
         job["verdict"] = {"verdict": "unknown", "confidence": 0, "summary": f"Eval failed: {e}", "issues": []}
@@ -1157,12 +1162,13 @@ async def _run_skill_test_once(md: str, task: str, url, model, headers, owner,
         headers,
         skill_stats=stats,
         workload=workload,
+        owner=owner,
     )
     return text, verdict
 
 
 async def _improve_skill_md(skill_md: str, verdict: dict, transcript: str, url, model, headers,
-                            workload: str = "foreground"):
+                            workload: str = "foreground", owner: Optional[str] = None):
     """Have a model rewrite SKILL.md to fix the reviewer's issues. Returns the
     corrected markdown, or None if it couldn't produce a usable change."""
     import re as _re
@@ -1192,7 +1198,8 @@ async def _improve_skill_md(skill_md: str, verdict: dict, transcript: str, url, 
                                    [{"role": "system", "content": sys_prompt},
                                     {"role": "user", "content": user_msg}],
                                    temperature=0.2, max_tokens=16384, headers=headers, timeout=180,
-                                   workload=workload)
+                                   workload=workload,
+                                   reasoning_effort=effort_for_call(url, model, owner))
     except Exception as e:
         logger.warning(f"Audit: improve call failed: {e}")
         return None
@@ -1262,6 +1269,7 @@ async def _audit_one_skill(skills_manager, skill, url, model, headers,
         ]
         nec = await _eval_skill_necessity(
             md, others, url, model, headers, workload=workload,
+            owner=owner,
         )
         if nec is not None:
             skills_manager.set_necessity(name, nec.get("necessary", True),
@@ -1278,6 +1286,7 @@ async def _audit_one_skill(skills_manager, skill, url, model, headers,
         if _should_check_retrieval_precision(skill):
             rp = await _eval_skill_retrieval_precision(
                 md, others, url, model, headers, workload=workload,
+                owner=owner,
             )
             if rp and not rp.get("ok"):
                 issues = rp.get("issues") or ["metadata: retrieval: narrow tags and when_to_use to the intended trigger"]
@@ -1288,7 +1297,7 @@ async def _audit_one_skill(skills_manager, skill, url, model, headers,
                     "summary": rp.get("summary") or "Retrieval metadata is too broad.",
                     "issues": issues,
                 }, "Retrieval audit only: the procedure may work, but matching metadata is too broad.",
-                    url, model, headers, workload=workload)
+                    url, model, headers, workload=workload, owner=owner)
                 if fixed and fixed.strip() != md.strip() and _apply_skill_md(skills_manager, name, fixed, owner):
                     md = fixed
                     refreshed = next((s for s in skills_manager.load(owner=owner) if s.get("name") == name), None)
@@ -1364,6 +1373,7 @@ async def _audit_one_skill(skills_manager, skill, url, model, headers,
             skill_stats=skill_stats,
             baseline_stats=baseline_stats,
             workload=workload,
+            owner=owner,
         )
     v = verdict.get("verdict")
     log(f"{name}: verdict = {v} ({verdict.get('summary', '')[:80]})")
@@ -1397,6 +1407,7 @@ async def _audit_one_skill(skills_manager, skill, url, model, headers,
             log(f"{name}: pass, but fixing {len(meta_issues)} metadata issue(s)…")
             fixed = await _improve_skill_md(
                 md, verdict, transcript, url, model, headers, workload=workload,
+                owner=owner,
             )
             if fixed and fixed.strip() != md.strip():
                 _apply_skill_md(skills_manager, name, fixed, owner)
@@ -1430,6 +1441,7 @@ async def _audit_one_skill(skills_manager, skill, url, model, headers,
     log(f"{name}: self-editing to fix issues…")
     new_md = await _improve_skill_md(
         md, verdict, transcript, url, model, headers, workload=workload,
+        owner=owner,
     )
     if new_md and new_md.strip() != md.strip() and _apply_skill_md(skills_manager, name, new_md, owner):
         md = new_md
@@ -1464,6 +1476,7 @@ async def _audit_one_skill(skills_manager, skill, url, model, headers,
         log(f"{name}: teacher {t_model} rewriting the skill…")
         t_md = await _improve_skill_md(
             md, verdict, transcript, t_url, t_model, t_headers, workload=workload,
+            owner=owner,
         )
         if t_md and t_md.strip() != md.strip() and _apply_skill_md(skills_manager, name, t_md, owner):
             md = t_md
