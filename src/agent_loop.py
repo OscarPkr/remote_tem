@@ -14423,6 +14423,7 @@ def _build_system_prompt(
     suppress_skills: bool = False,
     active_email: Optional[Dict[str, str]] = None,
     workspace: Optional[str] = None,
+    endpoint_url: Optional[str] = None,
     client_runtime_context: Optional[Dict[str, Any]] = None,
     preserve_conversation: bool = False,
 ) -> List[Dict]:
@@ -14524,6 +14525,7 @@ def _build_system_prompt(
             mcp_disabled_map=mcp_disabled_map, compact=compact, owner=owner,
             suppress_local_context=suppress_local_context,
             suppress_skills=suppress_skills,
+            endpoint_url=endpoint_url,
         )
     else:
         agent_prompt, _skill_index_block = _build_base_prompt(
@@ -14536,6 +14538,7 @@ def _build_system_prompt(
             owner=owner,
             suppress_local_context=suppress_local_context,
             suppress_skills=suppress_skills,
+            endpoint_url=endpoint_url,
         )
         if not active_document:
             _cached_base_prompt = agent_prompt
@@ -15214,6 +15217,7 @@ def _build_base_prompt(
     owner: Optional[str] = None,
     suppress_local_context: bool = False,
     suppress_skills: bool = False,
+    endpoint_url: Optional[str] = None,
 ):
     """Build the agent prompt with only relevant tools included.
 
@@ -15272,7 +15276,11 @@ def _build_base_prompt(
             from src.constants import DATA_DIR
             _sm = SkillsManager(DATA_DIR)
             active_tools = list(set(TOOL_SECTIONS.keys()) - set(disabled or []))
-            skill_idx = _sm.index_for(owner=owner, active_toolsets=active_tools)
+            skill_idx = _sm.index_for(
+                owner=owner,
+                active_toolsets=active_tools,
+                local_model=bool(endpoint_url) and is_local_endpoint(endpoint_url),
+            )
             if skill_idx:
                 lines = ["## Available skills",
                          "Procedures the assistant should consult before doing domain work. "
@@ -24303,6 +24311,7 @@ async def stream_agent_loop(
                 active_email=active_email,
                 workspace=workspace,
                 client_runtime_context=client_runtime_context,
+                endpoint_url=candidate_url,
             )
         # The request user turn is authoritative and must never disappear
         # while rebuilding the route prompt.  Some native terminal requests
