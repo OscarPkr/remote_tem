@@ -1,7 +1,8 @@
 """One presentation gate between agent execution and externally visible prose.
 
-Tool, progress and interaction events stay live. Answer deltas are held until
-the generator unwinds so a later replacement cannot conceal an earlier false
+Tool, progress and interaction events stay live. Evidence-safe complete
+sentences from ordinary answers may stream before the terminal check; execution
+answers remain gated so a later replacement cannot conceal an earlier false
 claim. This consumes no provider calls. Cancellation closes the inner generator
 under the same journal/turn authority; it never emits a successful terminal event.
 """
@@ -123,7 +124,7 @@ def _supported_prose(text: str, ledger: EvidenceLedger, decision: CompletionDeci
                         or not ledger._supports_verifier_claim(identities, paths)):
                     why = 'no current passing executable verification supports the claim'
             elif claim == 'mutation':
-                if not ledger._supports_artifact_claim(EvidenceKind.ARTIFACT_MUTATION, paths):
+                if not ledger._supports_mutation_claim(paths):
                     why = 'no matching artifact mutation supports the execution claim'
             elif claim == 'execution':
                 # A generic assertion cannot be tied confidently to a receipt.
@@ -165,6 +166,16 @@ def _disclosure(answer: str, ledger: EvidenceLedger) -> str:
     if not summary:
         return ''
     return ('\n\n' + summary) if answer.strip() else summary
+
+
+def _complete_prose_prefix(text: str) -> str:
+    """Return complete statement segments, keeping the current sentence pending."""
+    statements = list(_unquoted_statements(text))
+    if not statements:
+        return ''
+    if statements[-1][0].strip():
+        statements.pop()
+    return ''.join(statement for statement, _ in statements)
 
 
 def _completion_answer(text: str, ledger: EvidenceLedger, decision: CompletionDecision) -> tuple[str, str]:
@@ -232,6 +243,10 @@ def with_completion_gate(func):
         journal.effects = (parent.effects if parent is not None and parent.effects is not None
                            else EffectLog(journal.run_id))
         answer_events: list[dict] = []
+        streamed_answer_events: set[int] = set()
+        streamed_safe_text = ''
+        stream_conflict = False
+        first_visible_answer_at = None
         metrics_events: list[dict] = []
         answer = ''
         has_final = False
@@ -297,18 +312,36 @@ def with_completion_gate(func):
                             first_answer_at = perf_counter()
                         # Boolean thinking=True marks a reasoning-only delta;
                         # a textual thinking companion must not hide an answer
-                        # delta. Both shapes remain buffered until the gate.
+                        # delta. Thinking remains buffered until terminal review.
                         if isinstance(data.get('thinking'), str):
-                            answer_events.append({'delta': data['thinking'], 'thinking': True})
+                            thinking_event = {'delta': data['thinking'], 'thinking': True}
+                            answer_events.append(thinking_event)
                             data = {key: value for key, value in data.items() if key != 'thinking'}
                             if 'delta' not in data:
                                 continue
                         if data.get('thinking') is not True and 'delta' in data:
                             if has_final:
+                                stream_conflict |= bool(streamed_safe_text)
+                                streamed_safe_text = ''
                                 answer = ''
                                 has_final = False
                             answer += str(data.get('delta') or '')
                         answer_events.append(data)
+                        if data.get('thinking') is not True and 'delta' in data \
+                                and not _execution_obligation(requirements):
+                            prefix = _complete_prose_prefix(answer)
+                            if prefix:
+                                ledger_now = _ledger(journal, requirements)
+                                decision_now = ledger_now.evaluate(exhausted=exhausted, awaiting_user=awaiting)
+                                safe_prefix, _ = _supported_prose(prefix, ledger_now, decision_now)
+                                if safe_prefix.startswith(streamed_safe_text):
+                                    delta = safe_prefix[len(streamed_safe_text):]
+                                    if delta:
+                                        first_visible_answer_at = first_visible_answer_at or perf_counter()
+                                        yield _event({'delta': delta})
+                                        streamed_safe_text = safe_prefix
+                                elif streamed_safe_text:
+                                    stream_conflict = True
                         continue
                     yield chunk
             if provider_error and not answer_events and not metrics_events:
@@ -361,7 +394,10 @@ def with_completion_gate(func):
             disclosure_only = bool(disclosure) and not (presentation_replaced or reason or unsafe_draft
                                                         or filtered_answer != answer)
             replaced_answer = not disclosure_only and bool(
-                presentation_replaced or reason or unsafe_draft or safe_answer != answer)
+                presentation_replaced or reason or unsafe_draft or safe_answer != answer or stream_conflict
+                or (provider_error and streamed_safe_text))
+            if streamed_safe_text and not answer.startswith(streamed_safe_text):
+                replaced_answer = True
             if replaced_answer:
                 reasoning = [event for event in answer_events if event.get('thinking') is True]
                 _, unsafe_reasoning = completion_answer(
@@ -369,11 +405,31 @@ def with_completion_gate(func):
                     replace(presentation_decision, can_complete=True))
                 if not unsafe_reasoning:
                     for event in reasoning:
-                        yield _event(event)
-                yield _event({'type': 'final_response', 'content': safe_answer})
+                        if id(event) not in streamed_answer_events:
+                            yield _event(event)
+                yield _event({
+                    'type': 'final_response',
+                    'content': safe_answer,
+                    'render_owner': 'streamed',
+                    'replacement_scope': 'turn',
+                })
             else:
                 for event in answer_events:
-                    yield _event(event)
+                    if event.get('thinking') is True:
+                        if id(event) not in streamed_answer_events:
+                            streamed_answer_events.add(id(event))
+                            first_visible_answer_at = first_visible_answer_at or perf_counter()
+                            yield _event(event)
+                    elif event.get('type') == 'final_response':
+                        if streamed_safe_text:
+                            event = {**event, 'replacement_scope': 'turn'}
+                        first_visible_answer_at = first_visible_answer_at or perf_counter()
+                        yield _event(event)
+                if not has_final:
+                    remainder = answer[len(streamed_safe_text):] if answer.startswith(streamed_safe_text) else answer
+                    if remainder:
+                        first_visible_answer_at = first_visible_answer_at or perf_counter()
+                        yield _event({'delta': remainder})
                 if disclosure_only:
                     yield _event({'delta': disclosure})
             if provider_error:
@@ -386,8 +442,11 @@ def with_completion_gate(func):
                 if ledger.effects:
                     metadata['effect_assessments'] = [entry['assessment'].to_dict() for entry in ledger.effects]
                 metadata['completion_gate'] = {
-                    'buffer_seconds': released_at - first_answer_at if first_answer_at is not None else 0,
-                    'first_visible_answer_seconds': released_at - started,
+                    'buffer_seconds': max(0, (first_visible_answer_at or released_at) - first_answer_at)
+                    if first_answer_at is not None else 0,
+                    'evaluation_seconds': released_at - first_answer_at if first_answer_at is not None else 0,
+                    'first_visible_answer_seconds': first_visible_answer_at - started
+                    if first_visible_answer_at is not None else 0,
                     'additional_provider_calls': 0,
                     'answer_replaced': replaced_answer,
                 }

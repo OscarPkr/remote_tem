@@ -329,6 +329,30 @@ def test_conversational_request_wrappers_preserve_explicit_family(message, expec
 
 
 @pytest.mark.parametrize("message", [
+    "30-day task + protocol doc",
+    "I wanna work on a project where I test meditation for 30 days. But I test my brain activity before and after so I can compare.",
+    "Protocol doc only",
+    "Make a 30-day meditation plan",
+    "help me build a habit tracker for the project",
+])
+def test_bare_project_task_noun_does_not_inject_task_tools(message):
+    # A project description that merely contains the noun "task" must not offer
+    # the background-task scheduler or let the model auto-create a task.
+    assert "tasks" not in requested_capabilities(message)
+    assert selected_tools_for_request(message) != frozenset({"manage_tasks"})
+
+
+@pytest.mark.parametrize("message", [
+    "Create a task to call the dentist",
+    "List my scheduled tasks",
+    "show me my automations",
+    "what scheduled tasks do i have?",
+])
+def test_explicit_task_management_still_routes_to_tasks(message):
+    assert "tasks" in requested_capabilities(message)
+
+
+@pytest.mark.parametrize("message", [
     "can u also pop the notes panel open for me?",
     "k leave it for now - also pop open the calendar panel",
 ])
@@ -4413,3 +4437,12 @@ def test_chinese_video_to_image_artifact_keeps_media_and_workspace_tools():
         "请完整浏览 /workspace/input/video.mp4，为每款零食截图并拼成清单图，"
         "输出到 /workspace/snack_checklist.jpg，交付前打开成品图检查。"
     ) == {"media_inspection", "shell_files"}
+
+
+def test_named_shell_selects_shell_family_even_for_a_bare_command():
+    # An explicitly named shell is a request to use the shell even when the
+    # rest of the message is a bare/typo'd command; admission must match the
+    # always-offered bash tool.
+    assert requested_capabilities("Bash commabd Ls la") == {"shell_files"}
+    assert requested_capabilities("bash ls") == {"shell_files"}
+    assert requested_capabilities("use the terminal to show me the files") == {"shell_files"}

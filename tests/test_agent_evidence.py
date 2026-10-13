@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from src.agent_evidence import (
     CompletionRequirements,
     CompletionStatus,
@@ -934,3 +936,66 @@ def test_exhaustion_and_awaiting_user_are_non_completion_states():
     ledger = EvidenceLedger()
     assert ledger.evaluate(exhausted=True).status == CompletionStatus.EXHAUSTED
     assert ledger.evaluate(awaiting_user=True).status == CompletionStatus.AWAITING_USER
+
+
+@pytest.mark.parametrize("tool", ["create_document", "update_document", "edit_document"])
+def test_authoritative_document_write_records_document_mutation_evidence(tool):
+    ledger = EvidenceLedger.from_tool_events([
+        {"tool": tool, "command": "fix grammar", "exit_code": 0},
+    ])
+
+    mutations = [event for event in ledger.events
+                 if event.kind == EvidenceKind.DOCUMENT_MUTATION]
+    assert len(mutations) == 1
+    assert mutations[0].authoritative and mutations[0].success
+    assert ledger._supports_document_mutation() is True
+
+
+def test_non_authoritative_document_write_is_not_mutation_evidence():
+    ledger = EvidenceLedger.from_tool_events([
+        {"tool": "update_document", "command": "fix grammar"},
+    ])
+
+    assert ledger._supports_document_mutation() is False
+
+
+def test_successful_private_write_supports_mutation_claim_without_artifact():
+    # manage_calendar:create_event has no filesystem artifact, so the completion
+    # verifier previously erased the model's "I created the meeting" claim. A
+    # successful authoritative owned-state write must now support it.
+    from src.agent_runtime.completion import completion_answer
+
+    ledger = EvidenceLedger.from_tool_events([
+        {
+            "round": 1,
+            "tool": "manage_calendar",
+            "command": json.dumps({
+                "action": "create_event",
+                "title": "Meeting with Sam",
+                "start": "2026-10-16T15:00:00",
+            }),
+            "output": "Created event [Meeting with Sam]",
+            "exit_code": 0,
+            "execution_attempted": True,
+        },
+    ])
+    assert ledger._private_action_mutations == ["manage_calendar:create_event"]
+
+    answer, _ = completion_answer(
+        "I created the meeting with Sam.", ledger, ledger.evaluate())
+    assert "created the meeting with Sam" in answer
+    assert not answer.startswith("Unsupported execution claims")
+
+
+def test_failed_private_write_does_not_support_mutation_claim():
+    ledger = EvidenceLedger.from_tool_events([
+        {
+            "round": 1,
+            "tool": "manage_calendar",
+            "command": json.dumps({"action": "create_event", "title": "x"}),
+            "output": "denied",
+            "exit_code": 1,
+            "execution_attempted": True,
+        },
+    ])
+    assert ledger._private_action_mutations == []

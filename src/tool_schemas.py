@@ -70,7 +70,7 @@ def _repair_function_arg_aliases(tool_type: str, args: dict[str, Any]) -> dict[s
         command = args.get("command")
         if isinstance(command, str):
             path, separator, content = command.partition("\n")
-            if separator and path.strip() and content.strip():
+            if separator and path.strip() and content:
                 args["path"] = path.strip()
                 args["content"] = content
                 logger.warning("Normalized legacy `command` write shape to path/content")
@@ -494,14 +494,14 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "youtube_tool",
-            "description": "Read YouTube-specific data without fighting the JS UI. Use for YouTube video comments, transcripts, metadata, or latest video from a channel. For general web lookup use web_search; for interacting with the visible site use private_browser.",
+            "description": "Read YouTube-specific data (comments, transcripts, metadata, or latest video from a channel) without fighting the YouTube JS UI. YOUTUBE ONLY: it accepts only youtube.com or youtu.be links — a video URL, a shorts/live link, or an 11-character video_id, or a channel /@handle/videos URL. It does NOT accept any other website. For a non-YouTube URL do not use this tool: use web_fetch for one specific page or web_search for an open-ended lookup; use private_browser only to drive the visible browser.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["comments", "transcript", "metadata", "latest_channel_video"], "description": "What YouTube data to retrieve. Use latest_channel_video with max_results for latest N uploads from a channel."},
-                    "url": {"type": "string", "description": "YouTube video or channel URL"},
-                    "video_url": {"type": "string", "description": "YouTube video URL"},
-                    "video_id": {"type": "string", "description": "YouTube video id"},
+                    "url": {"type": "string", "description": "A youtube.com or youtu.be URL (video, watch?v=, shorts, or a channel /@handle/videos URL). No other hosts."},
+                    "video_url": {"type": "string", "description": "A youtube.com or youtu.be video URL"},
+                    "video_id": {"type": "string", "description": "The 11-character YouTube video id (e.g. jNQXAC9IVRw)"},
                     "channel_url": {"type": "string", "description": "YouTube channel URL or /@handle/videos URL"},
                     "handle": {"type": "string", "description": "YouTube handle, e.g. @OpenAI"},
                     "max_results": {"type": "integer", "description": "Maximum comments, uploads, or results to return, capped at 50"}
@@ -1497,7 +1497,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "generate_image",
-            "description": "Generate an AI image from a text prompt and save it to the gallery. If this tool reports that no image model or endpoint is configured, report that limitation directly; do not substitute Bash, Python, SVG, or another tool.",
+            "description": "Generate a NEW image from a text prompt and place it as a layer in the open editor or save it to the gallery. Use for adding content that is not already in the photo (e.g. 'add a full moon in the sky'). If this tool reports that no image model or endpoint is configured, report that limitation directly; do NOT substitute deterministic editor ops (selection/adjustments/filters), Bash, Python, or SVG.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1524,6 +1524,75 @@ FUNCTION_TOOL_SCHEMAS = [
                     "scale": {"type": "number", "description": "For upscale: scale factor (default 2)"},
                 },
                 "required": ["image_id", "action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "plan_edit",
+            "description": "Plan a photo-editing program for the currently open image editor. Returns an ordered list of editor ops to run against the canvas. Route object removal, added content, or replaced content to ai_edit_image/generate_image; use deterministic ops only for tone/colour/filter/crop/text/selection edits. If no image provider is configured for a generative request, say so instead of planning a substitute deterministic edit. Use the canonical adjustment/filter shapes (adjustments.apply/applyMasked params {\"type\", \"params\"}; filters.apply/applyMasked params {\"id\"}); never invent adjustment types or filter ids. New ops: photo.autoTone; retouch.skin/blemish/teeth; selection.face/background. Portrait/look-better ('fix the skin', 'fix my teeth') -> selection.face then retouch.skin (and retouch.teeth for teeth) then ONE gentle photo.autoTone; never a timid single step. Low-key/'fix the lighting' on a dark image: at most ONE global lift (prefer photo.autoTone once or shadows-highlights); never stack autoTone/brightness/exposure/levels, and keep highlights <= 0. Temperature sign: moody/cool/cinematic -> white-balance temperature NEGATIVE; warm/golden/sunset -> POSITIVE. Background softer -> selection.background then filters.applyMasked {id:'blur-gaussian'} (never a plain global blur). A vague prompt with no concrete defect ('clean this up') -> return {\"reply\": <question>, \"steps\": [], \"ask_user\": {\"question\":..., \"options\":[...]}} with 2-3 concrete options instead of guessing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "What the user wants done to the image"},
+                    "state": {"type": "object", "description": "Optional current editor state (layers, selection, document info)"}
+                },
+                "required": ["prompt"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_editor_command",
+            "description": "Run a single deterministic operation on the open image editor and return its result. Use catalog ops such as adjustments.*, filters.applyMasked, selection.*, layers.*, document.importImage, layers.placeImage, export.png, screenshot. Do NOT use for AI/masked edits (use ai_edit_image) or new imagery (use generate_image). Canonical shapes: adjustments.apply/applyMasked params = {\"type\": <brightness-contrast|exposure|white-balance|hue-saturation|vibrance|black-white|shadows-highlights|levels|curves|color-balance|photo-filter|selective-color|gradient-map|invert|posterize|threshold|channel-mixer|color-lookup>, \"params\": {...}}; filters.apply/applyMasked params = {\"id\": <blur-gaussian|blur-motion|blur-zoom|sharpen|sharpen-edges|unsharp-mask|noise-add|noise-despeckle|pixelate-mosaic|pixelate-crystallize|stylize-emboss|stylize-find-edges|stylize-solarize|distort-twirl|distort-pinch|distort-spherize|distort-ripple|render-clouds>}. Never nest a numeric bag under {\"adjustments\": {...}} and never invent adjustment types or filter ids (no \"vignette\" or \"clarity\"). Additional canonical ops: photo.autoTone {}; retouch.skin {smooth,opacity,blemish,radius,threshold}; retouch.blemish {radius,threshold}; retouch.teeth {desat,bright}; selection.face {mode}; selection.background {mode,subject,fuzziness}. At most one global brightness/exposure lift (prefer shadows-highlights; keep highlights <= 0). Never stack global lifts.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "description": "Editor op name from the catalog, e.g. adjustments.applyMasked"},
+                    "params": {"type": "object", "description": "Parameters for the op"},
+                    "session": {"type": "string", "description": "Editor session id (defaults to the open session)"},
+                    "wait": {"type": "boolean", "description": "Wait for the editor result (default true)"}
+                },
+                "required": ["op"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_editor_screenshot",
+            "description": "Capture the open image editor's current canvas as a PNG data URL. Use to inspect the result before choosing the next edit.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "session": {"type": "string", "description": "Editor session id (defaults to the open session)"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ai_edit_image",
+            "description": "Apply an AI image edit and place the result as a NEW layer, never overwriting the original. Two modes. mode='instruction' (default): send the WHOLE image with a clear prompt and no mask — use a rephrased instruction that NAMES what must stay unchanged, e.g. 'replace the background with a sunny beach, keep the woman exactly the same'. Use this for background/scene replacement, changing the season or style, adding an object to the scene (a moon, a person), and removing diffuse distractions. mode='masked': masked inpaint on a selected region — use ONLY for an explicit regional removal of a clearly identified object ('remove the person on the left'); select the object first so the mask is tight. NEVER approximate object removal/addition/replacement with selection, adjustment, filter or transform ops; if no image provider is configured, report that instead of substituting a deterministic edit. Other ops: remove-bg, upscale (2x/4x), denoise, enhance-face.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "enum": ["remove-bg", "upscale", "denoise", "enhance-face", "inpaint", "generative"], "description": "AI edit operation"},
+                    "mode": {"type": "string", "enum": ["instruction", "masked"], "description": "instruction = whole-image edit with no mask (background/season/style/add-object/diffuse removal); masked = tight-mask regional removal of a selected object. Default instruction."},
+                    "prompt": {"type": "string", "description": "Instruction for inpaint/generative (in instruction mode, name what must stay unchanged)"},
+                    "image": {"type": "string", "description": "Optional source (data URL or gallery image id); defaults to the current canvas/screenshot"},
+                    "mask": {"type": "string", "description": "Optional base64 PNG mask (white = region to edit); required for mode='masked'"},
+                    "scale": {"type": "number", "description": "Upscale factor (2 or 4)"},
+                    "strength": {"type": "number", "description": "Denoise strength (0-1)"},
+                    "steps": {"type": "integer", "description": "Optional sampler steps. Use 8 for removal/expand edits (default 4 is too weak for those)."},
+                    "place": {"type": "boolean", "description": "Place the result as a new layer (default true)"},
+                    "model": {"type": "string", "description": "Optional image model id to route this edit to (from GET /api/editor/image-models); omit to use the configured default"},
+                    "session": {"type": "string", "description": "Editor session id"}
+                },
+                "required": ["op"]
             }
         }
     },
@@ -2200,13 +2269,7 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
     elif tool_type == "get_workspace":
         content = ""
     elif tool_type == "write_file":
-        body = args.get("content")
-        if isinstance(body, str) and body.strip():
-            content = args.get("path", "") + "\n" + body
-        else:
-            # Preserve missing/empty intent for WriteFileTool instead of folding
-            # all empty shapes into the same path-plus-newline representation.
-            content = json.dumps(args)
+        content = args.get("path", "") + "\n" + args.get("content", "")
     elif tool_type == "edit_file":
         content = json.dumps(args)
     elif tool_type == "apply_patch":

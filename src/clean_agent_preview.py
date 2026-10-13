@@ -32,12 +32,7 @@ from src.tool_schemas import (
     normalized_native_function_argument_error,
 )
 from src.tool_types import ToolBlock
-from src.tool_parsing import iter_email_addresses, parse_tool_blocks, strip_tool_blocks, strip_angle_tags
-from src.text_scanning import (
-    contains_detailed_sequence_request,
-    contains_search_engine_navigation,
-    iter_prefixed_token_matches,
-)
+from src.tool_parsing import parse_tool_blocks, strip_tool_blocks
 from src.turn_contract import (
     _REQUEST_PREFIX,
     calendar_retiming_request,
@@ -49,6 +44,7 @@ from src.prompt_security import untrusted_context_message
 from src.model_profiles import (
     model_id_leaf,
     is_odysseus_merged_tools_model,
+    supports_user_thinking_toggle,
     uses_odysseus_progressive_thinking,
 )
 
@@ -58,94 +54,6 @@ MODE = COMPACT_PREVIEW_MODE
 
 class ProviderStreamError(Exception):
     """A provider reported failure inside an otherwise successful SSE response."""
-
-
-# Only these audited, fixed domain messages may cross the exception boundary.
-# Return the canonical constants rather than arbitrary exception text.
-_PUBLIC_PREVIEW_TOOL_ERRORS = {message: message for message in (
-    'An equivalent search already returned evidence. Change the angle, missing subtopic, source type, or corroboration target instead of only changing freshness wording.',
-    'Browser navigation already failed for this exact URL; use another source page.',
-    'Do not infer image content repeatedly from filenames; use inspect_media on representative files, then continue from visual evidence.',
-    'Equivalent search intent was repeated after a correction reminder; web_search is disabled for this turn.',
-    'Look up the target with list_sessions before changing a chat. Use its exact returned ID; never invent last-chat/latest aliases. If the target is ambiguous, ask using the candidate chat titles.',
-    'Resolve the named recipient with resolve_contact before drafting. Never invent an email address.',
-    'Selection-only edits cannot use replace_all. Use a unique contextual FIND inside the selected passage.',
-    'The bounded search-attempt budget is exhausted. Do not search again; answer from usable evidence already gathered, or clearly report what could not be verified and suggest a concrete next step.',
-    'The calendar read has not succeeded yet. Obtain the requested calendar evidence before creating the dependent email draft.',
-    'The latest note search returned no candidates, so this reference has no note to open. Do not reuse an older list item; report the empty result or ask which note was intended.',
-    'The latest research search returned no candidates, so this reference has no report to open. Do not reuse an unrelated older report.',
-    'The proposed expansion only adds placeholder/meta text. Write substantive content that continues the existing document’s subject, voice, and format; do not announce that a paragraph was added.',
-    'The recipient address is not supported by the contact lookup. Use an exact returned address for the requested person; if no match exists, explain the missing recipient instead of guessing.',
-    'The same artifact target was already rewritten three times; finish from the latest successful version instead of rewriting it again.',
-    'These suggestions collapse multiple different passages into the same much shorter replacement, violating the request to preserve meaning. Produce passage-specific revisions that retain each source passage’s claims and intent.',
-    'This exact call already failed twice and will not be executed again; change strategy or finish from existing evidence.',
-    'This exact failed call was repeated after a correction reminder; the tool is disabled for this turn. Finish from existing evidence.',
-    'This exact invalid call was repeated after two validation failures; the tool is disabled for this turn.',
-    'This exact successful call already returned evidence. Do not repeat it; change the arguments or tool to gather different evidence, or finish from the evidence already available.',
-    'This still image was already inspected and the same visual evidence is already in context. inspect_media is withheld for the next correction round; use that evidence, inspect a different file, or finish.',
-    'This operation is outside the preview safety policy. No change was made.',
-    'This replacement does not make its passage more concise. Shorten the wording while retaining its facts and meaning; a spelling-only change does not satisfy the requested action. Retry with shorter replacements.',
-    'Tool arguments could not be converted for execution.',
-    'Tool arguments must be a JSON object.',
-    'Tool execution budget exhausted; finish from existing evidence.',
-    'Tool is not offered or permitted.',
-    'Two equivalent searches already returned no evidence. Do not repeat this search wording; use a different offered tool or a materially different query.',
-    'Unresolved video target: this ID was not supplied by the user or observed in a successful tool result. Do not guess it from the title. Open/read the referenced browser link or call youtube_tool latest_channel_video for the observed channel, then use its returned ID.',
-    'inspect_media exports only extract video stills and require an explicit timestamp plus output_path for every item. First inspect the video to find the timestamp; use write_file or python to author a diagram or other new artifact.',
-    'web_fetch requires url or urls. query only filters a supplied page; it is not a search or writing request.',
-)}
-
-
-def _schema_argument_hint(args, schema):
-    """Describe a schema mismatch from the schema and the call's own arguments.
-
-    Rebuilt from a fresh validation rather than read off the caught exception,
-    so nothing the exception carries can reach the model.
-    """
-    if not isinstance(schema, dict):
-        return ''
-    try:
-        validator = jsonschema.validators.validator_for(schema)(schema)
-        error = jsonschema.exceptions.best_match(validator.iter_errors(args))
-    except jsonschema.exceptions.SchemaError:
-        return ''
-    if error is None:
-        return ''
-    location = '.'.join(str(part) for part in error.absolute_path)[:80]
-    field = f"'{location}' " if location else ''
-    if error.validator == 'required' and isinstance(error.instance, dict):
-        missing = [str(name) for name in error.validator_value if name not in error.instance]
-        prefix = f'{location}.' if location else ''
-        hint = 'Missing required argument: ' + ', '.join(f"'{prefix}{name}'" for name in missing) + '.'
-    elif error.validator == 'type':
-        expected = error.validator_value
-        expected = ' or '.join(expected) if isinstance(expected, list) else str(expected)
-        hint = f'Argument {field}must be of type {expected}.'
-    elif error.validator == 'enum':
-        allowed = ', '.join(str(value) for value in error.validator_value[:12])
-        hint = f'Argument {field}must be one of: {allowed}.'
-    elif error.validator == 'additionalProperties':
-        hint = 'Remove arguments the offered tool schema does not define.'
-    else:
-        return ''
-    return f'{hint} Correct the call using the offered tool schema.'
-
-
-def _public_preview_tool_error(exc, *, execution_attempted=False):
-    """Keep useful domain guidance while withholding arbitrary diagnostics."""
-    if execution_attempted:
-        return 'The tool failed unexpectedly. Check the server log and retry.'
-    if isinstance(exc, json.JSONDecodeError):
-        return 'Tool arguments are not valid JSON. Correct the JSON object and retry.'
-    if isinstance(exc, jsonschema.ValidationError):
-        return 'Tool arguments do not match the required schema. Correct the call using the offered tool schema.'
-    detail = str(exc)
-    if detail.startswith('Artifact completion Python must reference the required '):
-        return 'Artifact completion Python must create non-empty output at the required artifact target.'
-    if detail.startswith('Shell access to credential variable '):
-        return 'Shell access to credentials is blocked. Use brokered native tools.'
-    return _PUBLIC_PREVIEW_TOOL_ERRORS.get(detail, 'The tool call could not be validated. Check its arguments and retry.')
-
 
 # Native unattended workspaces routinely require several inspections followed
 # by several artifact writes.  The interactive preview keeps its six-call
@@ -172,6 +80,13 @@ ARTIFACT_RESEARCH_TOOLS = frozenset({
     'web_search', 'web_fetch', 'private_browser', 'pdf_extract', 'youtube_tool',
     'inspect_media', 'extract_text', 'transcribe_media',
 })
+DETAILED_VIDEO_REQUEST = re.compile(
+    r"\b(?:how\s+many|count|sequence|in\s+order|chronological|"
+    r"timestamps?|what\s+time|at\s+what\s+time|when\s+.*(?:end|happen)|"
+    r"first\s+.*(?:save|attempt|event)|score(?:board)?s?)\b|"
+    r"(?:多少|几次|何时|什么时候|时间|顺序)",
+    re.IGNORECASE,
+)
 READ_TOOLS = frozenset({
     'manage_notes', 'manage_calendar', 'manage_memory', 'manage_skills', 'manage_tasks',
     'manage_documents', 'manage_research', 'manage_contact', 'list_sessions',
@@ -196,6 +111,13 @@ SAFE_WRITE_TOOLS = frozenset({
 EXPLICIT_EXECUTE_TOOLS = frozenset({'bash', 'python'})
 SAFE_UI_TOOLS = frozenset({'ui_control'})
 BROKERED_JOB_TOOLS = frozenset({'trigger_research'})
+# Scoped NL photo-editor surface. These are offered only when the
+# ``photo_editor`` capability family is active (editor Quick Edit popup or an
+# image-edit chat turn); they drive the in-process, owner-scoped editor bridge
+# and the existing AI image ops.
+EDITOR_AGENT_TOOLS = frozenset({
+    'plan_edit', 'run_editor_command', 'get_editor_screenshot', 'ai_edit_image',
+})
 CONTRACT_REQUIRED_TOOLS = frozenset({
     'send_email', 'reply_to_email',
     'create_session', 'send_to_session', 'manage_session',
@@ -209,6 +131,7 @@ from src.turn_contract import CONTRACT_CORE_TOOLS
 PREVIEW_TOOLS = (
     READ_TOOLS | SAFE_WRITE_TOOLS | EXPLICIT_EXECUTE_TOOLS | SAFE_UI_TOOLS
     | BROKERED_JOB_TOOLS | CONTRACT_REQUIRED_TOOLS | CONTRACT_CORE_TOOLS
+    | EDITOR_AGENT_TOOLS
 )
 # Keep a small recovery-capable surface on every interactive compact agent
 # turn. Routing still adds domain tools, while policy and action guards remain
@@ -298,23 +221,19 @@ def provider_compatible_tool_choice_request(request, model):
                 # Ajax's forced decoder emits incomplete optional payloads
                 # (and named choice can emit scalar/repeated-number arguments).
                 # Keep the selected schema; validate completion in the harness.
+                # (Ajax's auto decoding is designed around a single-tool
+                # boundary, so this narrowing is intentional here. The
+                # tool-hiding bug was in the deepseek/kimi branch below, which
+                # must keep the full offered set.)
                 return {**request, 'tools': selected, 'tool_choice': 'auto'}
         if choice == 'required':
             return {**request, 'tool_choice': 'auto'}
     if model_name.startswith(('deepseek', 'kimi')) and 'tool_choice' in request:
         compatible = dict(request)
-        choice = compatible.get('tool_choice')
-        selected_name = (
-            (choice.get('function') or {}).get('name')
-            if isinstance(choice, dict) else None
-        )
-        if selected_name:
-            selected = [
-                schema for schema in compatible.get('tools') or []
-                if (schema.get('function') or {}).get('name') == selected_name
-            ]
-            if selected:
-                compatible['tools'] = selected
+        # DeepSeek/Kimi reject a forced named choice. Drop the unsupported
+        # choice but KEEP the full offered tool set: narrowing `tools` to the
+        # named schema would hide every other tool the turn offered (e.g. a
+        # required calendar read hiding the email tools the user asked for).
         compatible.pop('tool_choice', None)
         return compatible
     if (
@@ -895,95 +814,13 @@ def malformed_write_handoff_target(arguments, required_artifacts=(), user_text='
     return target
 
 
-_PAGE_LISTING_WORDS = ("stories", "articles", "posts", "headlines", "pages")
-
-
-def _listing_allowed(char):
-    return char == " " or char in ".:/-" or char == "_" or char.isalnum()
-
-
-def _allowed_then_space(value):
-    """Whether value can be class+ followed by whitespace+, without retries."""
-    if len(value) < 2:
-        return False
-    first_disallowed = next((i for i, char in enumerate(value) if not _listing_allowed(char)), len(value))
-    if first_disallowed < len(value):
-        return first_disallowed > 0 and all(char.isspace() for char in value[first_disallowed:])
-    return value[-1].isspace()
-
-
-def _space_then_allowed(value):
-    """Whether value can be whitespace+ followed by the listing class+."""
-    if len(value) < 2:
-        return False
-    first_nonspace = next((i for i, char in enumerate(value) if not char.isspace()), len(value))
-    if first_nonspace < len(value):
-        return first_nonspace > 0 and all(_listing_allowed(char) for char in value[first_nonspace:])
-    trailing_spaces = len(value) - len(value.rstrip(" "))
-    return trailing_spaces > 0 and (len(value) > trailing_spaces or trailing_spaces >= 2)
-
-
-def _page_listing_request(user_text):
-    value = str(user_text or '').lstrip()
-    nonspace_end = len(value.rstrip())
-    if value[nonspace_end - 1:nonspace_end] in ("!", "?"):
-        value = value[:nonspace_end - 1]
-    lead = re.match(
-        r"(?:top|latest|recent|list(?: the)?|show(?: me)?(?: the)?)(?=\s)",
-        value, re.I,
-    )
-    if not lead:
-        return False
-    cursor = lead.end()
-    while cursor < len(value) and value[cursor].isspace():
-        cursor += 1
-    body = value[cursor:]
-    nonspace_end = len(body.rstrip())
-    terminal_end = nonspace_end
-    if body[terminal_end - 1:terminal_end] == ".":
-        terminal_end = len(body[:terminal_end - 1].rstrip())
-    first_disallowed = len(body)
-    last_disallowed = -1
-    first_nonspace_after_disallowed = len(body)
-    for index, char in enumerate(body):
-        if not _listing_allowed(char):
-            first_disallowed = min(first_disallowed, index)
-            if index < nonspace_end:
-                last_disallowed = index
-        if index >= first_disallowed and not char.isspace():
-            first_nonspace_after_disallowed = min(first_nonspace_after_disallowed, index)
-    last_literal_space = body.rfind(" ")
-    for word in _PAGE_LISTING_WORDS:
-        for candidate in re.finditer(word, body, re.I):
-            start = candidate.start()
-            prefix_allowed = start >= 2 and (
-                body[start - 1].isspace() if start <= first_disallowed
-                else first_disallowed > 0 and start <= first_nonspace_after_disallowed
-            )
-            if start == 0 or prefix_allowed:
-                after_start = candidate.end()
-                if after_start >= terminal_end:
-                    return True
-                on = after_start
-                while on < len(body) and body[on].isspace():
-                    on += 1
-                if on > after_start and body[on:on + 2].casefold() == "on":
-                    tail_start = on + 2
-                    tail_end = tail_start
-                    while tail_end < len(body) and body[tail_end].isspace():
-                        tail_end += 1
-                    if len(body) - tail_start >= 2 and tail_end > tail_start:
-                        if tail_end < len(body):
-                            if last_disallowed < tail_end:
-                                return True
-                        elif last_literal_space > tail_start:
-                            return True
-    return False
-
-
 def page_listing_response(entries, user_text, max_items=10):
     """Render simple page listings from observed titles/URLs, never synthesized rankings."""
-    if not _page_listing_request(user_text) or re.search(r'\b(?:and|compare|summarize|analyse|analyze|about|by|since|yesterday)\b', user_text, re.I):
+    if not re.fullmatch(
+        r'\s*(?:top|latest|recent|list(?: the)?|show(?: me)?(?: the)?)\s+'
+        r'(?:[\w .:/-]+\s+)?(?:stories|articles|posts|headlines|pages)'
+        r'(?:\s+on\s+[\w .:/-]+)?[.!?]?\s*', user_text, re.I,
+    ) or re.search(r'\b(?:and|compare|summarize|analyse|analyze|about|by|since|yesterday)\b', user_text, re.I):
         return ''
     from urllib.parse import quote, urlsplit
     from html import escape
@@ -1399,12 +1236,55 @@ def incomplete_broad_web_answer(content, user_text, *, recovery_attempts=0):
     return len(words) < 80 or not re.search(r'https?://\S+', str(content or ''))
 
 
-def progressive_thinking_for_turn(model, offered_schemas, thinking_mode=None):
-    """Use Qwen reasoning only when this turn has no Odysseus tool surface."""
-
-    if str(thinking_mode or '').lower() == 'off':
+def progressive_thinking_for_turn(model, offered_schemas, thinking_mode=None, *, tool_failed=False, deliberate=False):
+    """Ajax Compact owns reasoning; legacy session preferences do not control it."""
+    if not uses_odysseus_progressive_thinking(model):
         return False
-    return uses_odysseus_progressive_thinking(model) and not bool(offered_schemas)
+    return tool_failed or deliberate or not bool(offered_schemas)
+
+
+def spec_router_thinking_decision(endpoint_url, model, owner, headers, direct_user_text):
+    """Env-gated router decision for spec tool-surface turns. Fail open (None)."""
+    try:
+        from src import spec_router
+        if not spec_router.think_router_enabled():
+            return None
+        from src.agent_loop import _configured_model_tool_surface_raw
+        if _configured_model_tool_surface_raw(
+            endpoint_url, model, owner, headers=headers
+        ) != 'spec':
+            return None
+        return spec_router.route_thinking(direct_user_text)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            'spec think router decision failed; using rules only', exc_info=True)
+        return None
+
+
+def spec_router_think_reason(round_number, decision, existing_deliberate):
+    """Add 'router_think' on round 1 when the router asked for thinking and no
+    other rule already selected a deliberate reason."""
+    if (round_number == 1 and not existing_deliberate
+            and isinstance(decision, dict) and decision.get('think')):
+        return 'router_think'
+    return ''
+
+
+def tool_deliberation_reason(name, args):
+    """Classify selected operations, never infer intent from tool availability."""
+    name = canonical(name)
+    if name in {'python', 'edit_file', 'apply_patch'}:
+        return 'code'
+    if name in {'edit_document', 'suggest_document', 'update_document'}:
+        return 'document_edit'
+    if name in {'draft_email', 'draft_email_reply', 'ai_draft_email_reply'}:
+        return 'email_draft'
+    action = str(args.get('action') or '').lower()
+    if name == 'manage_tasks' and action in {'create', 'add', 'update', 'edit'}:
+        return 'task_design'
+    if name == 'manage_skills' and action in {'add', 'edit', 'patch', 'publish', 'audit'}:
+        return 'skill_evaluation'
+    return ''
 
 
 def visible_content_after_qwen_thinking(content):
@@ -1420,6 +1300,48 @@ def visible_content_after_qwen_thinking(content):
     if re.match(r'^\s*<think>', text, re.I):
         return ''
     return text.strip()
+
+
+def qwen_think_split_events(content, state):
+    """Split a no-reasoning-parser thinking round into live deltas.
+
+    Some thinking servers (no --reasoning-parser) return the whole
+    ``<think>…</think>`` trace as ordinary ``content``. Buffering that round
+    made the UI show nothing while the model thought and then dump the whole
+    answer at once. Stream the trace as ``{'delta': ..., 'thinking': True}``
+    events (the same shape a reasoning-parser server emits) and the text after
+    ``</think>`` as normal answer deltas. ``state`` is a mutable per-round dict
+    carrying the emission bookkeeping; the stored answer is unchanged (see
+    ``visible_content_after_qwen_thinking``).
+    """
+    events = []
+    text = str(content or '')
+    if not text:
+        return events
+    lowered = text.casefold()
+    lead = len('<think>') if lowered.startswith('<think>') else 0
+    close = lowered.find('</think>')
+    if close < 0:
+        if '<think>' not in lowered:
+            return events
+        # Hold back a possible partial '</think>' so it is never shown as
+        # thinking text.
+        think_region = text[lead:max(lead, len(text) - len('</think>'))]
+        answer_region = ''
+    else:
+        think_region = text[lead:close]
+        answer_region = text[close + len('</think>'):]
+    emitted_think = int(state.get('think_emitted', 0) or 0)
+    if len(think_region) > emitted_think:
+        events.append({'delta': think_region[emitted_think:], 'thinking': True})
+        state['think_emitted'] = len(think_region)
+    if close >= 0:
+        state['closed'] = True
+        emitted_answer = int(state.get('answer_emitted', 0) or 0)
+        if len(answer_region) > emitted_answer:
+            events.append({'delta': answer_region[emitted_answer:]})
+            state['answer_emitted'] = len(answer_region)
+    return events
 
 
 def prior_short_answer_for_no_tool_summary(user_text, history):
@@ -1699,24 +1621,17 @@ def prior_workspace_path_answer(user_text, history):
     return ''
 
 
-def _prior_web_source_request(text):
-    text = str(text or '')
-    candidate = text.lstrip().rstrip()
-    candidate = candidate.rstrip(".!? ")
-    return bool(re.fullmatch(
-        r"(?:(?:where|what)\s+did\s+you\s+(?:get|find)\s+(?:that|this)\s+from[?., ]*"
-        r"(?:give|show|send)\s+me\s+(?:the\s+)?(?:source\s+)?link"
-        r"|(?:give|show|send)\s+me\s+(?:the\s+)?(?:source\s+)?link(?:\s+for\s+that)?"
-        r"|what(?:['’]?s|\s+is)\s+(?:the\s+)?source(?:\s+link)?)",
-        candidate,
-        re.I,
-    ))
-
-
 def prior_web_source_answer(user_text, history):
     """Return the latest source URL for an explicit source-only follow-up."""
     text = str(user_text or '')
-    if not _prior_web_source_request(text):
+    if not re.fullmatch(
+        r"\s*(?:(?:where|what)\s+did\s+you\s+(?:get|find)\s+(?:that|this)\s+from[?., ]*"
+        r"(?:give|show|send)\s+me\s+(?:the\s+)?(?:source\s+)?link[.!? ]*"
+        r"|(?:give|show|send)\s+me\s+(?:the\s+)?(?:source\s+)?link(?:\s+for\s+that)?[.!? ]*"
+        r"|what(?:['’]?s|\s+is)\s+(?:the\s+)?source(?:\s+link)?[.!? ]*)\s*",
+        text,
+        re.I,
+    ):
         return ''
     call_names = {}
     candidates = []
@@ -2358,7 +2273,7 @@ def canonical_tools_for_mode(tools, mode):
 def contract_builder():
     root = Path(os.environ.get(
         'ODYSSEUS_TOOL_CONTRACT_ROOT',
-        str(Path(__file__).resolve().parents[1] / "scripts"),
+        '/home/pewds/odysseus-tool-work/scripts',
     )).resolve()
     contract_path = root / 'eval_alltools_unseen_compare.py'
     if contract_path.is_file():
@@ -2381,9 +2296,6 @@ def compact_schemas(schemas, *, model=None):
     # The evaluator's short email names and live MCP aliases share the same
     # contract; keep live dispatch names intact.
     compact = contract_builder()(copy.deepcopy(schemas), 'compact_contract_v5')
-    if re.match(r'^ajax(?:$|[-_])', model_id_leaf(model)):
-        compact = [schema for schema in compact
-                   if canonical(schema['function']['name']) != 'ask_user']
     # Description dropout makes edit_document's legacy free-form ``command``
     # field indistinguishable from a verb/action hint.  Small models then emit
     # values such as {"command":"replace"}, which cannot identify either side
@@ -2897,7 +2809,7 @@ def scope_preview_contract(preview_contract, routed_contract, active_capabilitie
     requested_family_tools = set().union(*(FAMILY_TOOLS.get(f, ()) for f in active))
     available_requested = routed_canonical & offered_canonical & requested_family_tools
     routed_canonical.update(canonical(name) for name in extra_tools)
-    if 'image_generation' not in active:
+    if 'image_generation' not in active and 'photo_editor' not in active:
         # A past image request must not keep generation warm on email/doc turns.
         routed_canonical.discard('generate_image')
     missing_active = {
@@ -2997,11 +2909,12 @@ def draft_contact_evidence_error(name, args, *, dependencies=(), executions=(), 
                     and not e.get('blocked')]
     if not observations:
         return 'Resolve the named recipient with resolve_contact before drafting. Never invent an email address.'
+    address_pattern = r'[A-Za-z0-9.!#$%&\x27*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
     known = {address.casefold() for e in observations
-             for address in iter_email_addresses(str(e.get('output') or ''), ascii_only=True)}
-    known.update(address.casefold() for address in iter_email_addresses(user_text, ascii_only=True))
+             for address in re.findall(address_pattern, str(e.get('output') or ''))}
+    known.update(address.casefold() for address in re.findall(address_pattern, user_text))
     proposed = {address.casefold() for field in ('to', 'cc', 'bcc')
-                for address in iter_email_addresses(str(args.get(field) or ''), ascii_only=True)}
+                for address in re.findall(address_pattern, str(args.get(field) or ''))}
     if not proposed or not proposed <= known:
         return ('The recipient address is not supported by the contact lookup. Use an exact '
                 'returned address for the requested person; if no match exists, explain '
@@ -3620,6 +3533,18 @@ def evaluate_preview_call(name, args, user_text='', *, allow_execute_code=False,
         blocked_effects.remove(ToolEffect.NETWORK_EGRESS)
         allowed_effects.add(ToolEffect.NETWORK_EGRESS)
     if (
+        (contract_required or family in turn_authorized_families)
+        and bare in {'plan_edit', 'run_editor_command', 'get_editor_screenshot', 'ai_edit_image'}
+    ):
+        # Scoped photo_editor agent tools. They are never in the general tool
+        # list; the immutable turn contract only selects them for an explicit
+        # editor request (Quick Edit popup / image-edit turn), so their UI and
+        # brokered-network effects are covered by the contract seal.
+        blocked_effects.discard(ToolEffect.UI_SIDE_EFFECT)
+        allowed_effects.add(ToolEffect.UI_SIDE_EFFECT)
+        blocked_effects.discard(ToolEffect.NETWORK_EGRESS)
+        allowed_effects.add(ToolEffect.NETWORK_EGRESS)
+    if (
         contract_required
         and bare in {'download_model', 'serve_preset', 'stop_served_model'}
         and family in turn_authorized_families
@@ -4119,7 +4044,7 @@ def active_document_revision_quality_error(name, args, *, active_document, user_
     if not incoming:
         return None
     addition = incoming[len(existing):].strip() if existing and incoming.startswith(existing) else ''
-    candidate = strip_angle_tags(addition, ' ').strip()
+    candidate = re.sub(r'<[^>]+>', ' ', addition).strip()
     candidate = re.sub(r'\s+', ' ', candidate)
     if not candidate or candidate.casefold() in str(user_text or '').casefold():
         return None
@@ -4144,8 +4069,8 @@ def document_suggestion_quality_error(name, args, *, user_text):
         for suggestion in suggestions:
             if not isinstance(suggestion, dict):
                 continue
-            source = re.sub(r'\s+', ' ', strip_angle_tags(str(suggestion.get('find') or ''), ' ', allow_empty=True)).strip()
-            result = re.sub(r'\s+', ' ', strip_angle_tags(str(suggestion.get('replace') or ''), ' ', allow_empty=True)).strip()
+            source = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', str(suggestion.get('find') or ''))).strip()
+            result = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', str(suggestion.get('replace') or ''))).strip()
             if not source or not result:
                 continue
             source_words = len(re.findall(r"\b[\w’'-]+\b", source))
@@ -4205,6 +4130,24 @@ def scope_active_editor_contract(turn_contract, *, empty=False, whole_draft=Fals
 
 def denied_response():
     return 'I can’t perform that operation in this preview. No changes were made.'
+
+
+WORKSPACE_REQUIRED_REFUSAL = (
+    'Shell and Python commands only run inside a workspace. '
+    'Open the code workspace (or set a working directory) and try again.'
+)
+
+
+def workspace_process_denial(executions) -> bool:
+    """True when a blocked call was refused because process execution needs a
+    sealed workspace (a plain chat turn carries none)."""
+    for entry in executions or ():
+        blob = ' '.join(
+            str(entry.get(key) or '') for key in ('error', 'output', 'failure_kind')
+        )
+        if 'sealed workspace' in blob or 'resource_identity_denied' in blob:
+            return True
+    return False
 
 
 def execution_has_write_effect(tool_name, content, capability, *, native_workspace_enabled):
@@ -4301,17 +4244,13 @@ _WORKSPACE_FILE_RE = re.compile(
     r"/workspace/[^\s,，、;；`\"'<>]+\.[A-Za-z0-9]{1,12}",
     re.I,
 )
-_WORKSPACE_PREFIX_RE = re.compile(r"/workspace/", re.I)
-_WORKSPACE_FILE_TOKEN_TAIL_RE = re.compile(r"[^\s,，、;；`\"'<>]*")
 
 
 def declared_workspace_artifacts(user_text):
     """Return explicit output paths, excluding paths used only as inputs."""
     text = str(user_text or '')
     paths = []
-    for match in iter_prefixed_token_matches(
-        text, _WORKSPACE_PREFIX_RE, _WORKSPACE_FILE_RE, _WORKSPACE_FILE_TOKEN_TAIL_RE
-    ):
+    for match in _WORKSPACE_FILE_RE.finditer(text):
         path = match.group(0).rstrip('.!?)）]}')
         if path.startswith('/workspace/fixtures/') or path in paths:
             continue
@@ -4431,61 +4370,17 @@ def evidence_tool_keeps_distinct_requests_available(name):
     }
 
 
-def _terminal_source_link_clause(text):
-    """Recognize the terminal short source/link clause from right to left."""
-    value = str(text or '')
-    def matches_at(end):
-        while end and value[end - 1] in ".!?":
-            end -= 1
-        while end and value[end - 1].isspace():
-            end -= 1
-        lowered = value[:end].casefold()
-        for courtesy in ("please", "pls"):
-            if lowered.endswith(courtesy):
-                boundary = end - len(courtesy)
-                end = boundary
-                while end and value[end - 1].isspace():
-                    end -= 1
-                lowered = value[:end].casefold()
-                break
-        token_match = re.search(r"(?:sources?|citations?|links?)$", lowered)
-        if token_match is None:
-            return False
-        prefix = value[:token_match.start()]
-        original_cursor = len(prefix)
-        courtesy_end = original_cursor
-        while courtesy_end and prefix[courtesy_end - 1].isspace():
-            courtesy_end -= 1
-        cursors = [original_cursor]
-        for courtesy in ("please", "pls"):
-            start = courtesy_end - len(courtesy)
-            if start >= 0 and prefix[start:courtesy_end].casefold() == courtesy:
-                if courtesy_end < original_cursor and (start == 0 or prefix[start - 1].isspace()):
-                    cursors.append(start)
-                break
-        for cursor in cursors:
-            while cursor and prefix[cursor - 1].isspace():
-                if prefix[cursor - 1] == "\n":
-                    return True
-                cursor -= 1
-            if cursor == 0 or prefix[cursor - 1] in ".!?;,":
-                return True
-        return False
-
-    return matches_at(len(value)) or (value.endswith("\n") and matches_at(len(value) - 1))
-
-
 def requested_web_source_links(user_text):
-    text = str(user_text or '')
-    return _terminal_source_link_clause(text) or bool(re.search(
+    return bool(re.search(
         r'\b(?:return|give|show|include|provide|cite|find)\b.{0,35}\b(?:source\s+)?links?\b'
+        r'|(?:^|[.!?;,\n])\s*(?:(?:pls|please)\s+)?(?:sources?|citations?|links?)\s*(?:pls|please)?\s*[.!?]*$'
         r'|\b(?:\d+|one|two|three|four|five)\s+(?:official\s+)?(?:source\s+)?links?\b'
         r'|\bofficial\s+source\b'
         r'|\b(?:with|include|provide|cite|show|give|find)\s+(?:the\s+)?(?:official\s+)?(?:sources|citations)\b'
         r'|\blink\s+(?:to\s+)?(?:the\s+|your\s+)?(?:original\s+|official\s+)?(?:instructions|sources|documentation|articles?|reports?|studies|manuals?|guides?)\b'
         r'|\b(?:find|locate|get|download)\b.{0,60}\bofficial\b.{0,60}\b(?:manual|guide|handbook|pdf|documentation)\b'
         r'|\b(?:find|locate|get|download)\b.{0,80}\b(?:manual|guide|handbook|pdf)\b.{0,40}\b(?:online|official)\b',
-        text,
+        str(user_text or ''),
         re.IGNORECASE,
     ))
 
@@ -4522,67 +4417,12 @@ def unbound_lookup_reference(user_text, history, *, supplied_context=False):
     ))
 
 
-def _web_source_rows(text):
-    """Extract numbered source title/URL rows with monotonic line scans."""
-    rows = []
-    position = 0
-    length = len(text)
-    while position < length:
-        if position and text[position - 1] != "\n":
-            newline = text.find("\n", position)
-            if newline < 0:
-                break
-            position = newline + 1
-            continue
-        cursor = position
-        if cursor >= length or text[cursor] != "[":
-            newline = text.find("\n", cursor)
-            if newline < 0:
-                break
-            position = newline + 1
-            continue
-        cursor += 1
-        digit_start = cursor
-        while cursor < length and text[cursor].isdigit():
-            cursor += 1
-        if cursor == digit_start or cursor >= length or text[cursor] != "]":
-            position += 1
-            continue
-        cursor += 1
-        if cursor >= length or not text[cursor].isspace():
-            position += 1
-            continue
-        while cursor < length and text[cursor].isspace():
-            cursor += 1
-        title_start = cursor
-        title_line_end = text.find("\n", title_start)
-        if title_line_end < 0:
-            break
-        title_end = title_line_end
-        while title_end > title_start and text[title_end - 1].isspace():
-            title_end -= 1
-        url_start = title_line_end + 1
-        while url_start < length and text[url_start].isspace():
-            url_start += 1
-        scheme_length = 7 if text.startswith("http://", url_start) else 8 if text.startswith("https://", url_start) else 0
-        if title_end > title_start and scheme_length:
-            url_end = url_start + scheme_length
-            while url_end < length and not text[url_end].isspace():
-                url_end += 1
-            rows.append((text[title_start:title_end], text[url_start:url_end]))
-            position = url_end
-            continue
-        newline = text.find("\n", position)
-        if newline < 0:
-            break
-        position = newline + 1
-    return rows
-
-
 def web_source_links(raw, *, max_items=1, prefer_official=False, query=''):
     """Extract stable title/URL pairs from the web tool's source preamble."""
     text = str(raw or '')
-    rows = _web_source_rows(text)
+    rows = re.findall(
+        r'^\[\d+\]\s+(.+?)\s*\n\s*(https?://\S+)', text, re.MULTILINE,
+    )
     query_tokens = set(re.findall(r'[a-z0-9]+', str(query or '').casefold())) - {
         'the', 'a', 'an', 'official', 'source', 'link', 'page', 'website',
         'site', 'guide', 'search', 'find', 'for', 'return',
@@ -5235,7 +5075,6 @@ from src.agent_runtime.authority import MISSING_AUTHORITY, with_request_authorit
 async def stream_preview(*, endpoint_url, model, messages, headers, turn_contract,
                          session_id, owner, disabled_tools, tool_policy,
                          history_session=None, external_untrusted_context_seen=False,
-                         delegated_credential=False,
                          active_document=None, active_email=None, workspace=None,
                          client_runtime_context=None, max_tokens=768, max_rounds=8,
                          max_tool_calls=0,
@@ -5271,20 +5110,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
             suggestion_only=suggestion_target,
             source_verification=_bound_editor_requests_web_verification(direct_user_text),
         )
-    from src.tool_security import delegated_credential_blocked_tools
-    from src.tool_capabilities import delegated_tool_is_blocked
-    disabled_tools = set(disabled_tools or ())
-    if delegated_credential:
-        disabled_tools.update(delegated_credential_blocked_tools())
-    hard_disabled = disabled_tools | (set(tool_policy.all_disabled_names()) if tool_policy else set())
-    def permitted_schema(schema):
-        name = schema['function']['name']
-        return (not (tool_policy and tool_policy.block_all_tool_calls)
-                and name not in hard_disabled
-                and not (delegated_credential and delegated_tool_is_blocked(name)))
-
-    offered = [schema for schema in compact_schemas(turn_contract.schemas(), model=model)
-               if permitted_schema(schema)]
+    offered = compact_schemas(turn_contract.schemas(), model=model)
     if standalone_social_turn(direct_user_text) or inline_text_transformation(direct_user_text):
         offered = []
     external_schema_by_name = {
@@ -5302,6 +5128,11 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
         for schema in offered
     ]
     progressive_thinking = progressive_thinking_for_turn(model, offered, ignored.get('thinking_mode'))
+    recovery_thinking_pending = False
+    recovery_thinking_rounds = []
+    operation_thinking_pending = ''
+    deliberated_operations = set()
+    operation_thinking_rounds = []
     external_runtime_tools = frozenset(
         str((schema.get('function') or {}).get('name') or '')
         for schema in (external_tool_schemas or ())
@@ -5335,7 +5166,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
         'This is a tool preview connected to the authenticated user’s real data. '
     )
     system = (
-        f'You are Odysseus. Current UTC date and time: {datetime.now(timezone.utc).isoformat()}. '
+        f'You are Ajax, the assistant in Odysseus. Current UTC date and time: {datetime.now(timezone.utc).isoformat()}. '
         + runtime_scope_clause
         + 'Use available tools when needed, including for personal records and current information. '
         'Preserve conversation context on follow-ups and choose arguments yourself. '
@@ -5472,7 +5303,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
     initial_length = len(history)
     security = ToolRunSecurityContext(
         external_untrusted_context_seen=bool(external_untrusted_context_seen),
-        delegated_credential=bool(delegated_credential),
         unattended_tools=(
             NATIVE_WORKSPACE_TOOLS if native_workspace_enabled else frozenset()
         ),
@@ -5542,11 +5372,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
     action_promise_recovery_attempts = 0
     citation_recovery_attempted = False
     force_no_tools_next_round = False
-    # Research can support an editor operation without owning its deliverable.
-    web_briefing_target = (
-        not active_editor_target and broad_current_web_request(direct_user_text)
-    )
-    force_web_search_next_round = web_briefing_target and not native_workspace_enabled
     force_private_browser_next_round = False
     force_web_fetch_next_round = False
     suggestion_retry_required = False
@@ -5614,14 +5439,61 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
     required_artifacts = runtime_required_artifacts(
         direct_user_text, client_runtime_context,
     ) if native_workspace_enabled else tuple()
-    if required_artifacts:
-        web_briefing_target = False
+    # Editor/artifact tasks have their own completion checks and reserved write
+    # budget. Do not reopen general briefing research after producing the output.
+    web_briefing_target = (
+        not active_editor_target and not required_artifacts
+        and broad_current_web_request(direct_user_text)
+    )
+    force_web_search_next_round = web_briefing_target and not native_workspace_enabled
     yield event({'type': 'turn_contract', **turn_contract.audit(), 'schema_mode': 'compact_contract_v5',
                  'native_workspace': native_workspace_enabled,
                  'required_artifacts': list(required_artifacts),
                  'multimodal_image_count': image_context_count,
                  'attachment_reference_count': attachment_refs,
                  'image_rehydration': conversation_diagnostics.get('image_rehydration')})
+    # A photo-edit turn with no open editor has no canvas to drive; offering the
+    # editor tools would only loop until the round cap and end with no answer.
+    # Answer deterministically and ask the user to open the attached image in
+    # the editor (Quick Edit) before applying the request.
+    _photo_editor_active = 'photo_editor' in (getattr(turn_contract, 'active_capabilities', ()) or ())
+    _photo_editor_open = bool(
+        ((client_runtime_context or {}).get('web_ui_state') or {}).get('photo_editor_open')
+    )
+    if _photo_editor_active and not _photo_editor_open:
+        _editor_guidance = (
+            "This image isn't open in the editor yet, so I can't apply edits to the "
+            "canvas from chat. Open the attached image in the editor (Quick Edit) and "
+            "send this request there \u2014 I'll apply it to the canvas."
+        )
+        history.append({'role': 'assistant', 'content': _editor_guidance})
+        yield event({'delta': _editor_guidance})
+        # The user text can carry harness attachment annotations
+        # ("[Image: x.png]", "[No vision model ...]"). Strip them so the
+        # one-click action re-sends only what the user typed.
+        _action_prompt = str(direct_user_text or '')
+        for _annotation in ('\n\n[Image:', '\n[Image:', '\n\n[Attached', '\n[No vision model'):
+            _cut = _action_prompt.find(_annotation)
+            if _cut != -1:
+                _action_prompt = _action_prompt[:_cut]
+        _action_prompt = _action_prompt.strip() or str(direct_user_text or '').strip()
+        # Machine-readable action so the chat UI can render a one-click
+        # "Open in editor & apply" button that loads the attached image and
+        # re-sends this prompt through the photo_editor endpoint.
+        yield event({
+            'type': 'final_response',
+            'content': _editor_guidance,
+            'photo_editor_action': {
+                'kind': 'open_and_apply',
+                'prompt': _action_prompt,
+            },
+        })
+        yield event({'type': 'metrics', 'data': {
+            'model': model, 'rounds': 0, 'round_texts': [_editor_guidance],
+            'tool_events': [], 'tool_calls': 0, 'agent_rounds': 0,
+        }})
+        yield 'data: [DONE]\n\n'
+        return
     try:
         async with httpx.AsyncClient(
             timeout=preview_http_timeout(
@@ -5703,6 +5575,16 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 usage_in += intent_accounting.get('input_tokens', 0)
                 usage_out += intent_accounting.get('output_tokens', 0)
                 has_real_usage = intent_accounting.get('usage_source') == 'real'
+            # Optional env-gated router decision (spec surface only). Computed
+            # once per user turn; disabled/None leaves behaviour unchanged.
+            _spec_route_think = spec_router_thinking_decision(
+                endpoint_url, model, owner, headers, direct_user_text)
+            if _spec_route_think is not None:
+                logging.getLogger(__name__).info(
+                    'spec think router: think=%s p_think=%s ms=%s',
+                    _spec_route_think.get('think'),
+                    _spec_route_think.get('p_think'),
+                    _spec_route_think.get('ms'))
             # One extra iteration is available only when a provider emits raw
             # tool markup during the normal final no-tools round. Ordinary
             # turns still obey ``round_limit`` exactly.
@@ -5860,7 +5742,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     round_offered = artifact_completion_tool_schemas(
                         round_offered, required_artifacts,
                     )
-                round_offered = [schema for schema in round_offered if permitted_schema(schema)]
                 research_choice = None
                 if not required_artifacts:
                     round_offered, research_choice, _ = bounded_research_tool_policy(
@@ -5874,6 +5755,53 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 # budget avoids a reasoning-only response that leaves the
                 # required artifact unwritten.
                 round_max_tokens = request_max_tokens
+                editor_write_complete = (
+                    active_editor_target and successful_write
+                    and not editor_partial_pending and not editor_batch_pending
+                )
+                deliberate = operation_thinking_pending or (
+                    'document_edit' if active_editor_target and not editor_write_complete else
+                    'code' if standalone_code_request(direct_user_text) and not successful_write else
+                    'research_synthesis' if web_briefing_target and successful_web_retrievals >= 2 else ''
+                )
+                if not deliberate:
+                    deliberate = spec_router_think_reason(
+                        round_number, _spec_route_think, deliberate)
+                progressive_thinking = progressive_thinking_for_turn(
+                    model, offered, ignored.get('thinking_mode'),
+                    tool_failed=recovery_thinking_pending,
+                    deliberate=bool(deliberate),
+                )
+                if progressive_thinking and deliberate:
+                    deliberated_operations.add(deliberate)
+                    operation_thinking_rounds.append({'round': round_number, 'reason': deliberate})
+                operation_thinking_pending = ''
+                if progressive_thinking and recovery_thinking_pending:
+                    recovery_thinking_rounds.append(round_number)
+                    yield event({'type': 'tool_loop_recovery',
+                                 'reason': 'progressive_thinking', 'round': round_number})
+                # Reserve room for a private reasoning trace. Progressive Qwen
+                # asks for it explicitly; reasoning-capable providers such as
+                # DeepSeek V4 stream reasoning_content against max_tokens, so the
+                # default 768-token budget can starve the visible answer.
+                if progressive_thinking:
+                    # Reserve room for reasoning and repair, honoring explicit limits.
+                    round_max_tokens = max(round_max_tokens, 4096)
+                    if max_tokens and int(max_tokens) > 0:
+                        round_max_tokens = min(round_max_tokens, int(max_tokens))
+                elif (
+                    supports_user_thinking_toggle(model)
+                    and str(ignored.get('thinking_mode') or '').strip().lower() != 'off'
+                ):
+                    # Reasoning is on by default for these providers and its
+                    # tokens count against max_tokens, so raise the ceiling above
+                    # the 768-token chat default. An explicit larger cap still
+                    # wins; the model stops early, so this is a ceiling only.
+                    floor = 4096
+                    if max_tokens and int(max_tokens) > floor:
+                        floor = min(int(max_tokens), 8192)
+                    round_max_tokens = max(round_max_tokens, floor)
+                recovery_thinking_pending = False
                 request = {'model': model, 'messages': request_messages, 'temperature': temperature,
                            'max_tokens': round_max_tokens, 'stream': True,
                            'stream_options': {'include_usage': True},
@@ -5886,6 +5814,8 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     and not editor_partial_pending and not editor_batch_pending
                 )
                 if editor_write_complete:
+                    request['chat_template_kwargs']['enable_thinking'] = False
+                    progressive_thinking = False
                     request['max_tokens'] = min(round_max_tokens, 256)
                     request['messages'] = [*request['messages'], {
                         'role': 'user', 'content':
@@ -6039,15 +5969,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 pending, content, round_reasoning = {}, '', ''
                 document_preview_index = None
                 document_preview_content = ''
-                if 'tools' in request:
-                    request['tools'] = [schema for schema in request['tools'] if permitted_schema(schema)]
-                    offered_names = {schema['function']['name'] for schema in request['tools']}
-                    choice = request.get('tool_choice')
-                    if not request['tools']:
-                        for key in ('tools', 'tool_choice', 'parallel_tool_calls'):
-                            request.pop(key, None)
-                    elif isinstance(choice, dict) and choice.get('function', {}).get('name') not in offered_names:
-                        request.pop('tool_choice', None)
                 can_preview_document = any(
                     schema.get('function', {}).get('name') == 'create_document'
                     for schema in request.get('tools', [])
@@ -6056,6 +5977,19 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 request = search_tool_choice_request(request)
                 tool_call_requested = request.get('tool_choice') not in (None, 'auto', 'none')
                 request = provider_compatible_tool_choice_request(request, model)
+                # Log the tool surface actually sent to the provider: the
+                # metrics `tool_schema_names` reports the pre-narrowing
+                # `offered` set, which hid the fact that a forced choice had
+                # shrunk the provider tools array to one schema.
+                logging.getLogger(__name__).info(
+                    "clean preview round %s sending %d tool(s): %s",
+                    round_number,
+                    len(request.get('tools') or []),
+                    [
+                        (schema.get('function') or {}).get('name')
+                        for schema in (request.get('tools') or [])
+                    ][:40],
+                )
                 if active_editor_target and request.get('tools'):
                     # Edits share mutable document state. Await a saved result
                     # before asking for another call; one call may still batch
@@ -6094,6 +6028,17 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     # established budget/error semantics.
                     round_offered = list(request.get('tools') or [])
                 finish_during_stream = False
+                # stream_preview talks to the provider directly and therefore
+                # bypasses the llm_core request pipeline. Apply the DeepSeek V4
+                # reasoning toggle here too, otherwise a user's thinking_mode
+                # choice is silently ignored for these sessions.
+                from src.llm_core import _apply_deepseek_v4_reasoning_defaults
+                _apply_deepseek_v4_reasoning_defaults(
+                    request, endpoint_url, model, ignored.get('thinking_mode'),
+                )
+                think_split_state = {'think_emitted': 0, 'answer_emitted': 0, 'closed': False}
+                round_reasoning_seen = False
+                think_answer_streamed = False
                 async with preview_model_response(client, endpoint_url, headers, request, context_recovery) as response:
                     response.raise_for_status()
                     finish_event = (
@@ -6111,7 +6056,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             provider_error = payload['error']
                             if isinstance(provider_error, dict):
                                 provider_error = provider_error.get('message') or provider_error.get('detail')
-                            detail = str(provider_error or 'Unknown provider error').strip()
+                            detail = str(provider_error or 'Unknown provider error').strip()[:300]
                             raise ProviderStreamError(detail)
                         usage = payload.get('usage') or {}
                         if usage:
@@ -6135,11 +6080,41 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         )
                         if reasoning:
                             round_reasoning += str(reasoning)
+                            round_reasoning_seen = True
                         text = delta.get('content') or ''
                         if text:
                             first_token = first_token or time.monotonic()
                             content += text
                             if (
+                                progressive_thinking
+                                and not round_reasoning_seen
+                                and not prior_summary_answer
+                                and not source_lookup_pending
+                                and not tool_call_requested
+                                and not pending
+                            ):
+                                # No reasoning parser: the model's <think>…</think>
+                                # trace arrives as ordinary content. Stream the
+                                # trace as thinking deltas and the text after
+                                # </think> as content instead of buffering the
+                                # whole round (which showed nothing, then dumped
+                                # the answer at once).
+                                for split_event in qwen_think_split_events(content, think_split_state):
+                                    if (
+                                        replace_streamed_draft_on_finish
+                                        and not streamed_round_text
+                                        and not split_event.get('thinking')
+                                    ):
+                                        split_event = {
+                                            **split_event,
+                                            'render_owner': 'streamed',
+                                            'replacement_scope': 'turn',
+                                        }
+                                    yield event(split_event)
+                                    if not split_event.get('thinking'):
+                                        streamed_round_text = True
+                                        think_answer_streamed = True
+                            elif (
                                 not prior_summary_answer
                                 and not progressive_thinking
                                 and not source_lookup_pending
@@ -6194,7 +6169,12 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     break
                 if progressive_thinking:
                     content = visible_content_after_qwen_thinking(content)
-                    if content and not prior_summary_answer and not source_lookup_pending:
+                    if think_answer_streamed:
+                        # The answer already went out as live deltas during the
+                        # split; never dump it a second time.
+                        streamed_round_text = True
+                    elif (content and not prior_summary_answer and not source_lookup_pending
+                            and not pending):
                         yield event({'delta': content})
                         streamed_round_text = True
                 proposed = [pending[i] for i in sorted(pending)]
@@ -6536,6 +6516,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                     result.get('error')
                                     or result.get('exit_code') not in (None, 0)
                                 )
+                                recovery_thinking_pending |= failed
                                 output = result.get('output') or result.get('error') or result
                                 output = output if isinstance(output, str) else json.dumps(
                                     output, ensure_ascii=False,
@@ -6630,7 +6611,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     if (
                         native_workspace_enabled
                         and content
-                        and contains_detailed_sequence_request(direct_user_text)
+                        and DETAILED_VIDEO_REQUEST.search(direct_user_text)
                         and successful_video_inspections == 1
                         and not media_detail_nudge_sent
                         and round_number < round_limit
@@ -6695,6 +6676,25 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         # that draft and persisted history with the evidence-backed result.
                         history.pop()
                         refusal = denied_response()
+                        # A photo-editor turn with no canvas command actually executed
+                        # (no browser editor attached) cannot claim the edit. Point the
+                        # user at the editor instead of the generic no-op refusal.
+                        if 'photo_editor' in (getattr(turn_contract, 'active_capabilities', ()) or ()):
+                            touched_canvas = any(
+                                str(e.get('tool') or '') in {
+                                    'run_editor_command', 'get_editor_screenshot',
+                                    'ai_edit_image', 'generate_image',
+                                }
+                                and not e.get('error') and e.get('exit_code', 0) == 0
+                                for e in executions
+                            )
+                            if not touched_canvas:
+                                refusal = (
+                                    'This photo is not open on the editor canvas, so I cannot '
+                                    'apply edits to it from chat. Open the attached image in the '
+                                    'editor (Quick Edit) and send the request there, and I will '
+                                    'apply it to the canvas.'
+                                )
                         history.append({'role': 'assistant', 'content': refusal})
                         yield event({'type': 'final_response', 'content': refusal})
                         break
@@ -6726,6 +6726,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 # policy. A harmless read followed by blocked mutations must
                 # not partially execute or emit one denial per attempted row.
                 batch_policy_denied = False
+                batch_deliberation = ''
                 for call in proposed:
                     try:
                         preflight_name = offered_tool_alias(
@@ -6788,6 +6789,12 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             policy_decisions.append({'round': round_number, **decision.audit()})
                             batch_policy_denied = True
                             break
+                        if not batch_deliberation:
+                            reason = tool_deliberation_reason(preflight_name, preflight_args)
+                            if reason and progressive_thinking:
+                                deliberated_operations.add(reason)
+                            if reason not in deliberated_operations:
+                                batch_deliberation = reason
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError, jsonschema.ValidationError):
                         # Malformed calls still enter the normal tool-error
                         # feedback path so the model can repair their syntax.
@@ -6798,6 +6805,21 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     history.append({'role': 'assistant', 'content': refusal})
                     yield event({'type': 'final_response', 'content': refusal})
                     break
+                if (batch_deliberation and not progressive_thinking
+                        and uses_odysseus_progressive_thinking(model)
+                        and round_number < round_limit):
+                    # No call has executed. Remove the unexecuted call envelope
+                    # so the next request contains no orphaned tool-call IDs.
+                    history.pop()
+                    operation_thinking_pending = batch_deliberation
+                    history.append({'role': 'user', '_harness_control': True, 'content':
+                        'Before executing the proposed operation, review its arguments against '
+                        'the user request and the available evidence. Nothing in this proposed '
+                        'batch has executed. Return the corrected tool calls, or obtain missing '
+                        'evidence first. Do not expand permissions or assume missing facts. '
+                        'Proposed batch: ' + json.dumps(proposed, ensure_ascii=False)})
+                    replace_streamed_draft_on_finish |= streamed_round_text
+                    continue
                 terminal_denial = False
                 terminal_suppression_violation = False
                 terminal_search_budget_violation = False
@@ -6810,6 +6832,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 # request with HTTP 400.  Collect visual evidence while the
                 # batch executes and append it only after every tool result.
                 round_visual_blocks = []
+                ask_user_turn_end = False
                 for call in proposed:
                     name = offered_tool_alias(call['function']['name'], round_offered)
                     arguments = call['function']['arguments']
@@ -6817,10 +6840,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     result, desc, policy_denied, block = None, name, False, None
                     args = {}
                     execution_attempted = False
-                    # Guidance a preview validator authored for this call. It
-                    # is the only failure text returned verbatim; exception
-                    # text goes through _public_preview_tool_error.
-                    validator_error = ''
                     call_signature = None
                     semantic_scope = None
                     try:
@@ -6879,12 +6898,11 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             prior_outcome = browser_navigation_outcomes.get(requested_url)
                             if requested_url and prior_outcome and prior_outcome[1] >= 2:
                                 calls += 1
-                                validator_error = (
+                                raise ValueError(
                                     f'Opening {requested_url} twice reached the same page '
                                     f'({prior_outcome[0]}). Do not repeat it; use the current '
                                     'page evidence or a different navigation strategy.'
                                 )
-                                raise ValueError(validator_error)
                         if tool_type == 'web_search':
                             web_search_attempts += 1
                             if not native_workspace_enabled and web_search_attempts > 3:
@@ -6978,7 +6996,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                     'This exact invalid call was repeated after two validation failures; '
                                     'the tool is disabled for this turn.'
                                 )
-                            validator_error = semantic_error
                             raise ValueError(semantic_error)
                         if canonical(name) == 'bash':
                             command = str(args.get('command') or '')
@@ -6987,7 +7004,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                 calls += 1
                                 suppressed_tool_until_round['bash'] = round_number + 1
                                 round_recovery_messages.append(sensitive_error)
-                                validator_error = sensitive_error
                                 raise ValueError(sensitive_error)
                             misused_native_tool = shell_native_tool_command_misuse(
                                 command, round_offered,
@@ -7001,7 +7017,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                     'with its offered schema.'
                                 )
                                 round_recovery_messages.append(recovery)
-                                validator_error = recovery
                                 raise ValueError(recovery)
                         semantic_scope = semantic_repeat_scope(name, args)
                         if (
@@ -7058,11 +7073,10 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         if canonical(name) in permanently_suppressed_tools:
                             calls += 1
                             terminal_suppression_violation = True
-                            validator_error = (
+                            raise ValueError(
                                 f'{name} was disabled after repeated identical calls; '
                                 'no further execution was attempted.'
                             )
-                            raise ValueError(validator_error)
                         success_repeat_limit = (
                             private_browser_success_repeat_limit(args)
                             if tool_type == 'private_browser' else 1
@@ -7155,7 +7169,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             )
                             if artifact_code_error:
                                 round_recovery_messages.append(artifact_code_error)
-                                validator_error = artifact_code_error
                                 raise ValueError(artifact_code_error)
                         decision = evaluate_preview_call(
                             name, args, latest_user,
@@ -7358,19 +7371,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         ):
                             artifact_body_handoff_attempts += 1
                             artifact_body_handoff_target = handoff_target
-                        logging.getLogger(__name__).warning(
-                            'Clean v3 tool call failed: %s', exc, exc_info=True,
-                        )
-                        if not validator_error and isinstance(exc, jsonschema.ValidationError) and schema:
-                            validator_error = _schema_argument_hint(args, schema['function']['parameters'])
-                        result = {
-                            'error': (
-                                validator_error if validator_error and not execution_attempted
-                                else _public_preview_tool_error(exc, execution_attempted=execution_attempted)
-                            ),
-                            'error_category': 'tool_execution_error' if execution_attempted else 'invalid_tool_arguments',
-                            'exit_code': 1,
-                        }
+                        result = {'error': str(exc).splitlines()[0][:300], 'exit_code': 1}
                     if (canonical(block.tool_type if block is not None else name) == 'youtube_tool'
                             and result.get('exit_code') not in (None, 0)):
                         round_recovery_messages.append(
@@ -7447,6 +7448,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             'type': 'tool_loop_recovery',
                             'reason': 'web_fetch_boilerplate_fallback',
                         })
+                    recovery_thinking_pending |= failed
                     if not failed and canonical(actual_tool) == 'web_search':
                         embedded_urls = search_embedded_article_urls(output)
                         if embedded_urls:
@@ -7495,6 +7497,8 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     browser_access_blocked = (
                         canonical(actual_tool) == 'private_browser'
                         and not failed
+                        # Compaction is for model readability; title/snapshot
+                        # relationships must remain intact for recovery checks.
                         and browser_observation_access_blocked(result.get('output') or result)
                     )
                     browser_page_missing = (
@@ -7502,6 +7506,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         and not failed
                         and browser_observation_page_missing(output)
                     )
+                    recovery_thinking_pending |= browser_access_blocked or browser_page_missing
                     if browser_page_missing:
                         round_recovery_messages.append(
                             'The browser displayed a missing-page error, not article evidence. '
@@ -7559,9 +7564,12 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         requested_browser_url = private_browser_open_url(args)
                         effective_browser_url = private_browser_effective_url(result)
                         browser_search_url = requested_browser_url or effective_browser_url
-                        is_search_engine_navigation = contains_search_engine_navigation(
-                            browser_search_url
-                        ) or bool(re.search(
+                        is_search_engine_navigation = bool(re.search(
+                            r'https?://(?:[^/]+\.)?(?:google\.[^/]+|bing\.com|duckduckgo\.com)'
+                            r'/(?:search|sorry|html|lite|\?)',
+                            browser_search_url,
+                            re.I,
+                        )) or bool(re.search(
                             r'https?://(?:[^/]+\.)?google\.[^/]+/sorry/',
                             effective_browser_url,
                             re.I,
@@ -7729,9 +7737,11 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                   'execution_attempted': execution_attempted,
                                   'blocked': policy_denied or schema is None,
                                   'desc': desc, 'round': round_number}
-                    for error_category in ('tool_execution_error', 'invalid_tool_arguments'):
-                        if result.get('error_category') == error_category:
-                            tool_event['error_category'] = error_category
+                    if isinstance(result.get('ask_user'), dict):
+                        # Copy the interactive payload into the persisted tool
+                        # event so history reload can reconstruct the card even
+                        # after the turn ends without another provider round.
+                        tool_event['ask_user'] = result['ask_user']
                     reader_event = email_reader_event(direct_user_text, actual_tool, args, result, failed=failed)
                     if reader_event:
                         yield event(reader_event)
@@ -7843,6 +7853,19 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     record_tool_execution(executions, tool_event)
                     yield event(tool_event)
                     history.append({'role': 'tool', 'tool_call_id': call['id'], 'content': output})
+                    ask_user_payload = result.get('ask_user')
+                    if isinstance(ask_user_payload, dict) and str(ask_user_payload.get('question') or '').strip():
+                        # ask_user is a turn boundary, not an ordinary tool.
+                        # Emit the interactive card, persist the question as the
+                        # assistant text (so the model sees it was already asked
+                        # next turn), and stop without feeding the tool result
+                        # back for another provider round.
+                        ask_question = str(ask_user_payload['question']).strip()
+                        history.append({'role': 'assistant', 'content': ask_question})
+                        yield event({'type': 'final_response', 'content': ask_question})
+                        yield event({'type': 'ask_user', 'data': ask_user_payload})
+                        ask_user_turn_end = True
+                        break
                     if (not failed and block is not None and block.tool_type == 'web_fetch'
                             and len(proposed) == 1 and result.get('page_entries')
                             and set(turn_contract.required) <= {'web_fetch', 'web_search', 'extract_text'}):
@@ -8069,6 +8092,10 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         )
                     if policy_denied:
                         terminal_denial = True
+                if ask_user_turn_end:
+                    # The ask_user card is the final UI event; end the turn and
+                    # wait for the user's selection instead of advancing a round.
+                    break
                 if round_visual_blocks:
                     visual_message = untrusted_context_message(
                         'tool visual evidence',
@@ -8139,7 +8166,43 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         'round': round_number,
                     })
                 if terminal_denial:
-                    refusal = denied_response()
+                    usable_evidence = any(
+                        not e.get('error') and e.get('exit_code', 0) == 0 and not e.get('blocked')
+                        for e in executions
+                    )
+                    if usable_evidence:
+                        # A denied call must not discard evidence a successful call already
+                        # produced. Recover by answering from the evidence we have and stating
+                        # plainly what could not be done, instead of a blanket refusal.
+                        if not round_recovery_messages:
+                            recovery = (
+                                'One or more tool calls were denied, but earlier tool calls in '
+                                'this turn returned usable evidence. Do not repeat any denied '
+                                'call and do not call more tools. Using only the evidence '
+                                'already returned, provide the best complete final answer now, '
+                                'and briefly state what you could not do because it was not '
+                                'permitted.'
+                            )
+                            if history and history[-1].get('_harness_control'):
+                                history[-1]['content'] = (
+                                    str(history[-1].get('content') or '') + ' ' + recovery
+                                )
+                            else:
+                                history.append({
+                                    'role': 'user', '_harness_control': True, 'content': recovery,
+                                })
+                        force_no_tools_next_round = True
+                        yield event({
+                            'type': 'completion_recovery',
+                            'reason': 'denial_after_successful_evidence',
+                            'round': round_number,
+                        })
+                        continue
+                    refusal = (
+                        WORKSPACE_REQUIRED_REFUSAL
+                        if workspace_process_denial(executions)
+                        else denied_response()
+                    )
                     history.append({'role': 'assistant', 'content': refusal})
                     yield event({'type': 'final_response', 'content': refusal})
                     break
@@ -8304,9 +8367,9 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 else:
                     yield event({'delta': '\nThe preview reached its round limit. Please narrow the request.'})
     except ProviderStreamError as exc:
-        detail = 'The selected model provider failed while generating. Retry or choose another model.'
-        logging.getLogger(__name__).warning('Clean v3 provider stream failed: %s', exc, exc_info=True)
-        yield f'event: error\ndata: {json.dumps({"status": 502, "error": detail, "error_category": "provider_stream_error"})}\n\n'
+        detail = f'The selected model provider failed while generating: {exc}'
+        logging.getLogger(__name__).warning('Clean v3 provider stream failed: %s', exc)
+        yield f'event: error\ndata: {json.dumps({"status": 502, "error": detail})}\n\n'
         return
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
@@ -8360,5 +8423,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
         'policy_decisions': policy_decisions,
         'schema_mode': 'compact_contract_v5', 'clean_v3_preview': True,
         'thinking_mode': 'progressive_on' if progressive_thinking else 'off',
+        'recovery_thinking_rounds': recovery_thinking_rounds,
+        'operation_thinking_rounds': operation_thinking_rounds,
     }})
     yield 'data: [DONE]\n\n'

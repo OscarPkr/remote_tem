@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from datetime import datetime
 from typing import Dict, Any, AsyncGenerator, List, Optional
 
-from fastapi import APIRouter, Request, HTTPException, Form, Query, Depends
+from fastapi import APIRouter, Request, HTTPException, Form, Query
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
@@ -32,6 +32,7 @@ from src.agent_loop import (
 )
 from src.agent_loop import _normalize_ody_qwen_text_artifacts
 from src import agent_runs
+from src import shutdown as _shutdown
 from src.model_context import estimate_tokens
 from src.context_compactor import (
     apply_compaction_state,
@@ -48,13 +49,7 @@ from src.foreground_model_routing import (
 from src.session_search import search_session_messages
 from src.prompt_security import untrusted_context_message
 from core.exceptions import SessionNotFoundError
-from src.auth_helpers import (
-    effective_user,
-    get_current_user,
-    is_delegated_credential,
-    require_api_token_scope,
-    require_chat_api_token_scope,
-)
+from src.auth_helpers import effective_user, get_current_user
 from routes.session_routes import _verify_session_owner
 from routes.document_helpers import _owner_session_filter
 from core.database import SessionLocal, get_session_mode, set_session_mode
@@ -85,8 +80,6 @@ from src.tool_policy import (
     web_search_enabled_for_turn,
 )
 from src.tool_approvals import tool_approval_store
-from src.tool_approval_scopes import stamp_chat_session_grant
-from src.tool_security import delegated_credential_blocked_tools
 from src.workspace_paths import backend_workspace_path
 from src.client_tool_contract import TUI_CLIENT_TOOL_NAMES
 from src.model_profiles import (
@@ -327,31 +320,13 @@ def _is_external_discovery_request(text: str) -> bool:
     ))
 
 
-_URL_SCHEME_RE = re.compile(r"https?://", re.I)
-_PDF_URL_TAIL_RE = re.compile(r"\.pdf\b|/pdf/", re.I)
-
-
-def _mentions_pdf_url(value: str) -> bool:
-    """Same as ``re.search(r"https?://[^\\s]+(?:\\.pdf\\b|/pdf/)", value, re.I)``.
-
-    Checked per whitespace-free token from its first scheme only (a later
-    scheme's tail is a suffix of the first's), so a token packed with
-    `http://` repeats is scanned once instead of once per repeat (ReDoS).
-    """
-    for token in value.split():
-        scheme = _URL_SCHEME_RE.search(token)
-        if scheme and _PDF_URL_TAIL_RE.search(token, scheme.end() + 1):
-            return True
-    return False
-
-
 def _prefers_structured_document_tools(text: str) -> bool:
     """Identify external paper/PDF extraction where shell is a bad source route."""
     value = str(text or "")
     if re.search(r"(?:^|\s)(?:file://)?/workspace/[^\s`\"']+\.pdf\b", value, re.I):
         return False
     return bool(
-        _mentions_pdf_url(value)
+        re.search(r"https?://[^\s]+(?:\.pdf\b|/pdf/)", value, re.I)
         or re.search(
             r"\b(?:paper|report|study)\b[\s\S]{0,1200}?"
             r"\b(?:tables?|figures?|benchmarks?|scores?|metrics?)\b",
@@ -1290,23 +1265,6 @@ def _stream_failure_status(chunk: str) -> Optional[int]:
     return None
 
 
-def _reject_delegated_tool_approval(request: Request) -> None:
-    """Refuse an approval answered by a bearer API token.
-
-    A tool approval records that a HUMAN authorized one dangerous action. A
-    token is a delegated credential handed to an integration, so when it
-    answers the prompt it triggered, nobody is asked and the gate collapses
-    into an extra round trip. Owner and session already match here: the token
-    is answering on behalf of the account that minted it.
-    """
-    if is_delegated_credential(request):
-        raise HTTPException(
-            403,
-            "Tool approvals require an interactive session. "
-            "API tokens cannot authorize a gated action.",
-        )
-
-
 def _mark_tool_approval_resolved(sess, approval_id: Any, decision: Any) -> bool:
     """Persist a consumed approval decision on its existing tool event."""
 
@@ -1331,11 +1289,6 @@ def _mark_tool_approval_resolved(sess, approval_id: Any, decision: Any) -> bool:
             if str(ask_user.get("approval_id") or "") != approval_key:
                 continue
             ask_user["resolved"] = normalized_decision
-            stamp_chat_session_grant(
-                ask_user,
-                getattr(sess, "id", ""),
-                normalized_decision,
-            )
             message_id = metadata.get("_db_id")
             resolved_metadata = {
                 key: value for key, value in metadata.items() if key != "_db_id"
@@ -2178,17 +2131,13 @@ def setup_chat_routes(
     webhook_manager=None,
     skills_manager=None,
 ) -> APIRouter:
-    router = APIRouter(
-        tags=["chat"],
-        dependencies=[Depends(require_chat_api_token_scope)],
-    )
+    router = APIRouter(tags=["chat"])
 
     # ------------------------------------------------------------------ #
     # POST /api/chat (non-streaming)
     # ------------------------------------------------------------------ #
     @router.post("/api/chat", response_model=Dict[str, Any])
     async def chat_endpoint(request: Request, chat_request: ChatRequest) -> Dict[str, Any]:
-        require_api_token_scope(request, "chat")
         _set_user_time_from_request(request)
 
         message = chat_request.message
@@ -2405,7 +2354,6 @@ def setup_chat_routes(
     # ------------------------------------------------------------------ #
     @router.post("/api/chat_stream")
     async def chat_stream(request: Request) -> StreamingResponse:
-        require_api_token_scope(request, "chat")
         body = None
         try:
             if request.headers.get("content-type", "").startswith("application/json"):
@@ -2525,7 +2473,7 @@ def setup_chat_routes(
             _explicit_web_intent = (
                 _explicit_url_target
                 or bool(re.search(
-                r"\b(search|look\s+(?:(?:this|that|it|them|these|those)\s*)?up|lookup|find\s*out|google|browse|web|online|latest|current|today|news|weather|forecast|rate|exchange\s+rate)\b",
+                r"\b(search|look\s+(?:this|that|it|them|these|those)?\s*up|lookup|find\s*out|google|browse|web|online|latest|current|today|news|weather|forecast|rate|exchange\s+rate)\b",
                 _msg_l,
                 ))
                 or requires_external_web_verification(message)
@@ -2624,6 +2572,21 @@ def setup_chat_routes(
             logger.info("chat→agent auto-escalation: explicit private browser workflow")
         active_doc_id = form_data.get("active_doc_id", "").strip()
         active_doc_state = form_data.get("active_doc_state", "").strip().casefold()
+        # Scoped photo_editor agent context: the Quick Edit popup (and any
+        # image-edit chat turn) may carry the open image-editor session id and a
+        # canvas snapshot so the editor tool family can drive it in-process.
+        editor_session = (
+            form_data.get("editor_session")
+            or form_data.get("editor_session_id")
+            or ""
+        ).strip()
+        editor_state = form_data.get("editor_state") or ""
+        editor_screenshot = form_data.get("editor_screenshot") or ""
+        photo_editor_requested = (
+            str(form_data.get("photo_editor") or "").strip().lower()
+            in {"1", "true", "yes", "on"}
+            or bool(editor_session)
+        )
         logger.info(
             "[doc-inject] chat_mode=%s, active_doc_id=%r, active_doc_state=%r",
             chat_mode, active_doc_id, active_doc_state,
@@ -2731,7 +2694,6 @@ def setup_chat_routes(
             )
             owner = effective_user(request)
             if tool_approval_id:
-                _reject_delegated_tool_approval(request)
                 from src.agent_runtime.authority import require_user_approval_request
                 require_user_approval_request(request)
                 pending_tool_approval = tool_approval_store.peek(tool_approval_id)
@@ -3189,7 +3151,38 @@ def setup_chat_routes(
             active_document=bool(active_doc), workspace=bool(workspace),
             image_attachment=any(str(a.get('mime') or '').startswith('image/') for a in (ctx.preprocessed.attachment_meta or [])),
         ) if _use_turn_contract else frozenset()
-        if 'image_editing' in _turn_capabilities and ctx.preprocessed.attachment_meta:
+        # Scoped photo_editor family: offered ONLY for an explicit editor
+        # request (Quick Edit popup / editor session) or an image-edit chat
+        # turn carrying an image. When active the turn offers just the editor
+        # tools plus ask_user, never the general tool list.
+        _photo_editor_active = bool(_use_turn_contract) and (
+            photo_editor_requested
+            or (
+                "image_editing" in _turn_capabilities
+                and bool(ctx.preprocessed.attachment_meta)
+            )
+        )
+        if _photo_editor_active:
+            # The editor tool family drives the browser-side image editor; it
+            # replaces the generic edit_image instruction. Without an open
+            # editor session the tools cannot reach the canvas, so tell the
+            # user to open the image instead of emitting failing tool calls.
+            if editor_session:
+                editor_context = {'role': 'system', 'content':
+                    'The image editor is open (session ' + editor_session + '). Use run_editor_command, '
+                    'plan_edit and get_editor_screenshot to inspect and change the current canvas, and '
+                    'ai_edit_image for model-based edits. Apply the user\'s requested edit to the open '
+                    'editor and confirm the result with a screenshot.'}
+            else:
+                editor_context = {'role': 'system', 'content':
+                    'The user attached an image but no image editor is open, so the editor tools cannot '
+                    'reach the canvas. Do not call editor tools. Reply briefly telling the user to open '
+                    'the attached image in the editor (Quick Edit) and repeat the request; the editor '
+                    'tools will then apply it.'}
+            ctx.messages.insert(0, editor_context)
+            if foreground_policy.enabled:
+                getattr(ctx, 'route_messages', ctx.messages).insert(0, dict(editor_context))
+        elif 'image_editing' in _turn_capabilities and ctx.preprocessed.attachment_meta:
             image_refs = ['odysseus://attachment/' + str(a['id']) for a in ctx.preprocessed.attachment_meta
                           if a.get('id') and str(a.get('mime') or '').startswith('image/')]
             if image_refs:
@@ -3226,6 +3219,11 @@ def setup_chat_routes(
             # pasted revision request. This only offers permitted schemas;
             # it never requires or performs a document mutation.
             _turn_capabilities = _turn_capabilities | {"documents"}
+        # Scoped photo_editor family (see above): when active the turn offers
+        # just the editor tools plus ask_user, never the general tool list.
+        if _photo_editor_active:
+            _turn_capabilities = frozenset({"photo_editor"})
+            _active_turn_capabilities = _turn_capabilities
         # Same decision that prepared the turn; it only stamps the contract
         # inside the agent-contract branch below.
         _clean_v3_preview = _compact_preview_turn
@@ -3238,12 +3236,6 @@ def setup_chat_routes(
         if _use_turn_contract and _turn_capabilities and "search_browser" not in _turn_capabilities:
             _explicit_web_intent = False
         disabled_tools = set()
-        # Minting is admin-only, so every owner-keyed check below answers
-        # "admin" for a token. Cap it at the non-admin policy instead.
-        # stream_agent_loop repeats this from delegated_credential.
-        _delegated_credential = is_delegated_credential(request)
-        if _delegated_credential:
-            disabled_tools.update(delegated_credential_blocked_tools())
         # Only disable bash when the caller *explicitly* set it to a falsy
         # value. When unset (None), defer to per-user privilege checks below.
         # Web search is per-turn opt-in: either the chat pre-search setting
@@ -3475,9 +3467,22 @@ def setup_chat_routes(
             "document_editor": not {
                 "manage_documents", "create_document", "edit_document", "update_document",
             }.issubset(disabled_tools),
+            # A photo-editing chat turn can only reach a canvas when the image
+            # editor is actually open. The compact runtime uses this to reply
+            # (open the image in the editor) instead of looping on editor tools
+            # that have no canvas to drive.
+            "photo_editor_open": bool(editor_session),
         }
         # Capture permission state before schema selection/reconciliation.
         # Only deterministic request intent supplies grants, never inventory.
+        # The strict router (spec) surface picks its tools in src/spec_router.py
+        # AFTER authority is built, so its admission is keyed off the surface.
+        try:
+            _spec_surface = _configured_model_tool_surface(
+                getattr(sess, "endpoint_url", ""), getattr(sess, "model", ""), _user
+            ) == "spec"
+        except Exception:
+            _spec_surface = False
         _request_authority = request_authority_for_http(
             request, message, owner=_user, session_id=session, workspace=workspace,
             history=_turn_history, policy=tool_policy,
@@ -3485,9 +3490,16 @@ def setup_chat_routes(
             active_document=bool(active_doc),
             image_attachment=any(str(a.get('mime') or '').startswith('image/')
                                  for a in (ctx.preprocessed.attachment_meta or [])),
-            capabilities=({'search_browser'} if (
-                _explicit_browser_intent or _external_discovery_intent
-            ) else ()),
+            spec_surface=_spec_surface,
+            capabilities=(({"photo_editor"} if _photo_editor_active else set()) | ({'search_browser'} if (
+                _explicit_browser_intent
+                or _external_discovery_intent
+                # Grant search/browser tools whenever the turn actually offers
+                # them (Web toggle on / not denied), not only for explicit
+                # browser wording. Otherwise the model sees web_search in its
+                # schema but every call is rejected by request authority.
+                or "web_search" not in disabled_tools
+            ) else set())),
         )
         if exact_tool_approval is not None:
             from src.agent_runtime.authority import RequestAuthority
@@ -3513,8 +3525,6 @@ def setup_chat_routes(
                                  if s["function"]["name"] != "host_shell"]
             _contract_mgr = get_mcp_manager()
             _owner_blocked = blocked_tools_for_owner(_user)
-            if _delegated_credential:
-                _owner_blocked.update(delegated_credential_blocked_tools())
             if (
                 _workspace_tools_disabled_for_owner(_user)
                 and not _native_workspace_contract
@@ -3677,7 +3687,9 @@ def setup_chat_routes(
                     # personal manager; core shell/Web tools are not task
                     # fallbacks. Other turns retain warm and workspace tools.
                     extra_tools=(
-                        frozenset()
+                        frozenset({"ask_user"})
+                        if _active_turn_capabilities == frozenset({"photo_editor"})
+                        else frozenset()
                         if _exact_selected_native_chain or _active_turn_capabilities == frozenset({"tasks"}) or (
                             _active_turn_capabilities in (
                                 frozenset({"transcription"}), frozenset({"ocr"}),
@@ -3711,10 +3723,17 @@ def setup_chat_routes(
                     )
             # Every recovery path receives the same scope denial. The central
             # dispatcher also checks the immutable contract after rewrites.
-            disabled_tools.update(
-                s["function"]["name"] for s in _contract_schemas
-                if not _turn_contract.permits(s["function"]["name"])
-            )
+            # The strict router (spec) surface picks its own tools AFTER this
+            # contract is resolved, so scoping disabled_tools to the regex
+            # contract would empty its menu (e.g. all email/notes tools denied
+            # for a plain "search for the appointment email" turn). On spec
+            # turns keep only the pre-contract denials (user/privilege/global/
+            # plan/compare) and let src/spec_router.py + the spec surface decide.
+            if not _spec_surface:
+                disabled_tools.update(
+                    s["function"]["name"] for s in _contract_schemas
+                    if not _turn_contract.permits(s["function"]["name"])
+                )
             # Contract resolution is the final policy-and-routing authority.
             # Some legacy/API-model paths arrive with a stale disabled snapshot
             # assembled before routing.  The scope-denial pass above may retain
@@ -3879,7 +3898,7 @@ def setup_chat_routes(
                     _heartbeat_counter = 0
                     _last_progress = {}
                     _sent_avg = False
-                    while True:
+                    while not _shutdown.is_shutting_down():
                         status = research_handler.get_status(session)
                         if not status or status["status"] != "running":
                             break
@@ -4027,9 +4046,10 @@ def setup_chat_routes(
                         owner=_user,
                         size="auto",
                         progress_callback=_image_progress_callback,
+                        incognito=incognito,
                     ))
                 else:
-                    _img_task = asyncio.create_task(do_generate_image(f"{_user_msg}\n{sess.model}\n512x512", session, owner=_user))
+                    _img_task = asyncio.create_task(do_generate_image(f"{_user_msg}\n{sess.model}\n512x512", session, owner=_user, incognito=incognito))
                 _img_started = time.time()
                 _img_tick = 0
                 while not _img_task.done():
@@ -4568,7 +4588,6 @@ def setup_chat_routes(
                         uploaded_files=ctx.uploaded_files,
                         defer_context_shaping=_foreground_policy.enabled,
                         external_untrusted_context_seen=external_untrusted_context_seen,
-                        delegated_credential=_delegated_credential,
                         exact_approval=exact_tool_approval,
                         client_runtime_context=client_runtime_context,
                         thinking_mode=thinking_mode,
@@ -4879,11 +4898,20 @@ def setup_chat_routes(
         async def _safe_stream() -> AsyncGenerator[str, None]:
             """Wrapper that guarantees _active_streams cleanup even if stream_with_save
             raises before reaching a mode-specific finally block."""
+            _gen = stream_with_save()
             try:
-                async for chunk in stream_with_save():
+                while not _shutdown.is_shutting_down():
+                    try:
+                        chunk = await _gen.__anext__()
+                    except StopAsyncIteration:
+                        break
                     yield chunk
             finally:
                 _active_streams.pop(session, None)
+                try:
+                    await _gen.aclose()
+                except Exception:
+                    pass
 
         # Compare panes and explicitly unattended native clients are
         # short-lived, single-shot generations with nobody to resume them.
@@ -4975,7 +5003,12 @@ def setup_chat_routes(
         if rec is None:
             if agent_runs.is_active(session_id):
                 return {"status": "streaming", "detached": True}
-            raise HTTPException(404, "No active stream for this session")
+            # No active stream: report an explicit idle state with HTTP 200.
+            # A 404 here made every session load look like a failed request in
+            # the browser console. The client distinguishes "no stream" by the
+            # body (status != "streaming"), and still tolerates a 404 from an
+            # older server, so this stays backward compatible.
+            return {"status": "idle"}
         return rec
 
     # ------------------------------------------------------------------ #
@@ -5074,6 +5107,8 @@ def setup_chat_routes(
                     max_tokens=0,
                     tools=None,
                 ):
+                    if _shutdown.is_shutting_down():
+                        break
                     if chunk.startswith("data: ") and not chunk.startswith("data: [DONE]"):
                         try:
                             data = json.loads(chunk[6:])

@@ -1,0 +1,3 @@
+[submodule "vendor/photocraft"]
+	path = vendor/photocraft
+	url = https://github.com/storytold/photocraft

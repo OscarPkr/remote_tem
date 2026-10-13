@@ -1,6 +1,26 @@
 import json
+import pytest
 
 from src.clean_agent_preview import preview_tool_result_text
+
+
+@pytest.mark.parametrize('snapshot', [None, '', '   '])
+def test_text_and_title_survive_without_snapshot(snapshot):
+    result = {'url': 'https://example.org', 'title': 'Access denied',
+              'text': 'Unusual traffic. Complete the CAPTCHA.', 'snapshot': snapshot}
+    output = preview_tool_result_text({'output': json.dumps(result)}, 'private_browser', {})
+    assert 'Access denied' in output
+    assert 'Unusual traffic. Complete the CAPTCHA.' in output
+    from src.clean_agent_preview import browser_observation_access_blocked
+    assert browser_observation_access_blocked(output)
+
+
+def test_snapshot_takes_precedence_over_duplicate_page_text():
+    output = preview_tool_result_text({'output': json.dumps({
+        'snapshot': '- link "Report" [ref=e1]', 'text': 'Duplicated page body',
+    })}, 'private_browser', {})
+    assert '[ref=e1]' in output
+    assert 'Duplicated page body' not in output
 
 
 def test_legacy_page_text_retains_access_block_evidence():

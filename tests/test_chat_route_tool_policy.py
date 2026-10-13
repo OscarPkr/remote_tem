@@ -231,6 +231,25 @@ def test_disabled_tools_respects_missing_vs_explicit_toggles():
     )
 
 
+def test_request_authority_grants_web_when_turn_offers_web_tools():
+    """Web tools offered for a turn must carry request authority too.
+
+    Regression: the authority capabilities gate only recognized explicit
+    browser wording (``_explicit_browser_intent``/``_external_discovery_intent``),
+    so an implicit research question with the Web toggle on offered
+    ``web_search`` in the model's schema but rejected every call with
+    ``request_authority_denied``. The gate must also grant ``search_browser``
+    whenever web tools are not disabled for the turn.
+    """
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    assert "({'search_browser'} if (" in source, (
+        "request authority must be built with a search_browser capabilities gate"
+    )
+    assert "or \"web_search\" not in disabled_tools" in source, (
+        "authority must grant search_browser whenever web_search is offered"
+    )
+
+
 def test_explicit_private_browser_workflow_survives_web_search_disabled():
     source = _CHAT_ROUTES.read_text(encoding="utf-8")
     assert "_explicit_private_browser_intent" in source
@@ -747,4 +766,22 @@ def test_frontend_sends_explicit_allow_web_search_false_in_agent_mode():
     source = _CHAT_JS.read_text(encoding="utf-8")
     assert "fd.append('allow_web_search', el('web-toggle').checked ? 'true' : 'false')" in source, (
         "Frontend must send explicit allow_web_search=false in agent mode when toggle is off"
+    )
+
+
+def test_spec_surface_skips_the_contract_scope_tool_denial():
+    """On the strict-router (spec) surface the regex turn contract must NOT
+    scope disabled_tools, or the spec router menu (email/notes/...) is emptied
+    before src/spec_router.py runs. Compact/full/none keep the denial."""
+    source = _CHAT_ROUTES.read_text(encoding="utf-8")
+    assert "if not _spec_surface:" in source, (
+        "the contract-scope disabled_tools.update must be guarded for spec turns"
+    )
+    idx = source.index("if not _spec_surface:")
+    segment = source[idx:idx + 500]
+    assert "disabled_tools.update(" in segment, (
+        "the contract-scope denial must live inside the spec guard"
+    )
+    assert "if not _turn_contract.permits(" in segment, (
+        "the guarded block must be the contract-scope denial"
     )

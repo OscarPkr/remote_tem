@@ -1969,20 +1969,21 @@ class TaskScheduler:
             messages.append(datetime_context_msg)
         messages.append({"role": "user", "content": user_content})
 
-        # Recover the registered runtime URL and credentials for this chat route.
+        # Resolve headers from the endpoint's API key
         headers = {}
         try:
-            from core.database import SessionLocal
-            from src.endpoint_resolver import (
-                build_chat_url, build_headers, resolve_endpoint_runtime,
-                resolve_owner_registered_endpoint,
-            )
+            from core.database import SessionLocal, ModelEndpoint
+            from src.endpoint_resolver import normalize_base, build_headers, same_endpoint_base
+            from src.auth_helpers import owner_filter
             db2 = SessionLocal()
             try:
-                ep = resolve_owner_registered_endpoint(db2, endpoint_url, task.owner or None)
-                base, api_key = resolve_endpoint_runtime(ep, owner=task.owner or None)
-                endpoint_url = build_chat_url(base)
-                headers = build_headers(api_key, base)
+                ep_q = db2.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
+                ep_q = owner_filter(ep_q, ModelEndpoint, task.owner or None)
+                eps = ep_q.all()
+                for ep in eps:
+                    if same_endpoint_base(endpoint_url, ep.base_url):
+                        headers = build_headers(ep.api_key, normalize_base(ep.base_url))
+                        break
             finally:
                 db2.close()
         except Exception:
@@ -2169,23 +2170,26 @@ class TaskScheduler:
             endpoint_url, model = self._resolve_defaults(db, task.owner)
         if not endpoint_url or not model:
             raise RuntimeError("No model/endpoint configured for research")
+        endpoint_url = _normalize_chat_endpoint(endpoint_url)
         # Record the resolved model for the run record (see _execute_task_locked).
         self._last_run_model = model
 
-        # Authorize the selected URL before normalization can collapse service paths.
+        # Resolve headers
         try:
-            from src.endpoint_resolver import (
-                build_chat_url, build_headers, resolve_endpoint_runtime,
-                resolve_owner_registered_endpoint,
-            )
+            from core.database import ModelEndpoint
+            from src.endpoint_resolver import normalize_base, build_headers, same_endpoint_base
+            from src.auth_helpers import owner_filter
+            db2 = db
             if not headers_from_resolver:
-                ep = resolve_owner_registered_endpoint(db, endpoint_url, task.owner or None)
-                base, api_key = resolve_endpoint_runtime(ep, owner=task.owner or None)
-                endpoint_url = build_chat_url(base)
-                headers = build_headers(api_key, base)
+                ep_q = db2.query(ModelEndpoint).filter(ModelEndpoint.is_enabled == True)
+                ep_q = owner_filter(ep_q, ModelEndpoint, task.owner or None)
+                eps = ep_q.all()
+                for ep in eps:
+                    if same_endpoint_base(endpoint_url, ep.base_url):
+                        headers = build_headers(ep.api_key, normalize_base(ep.base_url))
+                        break
         except Exception:
             pass
-        endpoint_url = _normalize_chat_endpoint(endpoint_url)
 
         max_tokens = int(get_setting("research_max_tokens", 8192))
         extraction_timeout = int(get_setting("research_extraction_timeout_seconds", 90) or 90)
@@ -2501,6 +2505,36 @@ class TaskScheduler:
                     ScheduledTask.task_type == "action",
                 ).all() if row[0]
             }
+            # Built-in housekeeping rows created before the request-authority
+            # seal carry a NULL snapshot, so every scheduled run failed with
+            # "Scheduled action has no matching server request authority".
+            # Replace them: drop the unsealed row and let the seed loop below
+            # recreate an authorized copy (server-owned ingress), preserving the
+            # user's enable/pause choice. We never grant authority to the
+            # existing row, so a model-origin row can never gain a built-in
+            # grant this way.
+            replaced_actions = {}
+            stale_rows = db.query(ScheduledTask).filter(
+                ScheduledTask.owner == owner,
+                ScheduledTask.task_type == "action",
+                ScheduledTask.action.in_(list(HOUSEKEEPING_DEFAULTS.keys())),
+            ).all()
+            sealed_actions = {r.action for r in stale_rows
+                              if (r.request_authority_json or "").strip()}
+            removed_status = {}
+            for stale in stale_rows:
+                if (stale.request_authority_json or "").strip():
+                    continue
+                removed_status.setdefault(stale.action, stale.status)
+                db.delete(stale)
+            for action, status in removed_status.items():
+                if action in sealed_actions:
+                    # A sealed copy already exists; the NULL one was just a
+                    # stale duplicate. Keep the sealed row and let the seed
+                    # loop skip this action.
+                    continue
+                replaced_actions[action] = status
+                existing_actions.discard(action)
             renamed = []
             builtin_tasks = db.query(ScheduledTask).filter(
                 ScheduledTask.owner == owner,
@@ -2661,12 +2695,15 @@ class TaskScheduler:
                     output_target=defs.get("output_target", "none"),
                     notifications_enabled=False,
                 )
+                if action in replaced_actions and replaced_actions[action] in ("active", "paused"):
+                    task.status = replaced_actions[action]
                 db.add(task)
                 seeded.append(action)
-            if seeded or renamed or removed_dupes or retired_count:
+            if seeded or renamed or removed_dupes or retired_count or replaced_actions:
                 logger.info(
-                    "Housekeeping defaults for %s: seeded=%s renamed=%s deduped=%s retired=%s",
+                    "Housekeeping defaults for %s: seeded=%s renamed=%s deduped=%s retired=%s authority_replaced=%s",
                     owner, seeded, sorted(set(renamed)), sorted(set(removed_dupes)), retired_count,
+                    sorted(replaced_actions),
                 )
             # Always commit — the orphan-run sweep above may have produced
             # pending deletes even when no defaults changed.

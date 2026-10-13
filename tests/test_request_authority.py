@@ -64,10 +64,55 @@ def test_explicit_request_classes_remain_narrow(user_text, allowed, denied):
     assert not grant.permits(ExactOperation.normalize(denied, '{}'))
 
 
+def test_search_selection_keeps_the_sibling_web_reader_authorized():
+    # "Search the web ..." narrows selection to web_search alone, but the turn
+    # must be able to read a URL the search surfaces; otherwise every result is
+    # a dead end and the turn fails closed with request_authority_denied.
+    grant = create_request_authority(
+        "Search the web for the latest 2025 consumer EEG headset prices "
+        "under $500 and cite sources")
+    assert grant.permits(ExactOperation.normalize("web_search", '{"query":"eeg"}'))
+    assert grant.permits(
+        ExactOperation.normalize("web_fetch", '{"url":"https://example.com/report"}'))
+
+
+def test_fetch_only_selection_does_not_grant_search():
+    grant = create_request_authority("Fetch https://example.com and summarize it")
+    assert grant.permits(
+        ExactOperation.normalize("web_fetch", '{"url":"https://example.com"}'))
+    assert not grant.permits(ExactOperation.normalize("web_search", '{"query":"x"}'))
+
+
+def test_implicit_editor_revision_authority_requires_active_document():
+    prompt = ('ga mer ut pa att vi tanker pa framtid for bjorn och att vi faktist '
+              'trivs sa bra har med framtid planerad')
+    edit = ExactOperation.normalize("edit_document", '{"edits":[]}')
+
+    with_editor = create_request_authority(prompt, active_document=True)
+    without_editor = create_request_authority(prompt, active_document=False)
+
+    assert with_editor.permits(edit)
+    assert not without_editor.permits(edit)
+
+
 def test_safe_task_read_does_not_authorize_same_tool_mutation():
     grant = create_request_authority("List my tasks")
     assert grant.permits(ExactOperation.normalize("manage_tasks", '{"action":"list"}'))
     assert not grant.permits(ExactOperation.normalize("manage_tasks", '{"action":"create","prompt":"run bash"}'))
+
+
+def test_action_only_read_tolerates_benign_model_arguments():
+    # "What do you remember about me?" pins manage_memory to action=list. The
+    # model must not be denied merely for adding an innocuous limit/cursor, while
+    # a different (mutating) action stays outside the read grant.
+    grant = create_request_authority("What do you remember about me?")
+    memory = next(g for g in grant.grants if g.tool == "manage_memory")
+    assert memory.inputs is None
+    assert grant.permits(ExactOperation.normalize("manage_memory", '{"action":"list"}'))
+    assert grant.permits(
+        ExactOperation.normalize("manage_memory", '{"action":"list","limit":10}'))
+    assert not grant.permits(
+        ExactOperation.normalize("manage_memory", '{"action":"delete","id":"x"}'))
 
 
 def test_exact_read_identifiers_cannot_be_changed_by_model():
@@ -410,6 +455,42 @@ async def test_server_seeded_defaults_have_authority_but_legacy_rows_do_not_gain
             grant = restore_task_authority(task.request_authority_json, task.prompt,
                 task.task_type, task.action, owner=task.owner)
             assert grant.permits(task_operation(task.task_type, task.action, task.prompt)) == (task.id != "legacy")
+    engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_unsealed_housekeeping_row_is_replaced_with_an_authorized_copy(monkeypatch, tmp_path):
+    """A built-in row that predates the authority seal (NULL snapshot) must be
+    replaced by a freshly seeded, authorized copy, not left unrunnable. This is
+    the 'Email Tags' -> 'no matching server request authority' failure."""
+    import core.database as database
+    import routes.prefs_routes as preferences
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from src.task_scheduler import TaskScheduler
+    engine = create_engine(f"sqlite:///{tmp_path / 'tasks.db'}")
+    database.Base.metadata.create_all(engine)
+    sessions = sessionmaker(bind=engine)
+    monkeypatch.setattr(database, "SessionLocal", sessions)
+    monkeypatch.setattr(preferences, "_load_for_user", lambda owner: {})
+    scheduler = TaskScheduler(session_manager=None)
+    monkeypatch.setattr(scheduler, "ensure_assistant_defaults", AsyncMock())
+    with sessions() as db:
+        db.add(database.ScheduledTask(id="broken", owner="alice", name="Email Tags",
+                                     task_type="action", action="check_email_urgency",
+                                     status="active", request_authority_json=None))
+        db.commit()
+    await scheduler.ensure_defaults("alice")
+    with sessions() as db:
+        rows = db.query(database.ScheduledTask).filter(
+            database.ScheduledTask.action == "check_email_urgency").all()
+        assert len(rows) == 1, "the unsealed row must be replaced, not duplicated"
+        task = rows[0]
+        assert task.id != "broken"
+        assert task.status == "active", "the user's enable choice must survive the reseed"
+        grant = restore_task_authority(task.request_authority_json, task.prompt,
+            task.task_type, task.action, owner=task.owner)
+        assert grant.permits(task_operation(task.task_type, task.action, task.prompt))
     engine.dispose()
 
 

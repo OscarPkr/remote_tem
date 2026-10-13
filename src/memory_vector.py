@@ -102,15 +102,15 @@ class MemoryVectorStore:
         return collections
 
     def add(self, memory_id: str, text: str):
-        """Add a single memory entry to the vector index."""
+        """Insert or refresh a memory entry, preserving unchanged embeddings."""
         if not self._healthy:
             return
         for lane in self._lanes:
             try:
-                existing = lane.collection.get(ids=[memory_id])
-                if existing["ids"]:
+                existing = lane.collection.get(ids=[memory_id], include=["documents"])
+                if existing["ids"] and existing["documents"] == [text]:
                     continue
-                lane.collection.add(
+                lane.collection.upsert(
                     ids=[memory_id],
                     embeddings=lane.encode([text]),
                     documents=[text],

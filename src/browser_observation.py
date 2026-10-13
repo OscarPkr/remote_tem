@@ -17,10 +17,13 @@ def compact_browser_observation(value, budget=8000):
                 notices.append('Exit code: ' + str(item['exit_code']))
             if item.get('success') is False:
                 notices.append('Browser command failed.')
-            snapshot = item.get('snapshot') or item.get('text')
-            if item.get('title'):
-                notices.append('Title: ' + str(item['title']))
+            snapshot = item.get('snapshot')
+            if not isinstance(snapshot, str) or not snapshot.strip():
+                snapshot = item.get('text')
             url = item.get('url') or item.get('origin')
+            title = item.get('title')
+            if isinstance(title, str) and title.strip():
+                notices.append('Title: ' + title.strip())
             if isinstance(snapshot, str) and snapshot.strip():
                 # Snapshot text already contains labels and refs in DOM order.
                 # The refs mapping repeats them and buries menus in raw JSON.

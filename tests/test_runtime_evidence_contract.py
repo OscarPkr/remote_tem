@@ -549,3 +549,34 @@ def test_host_shell_native_arguments_use_the_same_verifier_classification(comman
     encoded = json.dumps({'command': command, 'timeout': 120})
     assert command_is_test(encoded) is expected
     assert command_is_validation(encoded) is expected
+
+
+@pytest.mark.parametrize('tool', ['create_document', 'update_document', 'edit_document'])
+def test_successful_document_write_supports_unnamed_mutation_claim(tool):
+    ledger = EvidenceLedger.from_tool_events([
+        {'tool': tool, 'command': 'fix grammar', 'exit_code': 0},
+    ])
+    claim = 'I updated the document with the grammar fix.'
+    answer, reason = completion_answer(claim, ledger, ledger.evaluate())
+    assert claim in answer
+    assert not reason
+
+
+def test_document_write_without_authoritative_receipt_cannot_support_claim():
+    ledger = EvidenceLedger.from_tool_events([
+        {'tool': 'update_document', 'command': 'fix grammar'},
+    ])
+    claim = 'I updated the document with the grammar fix.'
+    answer, reason = completion_answer(claim, ledger, ledger.evaluate())
+    assert reason
+    assert claim not in answer
+
+
+def test_document_evidence_does_not_support_named_file_claim():
+    ledger = EvidenceLedger.from_tool_events([
+        {'tool': 'update_document', 'command': 'fix grammar', 'exit_code': 0},
+    ])
+    claim = 'I updated config.py.'
+    answer, reason = completion_answer(claim, ledger, ledger.evaluate())
+    assert reason
+    assert claim not in answer

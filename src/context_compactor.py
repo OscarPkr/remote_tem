@@ -105,7 +105,7 @@ def auto_compact_threshold_percent() -> int:
     return max(50, min(95, value))
 
 # Cursor-style self-summarization prompt — produces structured, dense summaries
-SELF_SUMMARY_SYSTEM_PROMPT = """You are summarizing a conversation to preserve context after compaction. Produce a structured summary that lets the conversation continue seamlessly.
+SELF_SUMMARY_SYSTEM_PROMPT = """You are summarizing a conversation with Ajax, the user's AI assistant, to preserve context after compaction. Produce a structured summary that lets Ajax continue seamlessly. Ajax is the assistant's name; Odysseus is the app name.
 
 Use this format:
 
