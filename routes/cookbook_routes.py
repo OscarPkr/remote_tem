@@ -701,17 +701,13 @@ def setup_cookbook_routes() -> APIRouter:
             return cmd
 
         repo_id = "cyankiwi/MiniMax-M3-AWQ-INT4"
-        hf_home = Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface")))
-        hf_cache = Path(os.environ.get("HUGGINGFACE_HUB_CACHE", str(hf_home / "hub")))
-        snapshot_root = hf_cache / "models--cyankiwi--MiniMax-M3-AWQ-INT4" / "snapshots"
-        if body[serve_i + 1] == repo_id and snapshot_root.is_dir():
-            installed_snapshots = sorted(
-                (p for p in snapshot_root.iterdir() if p.is_dir()),
-                key=lambda p: p.stat().st_mtime,
-                reverse=True,
-            )
-            if installed_snapshots:
-                body[serve_i + 1] = str(installed_snapshots[0])
+        snapshot = (
+            "/home/pewds/.cache/huggingface/hub/"
+            "models--cyankiwi--MiniMax-M3-AWQ-INT4/"
+            "snapshots/4082acbbec1236d21828d55b6bb0fe02ade4ab5b"
+        )
+        if body[serve_i + 1] == repo_id:
+            body[serve_i + 1] = snapshot
 
         def add_env(key: str, value: str) -> None:
             if not any(p.startswith(f"{key}=") for p in env_parts):

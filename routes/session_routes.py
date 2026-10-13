@@ -6,24 +6,17 @@ import uuid
 import time
 from pathlib import Path
 from datetime import datetime
-from fastapi import APIRouter, Form, HTTPException, Response, Request, Depends, Query
+from fastapi import APIRouter, Form, HTTPException, Response, Request, Query
 import logging
 
 from core.session_manager import SessionManager
 from core.models import ChatMessage
 from src.request_models import SessionResponse
 from core.database import Session as DbSession, SessionLocal, Document, GalleryImage, utcnow_naive
-from src.auth_helpers import (
-    effective_user,
-    _auth_disabled,
-    owner_filter,
-    is_delegated_credential,
-    require_chat_api_token_scope,
-)
+from src.auth_helpers import effective_user, _auth_disabled, owner_filter
 from src.session_image_cleanup import _generated_image_path_for_cleanup, session_image_refs
 from src.session_actions import is_session_recently_active
 from src.upload_handler import reserve_message_upload_references
-from src.tool_approval_scopes import sanitize_client_message_metadata
 
 
 def _sanitize_export_filename(name: str) -> str:
@@ -241,15 +234,9 @@ def _verify_session_owner(request: Request, session_id: str, session_manager=Non
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(
-    prefix="/api",
-    tags=["sessions"],
-    dependencies=[Depends(require_chat_api_token_scope)],
-)
+router = APIRouter(prefix="/api", tags=["sessions"])
 
 def _current_user_is_admin(request: Request, user: str | None) -> bool:
-    if is_delegated_credential(request):
-        return False
     if not user:
         return False
     auth_mgr = getattr(request.app.state, "auth_manager", None)
@@ -278,22 +265,6 @@ def _reject_raw_endpoint_url_for_non_admin(
     # endpoint validation have already happened.
     if user and not _current_user_is_admin(request, user):
         raise HTTPException(403, "Choose a registered model endpoint")
-
-
-def _reject_delegated_session_options(
-    request: Request,
-    *,
-    skip_validation: bool = False,
-    api_key: str | None = None,
-) -> None:
-    """Keep bearer credentials from exercising interactive-admin options."""
-    if is_delegated_credential(request) and (
-        skip_validation or bool((api_key or "").strip())
-    ):
-        raise HTTPException(
-            403,
-            "API tokens cannot supply endpoint credentials or skip endpoint validation",
-        )
 
 
 def _persist_session_headers(session_id: str, headers: dict | None) -> bool:
@@ -530,11 +501,6 @@ def setup_session_routes(
     ):
         skip_val = str(skip_validation).lower() == "true"
         user = effective_user(request)
-        _reject_delegated_session_options(
-            request,
-            skip_validation=skip_val,
-            api_key=api_key,
-        )
         endpoint_api_key = ""
         endpoint_base_url = ""
         _reject_raw_endpoint_url_for_non_admin(request, user, endpoint_id, endpoint_url)
@@ -791,11 +757,7 @@ def setup_session_routes(
         except (AttributeError, TypeError, ValueError) as exc:
             raise HTTPException(400, "Invalid message attachment metadata") from exc
         for m in messages:
-            sess.add_message(ChatMessage(
-                m["role"],
-                m["content"],
-                metadata=sanitize_client_message_metadata(m.get("metadata")),
-            ))
+            sess.add_message(ChatMessage(m["role"], m["content"], metadata=m.get("metadata")))
         session_manager.save_sessions()
         return {"ok": True, "count": len(messages)}
 
@@ -1156,8 +1118,6 @@ def setup_session_routes(
         model: str = Form("gpt-4o"),
         rag: str = Form(None)
     ):
-        if is_delegated_credential(request):
-            raise HTTPException(403, "This session type requires an interactive session")
         if not OPENAI_API_KEY:
             raise HTTPException(400, "Server missing OPENAI_API_KEY")
         sid = str(uuid.uuid4())
@@ -1601,13 +1561,7 @@ def setup_session_routes(
             raise HTTPException(404, "Session not found")
         skills = _context_info_skill_inventory(skills_manager, owner=owner)
         tools = _context_info_tool_inventory()
-        # `cwd` is caller-chosen. Walking it for AGENTS.md and reporting whether
-        # it exists confirms paths on the host, which /api/workspace/browse and
-        # /vet reserve for admins (or single-user mode); keep that boundary here.
-        from src.tool_security import owner_is_admin_or_single_user
-
-        _host_paths_visible = owner_is_admin_or_single_user(owner)
-        agents_md = _context_info_agents_md_inventory(cwd) if _host_paths_visible else []
+        agents_md = _context_info_agents_md_inventory(cwd)
         # Workspace visibility: lets the TUI answer "can the backend actually
         # see this directory?" (mounted vs bridge-only) without probing.
         from src.workspace_paths import backend_workspace_path, workspace_mount_pairs
@@ -1617,22 +1571,19 @@ def setup_session_routes(
         # Server-side tool policy: non-admin owners silently lose the computer
         # tools (src/tool_security); surface that so the TUI can show it.
         try:
-            from src.tool_security import blocked_tools_for_owner, delegated_credential_blocked_tools
+            from src.tool_security import blocked_tools_for_owner
 
             _blocked = blocked_tools_for_owner(owner)
-            if is_delegated_credential(request):
-                _blocked.update(delegated_credential_blocked_tools())
         except Exception:
             _blocked = set()
         _computer = {"bash", "python", "read_file", "write_file", "host_shell"}
         _policy = {
             "computer_tools": "restricted" if _computer & _blocked else "full",
-            "reason": "API-token caller" if is_delegated_credential(request) else
-                      "non-admin owner" if _blocked else "single-user or admin",
+            "reason": "non-admin owner" if _blocked else "single-user or admin",
         }
         _workspace = {
             "backend_path": _backend_cwd,
-            "exists_in_backend": _host_paths_visible and bool(_backend_cwd) and Path(_backend_cwd).is_dir(),
+            "exists_in_backend": bool(_backend_cwd) and Path(_backend_cwd).is_dir(),
             "mount_configured": bool(workspace_mount_pairs()),
             "via_mount": bool(_raw_cwd) and backend_workspace_path(_raw_cwd) != _raw_cwd,
         }

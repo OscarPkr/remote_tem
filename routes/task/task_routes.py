@@ -14,7 +14,6 @@ from core.database import SessionLocal, ScheduledTask, TaskRun, NotificationLog
 from core.constants import internal_api_base
 from src.auth_helpers import get_current_user
 from src.constants import DATA_DIR, EMAIL_URGENCY_CACHE_DIR
-from src.endpoint_resolver import resolve_owner_registered_endpoint_url
 from src.task_action_policy import (
     ADMIN_ONLY_TASK_ACTIONS,
     is_admin_only_task_action,
@@ -520,12 +519,6 @@ def setup_task_routes(task_scheduler) -> APIRouter:
         db = SessionLocal()
         try:
             then_task_id = _validate_then_task_id(db, req.then_task_id, user)
-            endpoint_url = None
-            if req.endpoint_url:
-                try:
-                    endpoint_url = resolve_owner_registered_endpoint_url(db, req.endpoint_url, user)
-                except ValueError as exc:
-                    raise HTTPException(400, str(exc)) from exc
             notifications_enabled = (
                 False if req.task_type == "action" and req.notifications_enabled is None
                 else bool(req.notifications_enabled) if req.notifications_enabled is not None
@@ -562,7 +555,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
                 status="active" if (req.trigger_type in ("event", "webhook") or next_run) else "completed",
                 output_target=req.output_target,
                 model=req.model or None,
-                endpoint_url=endpoint_url,
+                endpoint_url=req.endpoint_url or None,
                 then_task_id=then_task_id,
                 webhook_token=webhook_token,
                 notifications_enabled=notifications_enabled,
@@ -618,8 +611,12 @@ def setup_task_routes(task_scheduler) -> APIRouter:
     async def create_notification_log(request: Request):
         """Persist an in-app toast so Settings can show notification history."""
         user = _owner(request)
+        # Toast logging is best-effort. With auth disabled (or no user) there is
+        # nothing meaningful to persist, so return success rather than a 401 —
+        # a 401 here would trip the global fetch redirect-to-/login handler and
+        # yank users out of the editor mid-edit.
         if not user:
-            raise HTTPException(401, "Authentication required")
+            return {"success": False}
         body = await request.json()
         message = str(body.get("body") or "").strip()[:2000]
         if not message:
@@ -762,14 +759,7 @@ def setup_task_routes(task_scheduler) -> APIRouter:
             if req.model is not None:
                 task.model = req.model or None
             if req.endpoint_url is not None:
-                try:
-                    # An empty override restores the existing default-model workflow.
-                    task.endpoint_url = (
-                        resolve_owner_registered_endpoint_url(db, req.endpoint_url, user)
-                        if req.endpoint_url else None
-                    )
-                except ValueError as exc:
-                    raise HTTPException(400, str(exc)) from exc
+                task.endpoint_url = req.endpoint_url or None
             if req.trigger_type is not None:
                 # Generate webhook token when switching to webhook trigger
                 if req.trigger_type == "webhook" and not task.webhook_token:
@@ -1252,14 +1242,8 @@ def setup_task_routes(task_scheduler) -> APIRouter:
             if not out.get("prompt"):
                 return {"success": False, "message": "Could not extract a task instruction"}
             return {"success": True, "draft": out}
-        except HTTPException as e:
-            # llm_core raises HTTPException with curated upstream text.
-            logger.error(f"parse_task failed: {e.detail}")
-            return {"success": False, "message": str(e.detail)}
         except Exception as e:
-            # Anything else (JSON/parse/runtime errors) can carry internals;
-            # log it and keep the client message generic.
             logger.error(f"parse_task failed: {e}")
-            return {"success": False, "message": f"Could not draft a task ({type(e).__name__})"}
+            return {"success": False, "message": str(e)}
 
     return router

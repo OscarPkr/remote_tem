@@ -7,14 +7,13 @@ import logging
 import re
 from typing import Dict, Any, Optional
 
-from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi import APIRouter, Request, HTTPException
 
 from core.models import ChatMessage
 from core.database import SessionLocal, ChatMessage as DbChatMessage, Session as DbSession
-from src.auth_helpers import effective_user, require_chat_api_token_scope
+from src.auth_helpers import effective_user
 from src.topic_analyzer import analyze_topics
 from src.upload_handler import reserve_message_upload_references
-from src.tool_approval_scopes import sanitize_client_message_metadata
 from routes.session_routes import (
     _message_role,
     _message_text,
@@ -238,10 +237,7 @@ def _keep_count_before_message(db_messages, before_msg_id: str | None) -> int | 
 
 
 def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
-    router = APIRouter(
-        tags=["history"],
-        dependencies=[Depends(require_chat_api_token_scope)],
-    )
+    router = APIRouter(tags=["history"])
 
     def _reserve_message_uploads(
         request: Request,
@@ -436,7 +432,7 @@ def setup_history_routes(session_manager, upload_handler=None) -> APIRouter:
             content = body.get("content", "")
             if not content:
                 raise HTTPException(400, "content is required")
-            metadata = sanitize_client_message_metadata(body.get("metadata"))
+            metadata = body.get("metadata")
             _reserve_message_uploads(request, content, metadata)
             msg = ChatMessage(role=role, content=content, metadata=metadata)
             session_manager.add_message(session_id, msg)

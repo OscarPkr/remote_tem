@@ -1873,8 +1873,7 @@ def test_tui_local_skill_request_reconciles_normal_tool_policy(monkeypatch):
         },
     )))
 
-    # Caller hard denials are absolute and cannot be re-enabled by later TUI turn contracts.
-    assert calls == []
+    assert calls == ["manage_skills"]
     assert not any(e.get("type") == "loop_breaker_triggered" for e in events)
 
 

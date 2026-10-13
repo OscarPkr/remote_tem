@@ -43,22 +43,11 @@ def setup_search_routes(config) -> APIRouter:
     router = APIRouter(tags=["search"])
 
     @router.get("/search/web", response_class=HTMLResponse)
-    async def web_search_page(request: Request, q: str = Query("", min_length=0)) -> HTMLResponse:
+    async def web_search_page(q: str = Query("", min_length=0)) -> HTMLResponse:
         """Browser-facing search results page for clickable agent web_search rows."""
-        # The site CSP allows inline script only with the per-request nonce
-        # (SecurityHeadersMiddleware); without it this page's script never ran.
-        nonce = html.escape(getattr(request.state, "csp_nonce", "") or "", quote=True)
         safe_q = str(q or "").strip()
         title = html.escape(safe_q or "Web search")
-        # json.dumps leaves `<`, `>` and `&` alone, so q=</script><script ...>
-        # would close this inline <script> and inject markup (reflected XSS).
-        # Unicode-escape them; the JS string value is unchanged.
-        q_json = (
-            json.dumps(safe_q)
-            .replace("<", "\\u003c")
-            .replace(">", "\\u003e")
-            .replace("&", "\\u0026")
-        )
+        q_json = json.dumps(safe_q)
         page = f"""<!doctype html>
 <html>
 <head>
@@ -90,7 +79,7 @@ def setup_search_routes(config) -> APIRouter:
     <div class="status" id="status">Loading...</div>
     <div id="results"></div>
   </main>
-  <script nonce="{nonce}">
+  <script>
     const initialQuery = {q_json};
     const input = document.getElementById('query');
     const statusEl = document.getElementById('status');
@@ -114,9 +103,7 @@ def setup_search_routes(config) -> APIRouter:
       }}
       statusEl.textContent = sources.length ? `${{sources.length}} results` : 'No results';
       resultsEl.innerHTML = sources.map(s => {{
-        const rawUrl = String(s.url || s.link || '');
-        // Result URLs come from third-party search results: only http(s) may become a link.
-        const url = /^https?:[/][/]/i.test(rawUrl) ? rawUrl : '';
+        const url = s.url || s.link || '';
         const title = s.title || url || 'Untitled';
         const snippet = s.snippet || s.content || '';
         return `<a class="result" href="${{esc(url)}}" target="_blank" rel="noopener noreferrer">

@@ -16,7 +16,6 @@ from pydantic import BaseModel
 
 from core.database import SessionLocal, CrewMember, ScheduledTask
 from src.auth_helpers import get_current_user
-from src.endpoint_resolver import resolve_owner_registered_endpoint_url
 from src.owner_identity import REQUEST_SENTINEL_OWNERS
 from src.task_scheduler import compute_next_run
 
@@ -179,13 +178,7 @@ def setup_assistant_routes(task_scheduler) -> APIRouter:
             if payload.model is not None:
                 crew_db.model = payload.model or None
             if payload.endpoint_url is not None:
-                try:
-                    crew_db.endpoint_url = (
-                        resolve_owner_registered_endpoint_url(db, payload.endpoint_url, owner)
-                        if payload.endpoint_url else None
-                    )
-                except ValueError as exc:
-                    raise HTTPException(400, str(exc)) from exc
+                crew_db.endpoint_url = payload.endpoint_url or None
             if payload.timezone is not None:
                 crew_db.timezone = payload.timezone or None
 

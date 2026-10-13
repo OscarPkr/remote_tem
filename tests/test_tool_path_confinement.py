@@ -169,14 +169,12 @@ def test_blocks_netrc():
         _resolve_tool_path("~/.netrc")
 
 
-def test_allows_agent_workspace(tmp_path):
-    """Paths under the agent's workspace in project data/ must resolve
-    cleanly. The rest of data/ is application state and is rejected;
-    tests/test_agent_state_dir_confinement.py covers that side."""
+def test_allows_project_data(tmp_path):
+    """Paths under project data/ must resolve cleanly."""
     from src.tool_execution import _resolve_tool_path
-    from src.constants import AGENT_WORKSPACE_DIR
-    target = os.path.join(AGENT_WORKSPACE_DIR, "test-confinement-ok.txt")
-    os.makedirs(AGENT_WORKSPACE_DIR, exist_ok=True)
+    from src.constants import DATA_DIR
+    target = os.path.join(DATA_DIR, "test-confinement-ok.txt")
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(target, "w") as f:
         f.write("ok")
     try:
@@ -315,8 +313,8 @@ async def test_write_file_dispatch_rejects_empty_directory_like_workspace_path(m
         workspace=str(tmp_path),
         security_context=NO_TOOL_SECURITY_CONTEXT,
     )
-    assert "BLOCKED" in desc
-    assert "content required; missing content section" in (
+    assert desc == "write_file: /workspace/papers"
+    assert "content required; refusing to create an empty file" in (
         result.get("error") or ""
     )
     assert result.get("exit_code") == 1

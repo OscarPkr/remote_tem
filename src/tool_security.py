@@ -127,6 +127,7 @@ PLAN_MODE_READONLY_TOOLS = {
     "resolve_contact",
     "chat_with_model",
     "ask_teacher",
+    "get_editor_screenshot",
 }
 
 
@@ -163,6 +164,7 @@ _PLAN_MODE_KNOWN_MUTATORS = {
     "download_model", "serve_model",
     "stop_served_model", "cancel_download", "adopt_served_model", "serve_preset",
     "generate_image", "edit_image", "trigger_research", "manage_research",
+    "plan_edit", "run_editor_command", "ai_edit_image",
     # Shell is never read-only-safe; block it explicitly so it stays out of plan
     # mode even if the schema list fails to load.
     "bash", "python",
@@ -273,17 +275,4 @@ def blocked_tools_for_owner(owner: Optional[str]) -> Set[str]:
     """Tools to hide/disable for this owner under public-user policy."""
     if owner_is_admin_or_single_user(owner):
         return set()
-    return set(NON_ADMIN_BLOCKED_TOOLS)
-
-
-def delegated_credential_blocked_tools() -> Set[str]:
-    """Tools an agent run driven by a bearer API token must not reach.
-
-    Deliberately not owner-dependent. ``blocked_tools_for_owner`` asks whether
-    the OWNER is an admin, and for a token that question is always answered
-    yes: minting a token is an admin-only action, so the empty set comes back
-    for every token in existence. A token is a long-lived credential the owner
-    hands to a third party, so it is capped at the non-admin policy no matter
-    who minted it.
-    """
     return set(NON_ADMIN_BLOCKED_TOOLS)
