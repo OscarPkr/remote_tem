@@ -368,19 +368,19 @@ def _resolve_research_settings(get_setting_fn):
     """
     try:
         max_tokens = int(get_setting_fn("research_max_tokens", 8192))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         max_tokens = 8192
     try:
         extraction_timeout = int(
             get_setting_fn("research_extraction_timeout_seconds", 90) or 90
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         extraction_timeout = 90
     try:
         extraction_concurrency = int(
             get_setting_fn("research_extraction_concurrency", 3) or 3
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         extraction_concurrency = 3
     return max_tokens, extraction_timeout, extraction_concurrency
 

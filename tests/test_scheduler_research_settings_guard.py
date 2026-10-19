@@ -15,6 +15,8 @@ same reads defensively; this is the scheduler's equivalent.
 
 from __future__ import annotations
 
+import json
+
 from src.task_scheduler import _resolve_research_settings
 
 
@@ -77,3 +79,24 @@ def test_valid_ints_pass_through():
     )
 
     assert _resolve_research_settings(get) == (2048, 120, 6)
+
+
+def test_non_finite_json_numbers_fall_back_individually():
+    """JSON exponent overflow produces infinity, which int() cannot convert."""
+    keys = (
+        "research_max_tokens",
+        "research_extraction_timeout_seconds",
+        "research_extraction_concurrency",
+    )
+    valid = (4096, 45, 2)
+    defaults = (8192, 90, 3)
+
+    for non_finite in (json.loads("1e309"), json.loads("-1e309")):
+        for index, key in enumerate(keys):
+            values = dict(zip(keys, valid))
+            values[key] = non_finite
+            expected = list(valid)
+            expected[index] = defaults[index]
+            assert _resolve_research_settings(
+                _fake_get_setting(values)
+            ) == tuple(expected)
