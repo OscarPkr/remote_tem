@@ -619,7 +619,7 @@ export function _showBulkActionsMenu(anchor) {
         dropdown.appendChild(divider);
         const options = [
           { label: 'Email file (.eml)', icon: _emailIco, action: _exportSelectedEmails },
-          { label: 'PDF', icon: _pdfIco, action: _exportSelectedEmailPdf },
+          { label: 'Print / save PDF', icon: _pdfIco, action: _exportSelectedEmailPdf },
         ];
         for (const option of options) {
           const child = document.createElement('div');

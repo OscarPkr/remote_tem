@@ -1122,29 +1122,9 @@ function _filenameFromContentDisposition(header) {
   return bare ? bare[1].trim() : '';
 }
 
-let _emailHtml2PdfReady = null;
-async function _loadEmailHtml2Pdf() {
-  if (window.html2pdf) return;
-  if (!_emailHtml2PdfReady) {
-    _emailHtml2PdfReady = new Promise((resolve, reject) => {
-      const script = document.createElement('script');
-      script.src = '/static/lib/html2pdf.bundle.min.js';
-      script.onload = resolve;
-      script.onerror = () => reject(new Error('Could not load PDF exporter'));
-      document.head.appendChild(script);
-    });
-  }
-  try {
-    await _emailHtml2PdfReady;
-  } catch (error) {
-    _emailHtml2PdfReady = null;
-    throw error;
-  }
-}
-
-async function _downloadSelectedEmailPdf(messages) {
-  if (messages.length > 20) throw new Error('PDF export supports up to 20 emails at a time');
-  await _loadEmailHtml2Pdf();
+async function _printSelectedEmails(messages) {
+  if (messages.length > 20) throw new Error('Print / save PDF supports up to 20 emails at a time');
+  if (typeof window.print !== 'function') throw new Error('Browser printing is unavailable');
 
   const loaded = new Array(messages.length);
   let nextIndex = 0;
@@ -1163,85 +1143,105 @@ async function _downloadSelectedEmailPdf(messages) {
   };
   await Promise.all(Array.from({ length: Math.min(4, messages.length) }, readWorker));
 
-  const page = document.createElement('div');
-  page.className = 'email-export-pdf';
-  page.style.cssText = 'width:794px;box-sizing:border-box;padding:38px;background:#fff;color:#171717;font:12px/1.55 Arial,Helvetica,sans-serif;';
-  const style = document.createElement('style');
-  style.textContent = `
-    .email-export-pdf-message { page-break-after: always; break-after: page; }
-    .email-export-pdf-message:last-child { page-break-after: auto; break-after: auto; }
-    .email-export-pdf-message h1 { margin: 0 0 18px; font-size: 20px; line-height: 1.3; overflow-wrap: anywhere; }
-    .email-export-pdf-fields { margin: 0 0 20px; padding: 0 0 14px; border-bottom: 1px solid #d8d8d8; }
-    .email-export-pdf-field { display: flex; gap: 10px; margin: 3px 0; overflow-wrap: anywhere; }
-    .email-export-pdf-label { width: 54px; flex: 0 0 54px; color: #666; }
-    .email-export-pdf-body { overflow-wrap: anywhere; word-break: break-word; }
-    .email-export-pdf-body img { max-width: 100%; }
-    .email-export-pdf-body a { color: #135f9b; text-decoration: underline; }
-    .email-export-pdf-body blockquote { margin-left: 12px; padding-left: 10px; border-left: 2px solid #ccc; color: #555; }
-    .email-export-pdf-body pre { white-space: pre-wrap; }
-  `;
-  page.appendChild(style);
-
-  const addField = (parent, label, value) => {
+  const addField = (doc, parent, label, value) => {
     if (!value) return;
-    const row = document.createElement('div');
+    const row = doc.createElement('div');
     row.className = 'email-export-pdf-field';
-    const labelEl = document.createElement('span');
+    const labelEl = doc.createElement('span');
     labelEl.className = 'email-export-pdf-label';
     labelEl.textContent = label;
-    const valueEl = document.createElement('span');
+    const valueEl = doc.createElement('span');
     valueEl.textContent = value;
     row.append(labelEl, valueEl);
     parent.appendChild(row);
   };
 
+  // Build sanitized HTML for the print frame -- scripts and event handlers
+  // cannot execute inside the sandboxed iframe.
+  const articles = [];
   for (const { message, data } of loaded) {
-    const article = document.createElement('article');
-    article.className = 'email-export-pdf-message';
     const subject = String(data.subject || message.subject || '(no subject)');
-    const title = document.createElement('h1');
-    title.textContent = subject;
-    article.appendChild(title);
-
-    const fields = document.createElement('div');
-    fields.className = 'email-export-pdf-fields';
     const from = data.from_name && data.from_address
       ? `${data.from_name} <${data.from_address}>`
       : data.from_name || data.from_address;
-    addField(fields, 'From', from);
-    addField(fields, 'To', data.to);
-    addField(fields, 'Cc', data.cc);
-    addField(fields, 'Date', data.date_display || data.date || message.date);
-    article.appendChild(fields);
 
-    const body = document.createElement('div');
-    body.className = 'email-export-pdf-body';
     const safeBody = new DOMParser().parseFromString(_safeRenderEmailBody(data), 'text/html');
     safeBody.querySelectorAll('img').forEach(img => {
       const placeholder = safeBody.createElement('span');
       placeholder.textContent = img.alt ? `[Image: ${img.alt}]` : '[Inline image omitted]';
       img.replaceWith(placeholder);
     });
-    body.innerHTML = safeBody.body.innerHTML;
-    body.querySelectorAll('details').forEach(detail => { detail.open = true; });
-    article.appendChild(body);
-    page.appendChild(article);
+    safeBody.querySelectorAll('details').forEach(detail => { detail.open = true; });
+    const bodyHtml = safeBody.body.innerHTML;
+
+    const fieldParts = [];
+    for (const [lbl, val] of [['From', from], ['To', data.to], ['Cc', data.cc], ['Date', data.date_display || data.date || message.date]]) {
+      if (!val) continue;
+      const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      fieldParts.push(`<div class="email-export-pdf-field"><span class="email-export-pdf-label">${esc(lbl)}</span><span>${esc(val)}</span></div>`);
+    }
+
+    const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    articles.push(
+      `<article class="email-export-pdf-message">` +
+      `<h1>${esc(subject)}</h1>` +
+      `<div class="email-export-pdf-fields">${fieldParts.join('')}</div>` +
+      `<div class="email-export-pdf-body">${bodyHtml}</div>` +
+      `</article>`
+    );
   }
+
+  const printCss = [
+    'html,body{background:#fff;color:#171717;font:12px/1.55 Arial,Helvetica,sans-serif;margin:0;padding:0}',
+    '.email-export-pdf{max-width:794px;margin:0 auto;padding:38px;box-sizing:border-box}',
+    '.email-export-pdf-message{page-break-after:always;break-after:page}',
+    '.email-export-pdf-message:last-child{page-break-after:auto;break-after:auto}',
+    '.email-export-pdf-message h1{margin:0 0 18px;font-size:20px;line-height:1.3;overflow-wrap:anywhere}',
+    '.email-export-pdf-fields{margin:0 0 20px;padding:0 0 14px;border-bottom:1px solid #d8d8d8}',
+    '.email-export-pdf-field{display:flex;gap:10px;margin:3px 0;overflow-wrap:anywhere}',
+    '.email-export-pdf-label{width:54px;flex:0 0 54px;color:#666}',
+    '.email-export-pdf-body{overflow-wrap:anywhere;word-break:break-word}',
+    '.email-export-pdf-body img{max-width:100%}',
+    '.email-export-pdf-body a{color:#135f9b;text-decoration:underline}',
+    '.email-export-pdf-body blockquote{margin-left:12px;padding-left:10px;border-left:2px solid #ccc;color:#555}',
+    '.email-export-pdf-body pre{white-space:pre-wrap}',
+    '@page{margin:10mm}',
+  ].join('\n');
 
   const safeBaseName = messages.length === 1
     ? String(loaded[0]?.data?.subject || messages[0]?.subject || 'email').replace(/[^\p{L}\p{N} ._-]+/gu, '_').trim().slice(0, 100) || 'email'
     : 'selected-emails';
+
+  // Use a sandboxed same-origin iframe following the established document.js
+  // Print / save PDF pattern (SAN-157). The browser opens a print dialog;
+  // saving, cancellation and pagination belong to the browser.
+  document.getElementById('email-browser-print-frame')?.remove();
+  const frame = document.createElement('iframe');
+  frame.id = 'email-browser-print-frame';
+  frame.title = 'Email print view';
+  frame.setAttribute('sandbox', 'allow-same-origin allow-modals');
+  frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:800px;height:600px;border:0;';
+  document.body.appendChild(frame);
   try {
-    await window.html2pdf().set({
-      margin: 10,
-      filename: `${safeBaseName}.pdf`,
-      image: { type: 'jpeg', quality: 0.92 },
-      html2canvas: { scale: 1.6, useCORS: false, backgroundColor: '#fff' },
-      jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
-      pagebreak: { mode: ['css', 'legacy'] },
-    }).from(page).save();
-  } finally {
-    page.remove();
+    const printDoc = frame.contentDocument;
+    printDoc.open();
+    printDoc.write('<!DOCTYPE html><html><head><meta charset="utf-8"></head><body></body></html>');
+    printDoc.close();
+    printDoc.title = safeBaseName;
+    const printStyle = printDoc.createElement('style');
+    printStyle.textContent = printCss;
+    printDoc.head.appendChild(printStyle);
+    const container = printDoc.createElement('div');
+    container.className = 'email-export-pdf';
+    container.innerHTML = articles.join('');
+    printDoc.body.appendChild(container);
+    await printDoc.fonts.ready;
+    frame.contentWindow.addEventListener('afterprint', () => frame.remove(), { once: true });
+    frame.contentWindow.focus();
+    frame.contentWindow.print();
+  } catch (error) {
+    frame.remove();
+    throw error;
   }
 }
 
@@ -1274,11 +1274,10 @@ async function _exportSelectedBundle(kind) {
     if (cancelBtn) cancelBtn.disabled = true;
     if (selectAll) selectAll.disabled = true;
     const isEmailExport = kind === 'emails';
-    const isPdfExport = kind === 'pdf';
-    if (countEl) countEl.textContent = `${isPdfExport ? 'Creating PDF' : 'Exporting'} ${isPdfExport ? 'from' : isEmailExport ? 'emails from' : 'attachments from'} ${messages.length}…`;
-    if (isPdfExport) {
-      await _downloadSelectedEmailPdf(messages);
-      showToast(`Exported ${messages.length} email${messages.length === 1 ? '' : 's'} as PDF`);
+    const isPrintExport = kind === 'print';
+    if (countEl) countEl.textContent = `${isPrintExport ? 'Preparing print' : 'Exporting'} ${isPrintExport ? 'for' : isEmailExport ? 'emails from' : 'attachments from'} ${messages.length}…`;
+    if (isPrintExport) {
+      await _printSelectedEmails(messages);
       return;
     }
     const res = await fetch(`${API_BASE}/api/email/${isEmailExport ? 'messages' : 'attachments'}-download-bulk`, {
@@ -1313,7 +1312,7 @@ async function _exportSelectedBundle(kind) {
         : `Exported attachments from ${messages.length} selected email${messages.length === 1 ? '' : 's'}`);
   } catch (err) {
     console.error(`Failed to export selected email ${kind}:`, err);
-    showToast(err?.message || (kind === 'emails' ? 'Failed to export emails' : 'Failed to export attachments'));
+    showToast(err?.message || (kind === 'emails' ? 'Failed to export emails' : kind === 'print' ? 'Could not open browser print' : 'Failed to export attachments'));
   } finally {
     if (busySpinner) busySpinner.destroy();
     if (actionsBtn) {
@@ -1334,7 +1333,7 @@ export async function _exportSelectedEmails() {
 }
 
 export async function _exportSelectedEmailPdf() {
-  return _exportSelectedBundle('pdf');
+  return _exportSelectedBundle('print');
 }
 
 export async function _exportSelectedAttachments() {

@@ -4216,6 +4216,10 @@ def setup_email_routes():
         used_names: set[str] = set()
         exported = 0
         skipped = 0
+        total_bytes = 0
+        # 512 MiB safety cap prevents unbounded memory growth when exporting
+        # many large messages.
+        max_total_bytes = 512 * 1024 * 1024
         single_export: tuple[str, bytes] | None = None
 
         def _email_filename(row: dict, uid: str) -> str:
@@ -4299,6 +4303,9 @@ def setup_email_routes():
                         suffix += 1
                     used_names.add(unique_name.lower())
                     message_bytes = _fixture_message_bytes(fixture, uid, folder)
+                    total_bytes += len(message_bytes)
+                    if total_bytes > max_total_bytes:
+                        raise HTTPException(status_code=413, detail="Export too large")
                     zf.writestr(f"{export_folder}/{unique_name}", message_bytes)
                     single_export = (unique_name, message_bytes)
                     exported += 1
@@ -4336,6 +4343,9 @@ def setup_email_routes():
                                     suffix += 1
                                 used_names.add(unique_name.lower())
                                 message_bytes = bytes(raw_message)
+                                total_bytes += len(message_bytes)
+                                if total_bytes > max_total_bytes:
+                                    raise HTTPException(status_code=413, detail="Export too large")
                                 zf.writestr(f"{export_folder}/{unique_name}", message_bytes)
                                 single_export = (unique_name, message_bytes)
                                 found.add(uid)

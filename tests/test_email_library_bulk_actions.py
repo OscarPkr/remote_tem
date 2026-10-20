@@ -70,17 +70,74 @@ def test_email_bulk_exports_messages_and_attachments_from_selected_context():
     assert '"X-Exported-Emails"' in backend
 
 
-def test_email_bulk_pdf_export_reads_without_marking_read_and_sanitizes_body():
+def test_email_print_pdf_export_reads_without_marking_read_and_sanitizes_body():
+    """Print / save PDF export must use the browser print dialog (SAN-157).
+
+    The removed html2pdf library must not be loaded or referenced. Instead
+    the export uses a sandboxed iframe and window.print(), matching the
+    established pattern in document.js.
+    """
     frontend = email_library_source()
-    pdf_src = _function_source("_downloadSelectedEmailPdf")
+    print_src = _function_source("_printSelectedEmails")
     menu_src = js_function_source("_showBulkActionsMenu", frontend)
 
-    assert "mark_seen=false&full=true" in pdf_src
-    assert "_safeRenderEmailBody(data)" in pdf_src
-    assert "new DOMParser()" in pdf_src
-    assert "window.html2pdf()" in pdf_src
-    assert "up to 20 emails" in pdf_src
-    assert "PDF" in menu_src
+    assert "mark_seen=false&full=true" in print_src
+    assert "_safeRenderEmailBody(data)" in print_src
+    assert "new DOMParser()" in print_src
+    assert "up to 20 emails" in print_src
+    assert "Print / save PDF" in menu_src
+
+    # SAN-157: must NOT reference the removed html2pdf library.
+    assert "html2pdf" not in print_src
+    assert "html2pdf" not in frontend
+
+    # Must use the browser print pattern with a sandboxed iframe.
+    assert "contentWindow.print()" in print_src
+    assert "sandbox" in print_src
+    assert "allow-same-origin" in print_src
+    assert "allow-modals" in print_src
+    assert "afterprint" in print_src
+    assert "email-browser-print-frame" in print_src
+
+
+def test_email_eml_export_bounds_total_size():
+    """The /messages-download-bulk endpoint must enforce a total size cap
+    to prevent unbounded memory growth when exporting many large messages."""
+    backend = _EMAIL_ROUTES.read_text(encoding="utf-8")
+
+    assert "max_total_bytes" in backend
+    assert "total_bytes" in backend
+    assert "Export too large" in backend
+    assert "status_code=413" in backend
+
+
+def test_email_eml_export_validates_selection_count():
+    """The /messages-download-bulk endpoint must reject oversized selections."""
+    backend = _EMAIL_ROUTES.read_text(encoding="utf-8")
+
+    assert 'len(messages) > 250' in backend
+    assert '"Too many emails selected"' in backend
+
+
+def test_email_eml_export_rejects_non_numeric_remote_uids():
+    """Non-numeric UIDs must not be passed to IMAP UID FETCH."""
+    backend = _EMAIL_ROUTES.read_text(encoding="utf-8")
+
+    # After fixture lookup fails, non-numeric UIDs are skipped.
+    assert 're.fullmatch(r"\\d+", uid)' in backend
+
+
+def test_email_eml_export_handles_partial_batch_failures():
+    """When an IMAP fetch batch returns partial results, exported/skipped
+    accounting must remain correct."""
+    backend = _EMAIL_ROUTES.read_text(encoding="utf-8")
+
+    # The skipped counter increments for UIDs not found in the batch response.
+    assert "skipped += len(batch) - len(found)" in backend
+    # Whole-connection failures count all rows as skipped.
+    assert "skipped += len(rows)" in backend
+    assert '"X-Exported-Emails"' in backend
+    assert '"X-Skipped-Emails"' in backend
 
 
 def test_fixture_tag_filter_supports_receipt_tag_flow():
