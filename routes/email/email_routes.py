@@ -4312,20 +4312,37 @@ def setup_email_routes():
                     with _imap(account_id, owner=owner) as conn:
                         conn.select(_q(folder), readonly=True)
                         uid_b = uid.encode()
+                        st_sz, sz_data = None, None
                         try:
                             st_sz, sz_data = _imap_uid_fetch(conn, uid_b, "(UID RFC822.SIZE)")
-                            if st_sz == "OK" and sz_data:
-                                for item in sz_data:
-                                    meta = item[0] if isinstance(item, tuple) else item
-                                    if isinstance(meta, bytes):
-                                        sz = _size_from_fetch_meta(meta)
-                                        if sz is not None and (sz > max_message_bytes or sz > max_total_bytes):
-                                            raise HTTPException(status_code=413, detail="Export too large")
-                        except HTTPException:
-                            raise
                         except Exception as sz_err:
-                            logger.debug("Single message size preflight error: %s", sz_err)
+                            logger.warning("Single message size preflight query error for uid=%s: %s", uid, sz_err)
 
+                        if st_sz != "OK":
+                            logger.warning("Single message size preflight status=%s for uid=%s", st_sz, uid)
+                            raise HTTPException(status_code=502, detail="Unable to verify email size safety")
+
+                        if not sz_data:
+                            # Message does not exist in mailbox (missing mail)
+                            raise HTTPException(status_code=404, detail="No selected emails could be exported")
+
+                        sz: int | None = None
+                        for item in sz_data:
+                            meta = item[0] if isinstance(item, tuple) else item
+                            if isinstance(meta, bytes):
+                                u = _uid_from_fetch_meta(meta)
+                                if u == uid:
+                                    sz = _size_from_fetch_meta(meta)
+                                    break
+
+                        if sz is None or sz < 0:
+                            logger.warning("Single message size preflight returned invalid/malformed size for uid=%s", uid)
+                            raise HTTPException(status_code=502, detail="Invalid email size metadata from server")
+
+                        if sz > max_message_bytes or sz > max_total_bytes:
+                            raise HTTPException(status_code=413, detail="Export too large")
+
+                        # Preflight size safety established; perform RFC822 fetch.
                         st, msg_data = _imap_uid_fetch(conn, uid_b, "(UID RFC822)")
                         if st == "OK" and msg_data:
                             for meta, raw in _group_uid_fetch_records(msg_data):
@@ -4407,7 +4424,14 @@ def setup_email_routes():
                     group = remote_groups.setdefault((account_id, folder), {})
                     group.setdefault(uid, (_email_filename(row, uid), row))
 
+                preflight_error: HTTPException | None = None
+
                 # Fetch original RFC822 data in batches and store it byte-for-byte.
+                # Note on IMAP memory-safety: Python's standard imaplib buffers socket responses into
+                # memory before returning literals to application code. Preflight verification ensures
+                # we do not intentionally fetch messages exceeding limits, but an untrusted or non-compliant
+                # IMAP server sending unexpectedly large literals cannot be bounded at the transport level
+                # without custom socket streaming. Post-fetch checks guard application-level storage.
                 for (account_id, folder), rows_by_uid in remote_groups.items():
                     rows = list(rows_by_uid.items())
                     remaining_rows = len(rows)
@@ -4417,26 +4441,64 @@ def setup_email_routes():
 
                             # Size preflight query to catch oversized exports early and bound batch sizes.
                             uid_set_all = ",".join(uid for uid, _ in rows).encode()
-                            size_by_uid: dict[str, int] = {}
+                            st_sz, sz_data = None, None
                             try:
                                 st_sz, sz_data = _imap_uid_fetch(conn, uid_set_all, "(UID RFC822.SIZE)")
-                                if st_sz == "OK" and sz_data:
-                                    for item in sz_data:
-                                        meta = item[0] if isinstance(item, tuple) else item
-                                        if isinstance(meta, bytes):
-                                            u = _uid_from_fetch_meta(meta)
-                                            s = _size_from_fetch_meta(meta)
-                                            if u and s is not None:
-                                                size_by_uid[u] = s
                             except Exception as sz_err:
-                                logger.debug("IMAP size preflight query failed or unsupported: %s", sz_err)
+                                logger.warning("IMAP size preflight query failed for folder=%s: %s", folder, sz_err)
 
-                            if size_by_uid:
-                                for u, s in size_by_uid.items():
-                                    if s > max_message_bytes:
-                                        raise HTTPException(status_code=413, detail="Export too large")
-                                if total_bytes + sum(size_by_uid.values()) > max_total_bytes:
+                            if st_sz != "OK":
+                                logger.warning("IMAP size preflight status=%s for folder=%s account=%s", st_sz, folder, account_id)
+                                preflight_error = HTTPException(status_code=502, detail="Unable to verify email size safety")
+                                skipped += remaining_rows
+                                remaining_rows = 0
+                                continue
+
+                            if not sz_data:
+                                # All requested UIDs in this mailbox are missing on server
+                                skipped += remaining_rows
+                                remaining_rows = 0
+                                continue
+
+                            reported_sizes: dict[str, int | None] = {}
+                            for item in sz_data:
+                                meta = item[0] if isinstance(item, tuple) else item
+                                if isinstance(meta, bytes):
+                                    u = _uid_from_fetch_meta(meta)
+                                    if u:
+                                        reported_sizes[u] = _size_from_fetch_meta(meta)
+
+                            # Categorize requested UIDs
+                            malformed_uids = [
+                                uid for uid, _ in rows
+                                if uid in reported_sizes and (reported_sizes[uid] is None or reported_sizes[uid] < 0)
+                            ]
+                            if malformed_uids:
+                                logger.warning("IMAP size preflight returned invalid/malformed size for uids=%s in folder=%s", malformed_uids, folder)
+                                preflight_error = HTTPException(status_code=502, detail="Invalid email size metadata from server")
+                                skipped += remaining_rows
+                                remaining_rows = 0
+                                continue
+
+                            # Identify missing mail (requested UIDs not returned in preflight)
+                            missing_uids = {uid for uid, _ in rows if uid not in reported_sizes}
+                            if missing_uids:
+                                skipped += len(missing_uids)
+                                remaining_rows -= len(missing_uids)
+                                rows = [item for item in rows if item[0] not in missing_uids]
+
+                            if not rows:
+                                continue
+
+                            size_by_uid: dict[str, int] = {
+                                uid: reported_sizes[uid] for uid, _ in rows
+                            }
+
+                            for u, s in size_by_uid.items():
+                                if s > max_message_bytes:
                                     raise HTTPException(status_code=413, detail="Export too large")
+                            if total_bytes + sum(size_by_uid.values()) > max_total_bytes:
+                                raise HTTPException(status_code=413, detail="Export too large")
 
                             # Form batches with at most 20 messages and capped at 10 MiB payload.
                             batches: list[list[tuple[str, tuple[str, dict]]]] = []
@@ -4445,10 +4507,10 @@ def setup_email_routes():
                             max_batch_bytes = 10 * 1024 * 1024
                             for item in rows:
                                 uid_val = item[0]
-                                sz = size_by_uid.get(uid_val, 0)
+                                sz = size_by_uid[uid_val]
                                 if cur_batch and (
                                     len(cur_batch) >= 20 or
-                                    (sz > 0 and cur_batch_bytes + sz > max_batch_bytes)
+                                    (cur_batch_bytes + sz > max_batch_bytes)
                                 ):
                                     batches.append(cur_batch)
                                     cur_batch = []
@@ -4469,7 +4531,11 @@ def setup_email_routes():
                                 found: set[str] = set()
                                 for meta, raw_message in _group_uid_fetch_records(msg_data):
                                     uid = _uid_from_fetch_meta(meta)
-                                    if uid not in wanted or not raw_message:
+                                    if not uid or uid not in wanted or not raw_message:
+                                        continue
+                                    if uid in found:
+                                        # P2: Reject duplicate IMAP response records for an already-processed UID
+                                        logger.debug("Ignoring duplicate IMAP FETCH record for uid=%s in folder=%s", uid, folder)
                                         continue
                                     filename = wanted[uid]
                                     unique_name = filename
@@ -4502,6 +4568,8 @@ def setup_email_routes():
                         logger.warning("Bulk email export skipped mailbox folder=%s account=%s count=%s: %s", folder, account_id, remaining_rows, exc)
 
             if exported <= 0:
+                if preflight_error is not None:
+                    raise preflight_error
                 raise HTTPException(status_code=404, detail="No selected emails could be exported")
 
             spooled_file.seek(0)

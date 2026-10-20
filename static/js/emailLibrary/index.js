@@ -1281,7 +1281,7 @@ async function _printSelectedEmails(messages) {
     frame.contentWindow.focus();
     frame.contentWindow.print();
     if (omitted.length > 0) {
-      const msg = `Printed ${successful.length} email${successful.length === 1 ? '' : 's'}; ${omitted.length} unavailable`;
+      const msg = `Prepared ${successful.length} email${successful.length === 1 ? '' : 's'} for printing; ${omitted.length} unavailable`;
       showToast(msg);
     }
   } catch (error) {

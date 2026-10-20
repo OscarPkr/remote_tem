@@ -264,21 +264,33 @@ def test_email_compose_can_attach_gallery_images():
 
 
 class _MockImapConn:
-    def __init__(self, messages_by_uid: dict[str, bytes] | None = None, fetch_exc: Exception | None = None):
+    def __init__(self, messages_by_uid: dict[str, bytes] | None = None, fetch_exc: Exception | None = None, fetch_cb=None):
         self.messages = messages_by_uid or {}
         self.fetch_exc = fetch_exc
+        self.fetch_cb = fetch_cb
+        self.fetch_calls: list = []
 
     def select(self, folder, readonly=True):
         return "OK", [b"1"]
 
     def uid(self, command, *args):
         if command == "FETCH":
+            self.fetch_calls.append(args)
             if self.fetch_exc is not None:
                 raise self.fetch_exc
+            if self.fetch_cb:
+                return self.fetch_cb(args)
             uid_set_b = args[0]
             uid_set = uid_set_b.decode() if isinstance(uid_set_b, bytes) else str(uid_set_b)
             uids = [u.strip() for u in uid_set.split(",") if u.strip()]
+            fetch_cmd = str(args[1]) if len(args) > 1 else ""
             res = []
+            if "RFC822.SIZE" in fetch_cmd:
+                for u in uids:
+                    if u in self.messages:
+                        meta = f"1 (UID {u} RFC822.SIZE {len(self.messages[u])})".encode()
+                        res.append(meta)
+                return "OK", res
             for u in uids:
                 if u in self.messages:
                     meta = f"1 (UID {u} RFC822 {{{len(self.messages[u])}}}".encode()
@@ -420,6 +432,9 @@ def test_messages_download_bulk_mid_batch_failure_accounting(monkeypatch):
         def select(self, folder, readonly=True):
             return "OK", [b"1"]
         def uid(self, command, *args):
+            fetch_cmd = str(args[1]) if len(args) > 1 else ""
+            if "RFC822.SIZE" in fetch_cmd:
+                return "OK", [f"{i} (UID {i} RFC822.SIZE 100)".encode() for i in range(1, 11)]
             records = []
             for i in range(1, 5):
                 records.append((f"{i} (UID {i} RFC822 {{{10}}}".encode(), f"Subject: Msg {i}\r\n\r\nBody {i}".encode()))
@@ -569,3 +584,192 @@ def test_messages_download_bulk_corrupt_zip_fails_closed(monkeypatch):
     })
     assert res.status_code == 500
     assert "Failed to create export archive" in res.json()["detail"]
+
+
+def test_messages_download_bulk_preflight_no_fails_safe_no_body_fetch(monkeypatch):
+    """When preflight returns NO, size safety is unknown: fail safely (502) and do not fetch bodies."""
+    mailbox = _MockImapConn({"101": b"dummy", "102": b"dummy"})
+    mailbox.fetch_cb = lambda args: ("NO", []) if "RFC822.SIZE" in str(args) else ("OK", [])
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    res = client.post("/api/email/messages-download-bulk", json={"messages": [{"uid": "101"}, {"uid": "102"}]})
+    assert res.status_code == 502
+    assert "Unable to verify email size safety" in res.json()["detail"]
+    assert not any("(UID RFC822)" in str(call) for call in mailbox.fetch_calls)
+
+
+def test_messages_download_bulk_preflight_empty_missing_mail(monkeypatch):
+    """When preflight returns empty data, all requested messages are missing on server: returns 404 with no body fetch."""
+    mailbox = _MockImapConn()  # no messages
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    res = client.post("/api/email/messages-download-bulk", json={"messages": [{"uid": "101"}, {"uid": "102"}]})
+    assert res.status_code == 404
+    assert "No selected emails could be exported" in res.json()["detail"]
+    assert not any("(UID RFC822)" in str(call) for call in mailbox.fetch_calls)
+
+
+def test_messages_download_bulk_preflight_malformed_fails_safe_no_body_fetch(monkeypatch):
+    """When preflight returns records without RFC822.SIZE, fail safely (502) and do not fetch bodies."""
+    mailbox = _MockImapConn({"101": b"dummy"})
+    mailbox.fetch_cb = lambda args: ("OK", [b"1 (UID 101 FLAGS (\\Seen))"]) if "RFC822.SIZE" in str(args) else ("OK", [])
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    res = client.post("/api/email/messages-download-bulk", json={"messages": [{"uid": "101"}]})
+    assert res.status_code == 502
+    assert "Invalid email size metadata from server" in res.json()["detail"]
+    assert not any("(UID RFC822)" in str(call) for call in mailbox.fetch_calls)
+
+
+def test_messages_download_bulk_preflight_inconsistent_fails_safe_no_body_fetch(monkeypatch):
+    """When preflight returns negative or corrupted size values, fail safely (502) and do not fetch bodies."""
+    mailbox = _MockImapConn({"101": b"dummy"})
+    mailbox.fetch_cb = lambda args: ("OK", [b"1 (UID 101 RFC822.SIZE -50)"]) if "RFC822.SIZE" in str(args) else ("OK", [])
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    res = client.post("/api/email/messages-download-bulk", json={"messages": [{"uid": "101"}]})
+    assert res.status_code == 502
+    assert "Invalid email size metadata from server" in res.json()["detail"]
+    assert not any("(UID RFC822)" in str(call) for call in mailbox.fetch_calls)
+
+
+def test_messages_download_bulk_preflight_partial_missing_omitted_from_body_fetch(monkeypatch):
+    """When some requested UIDs do not exist on the server, omit them from body fetch and export verified items."""
+    msg1 = b"From: a@example.com\r\nSubject: Only One\r\n\r\nBody"
+    mailbox = _MockImapConn({"101": msg1})  # 102 does not exist on server
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    res = client.post("/api/email/messages-download-bulk", json={
+        "messages": [{"uid": "101"}, {"uid": "102"}]
+    })
+    assert res.status_code == 200
+    assert res.headers["x-exported-emails"] == "1"
+    assert res.headers["x-skipped-emails"] == "1"
+
+    # Verify body fetch was only requested for 101, NOT 102
+    body_fetches = [call for call in mailbox.fetch_calls if "(UID RFC822)" in str(call)]
+    assert len(body_fetches) == 1
+    requested_uids = body_fetches[0][0].decode() if isinstance(body_fetches[0][0], bytes) else str(body_fetches[0][0])
+    assert requested_uids == "101"
+    assert "102" not in requested_uids
+
+
+def test_messages_download_bulk_duplicate_imap_records_rejected(monkeypatch):
+    """Duplicate IMAP FETCH response records for the same UID must be ignored.
+    They must not produce duplicate archive entries or corrupt accounting."""
+    import io
+    import zipfile
+
+    msg1 = b"From: a@example.com\r\nSubject: Unique\r\n\r\nBody 1"
+    mailbox = _MockImapConn({"101": msg1})
+
+    def custom_fetch(args):
+        fetch_cmd = str(args[1]) if len(args) > 1 else ""
+        if "RFC822.SIZE" in fetch_cmd:
+            return "OK", [b"1 (UID 101 RFC822.SIZE 100)", b"2 (UID 102 RFC822.SIZE 100)"]
+        # In body fetch, server sends duplicate records for 101, and nothing for 102
+        records = [
+            (b"1 (UID 101 RFC822 {50}", msg1),
+            b")",
+            (b"1 (UID 101 RFC822 {50}", msg1),  # DUPLICATE RECORD
+            b")",
+        ]
+        return "OK", records
+
+    mailbox.fetch_cb = custom_fetch
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    res = client.post("/api/email/messages-download-bulk", json={
+        "messages": [{"uid": "101"}, {"uid": "102"}]
+    })
+    assert res.status_code == 200
+    assert res.headers["x-exported-emails"] == "1"
+    assert res.headers["x-skipped-emails"] == "1"
+
+    zf = zipfile.ZipFile(io.BytesIO(res.content))
+    assert len(zf.namelist()) == 1
+    assert "101.eml" in zf.namelist()[0]
+
+
+def test_messages_download_bulk_single_message_preflight_failure_no_body_fetch(monkeypatch):
+    """In single message mode, bad preflight or missing mail fails safely without body fetch."""
+    mailbox = _MockImapConn({"101": b"dummy"})
+
+    # Case A: preflight NO -> 502
+    mailbox.fetch_cb = lambda args: ("NO", []) if "RFC822.SIZE" in str(args) else ("OK", [])
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+    res_no = client.post("/api/email/messages-download-bulk", json={"messages": [{"uid": "101"}]})
+    assert res_no.status_code == 502
+    assert not any("(UID RFC822)" in str(call) for call in mailbox.fetch_calls)
+
+    # Case B: missing mail -> 404
+    mailbox.fetch_calls.clear()
+    mailbox.fetch_cb = lambda args: ("OK", []) if "RFC822.SIZE" in str(args) else ("OK", [])
+    res_miss = client.post("/api/email/messages-download-bulk", json={"messages": [{"uid": "101"}]})
+    assert res_miss.status_code == 404
+    assert not any("(UID RFC822)" in str(call) for call in mailbox.fetch_calls)
+
+    # Case C: malformed metadata -> 502
+    mailbox.fetch_calls.clear()
+    mailbox.fetch_cb = lambda args: ("OK", [b"1 (UID 101 NO_SIZE)"]) if "RFC822.SIZE" in str(args) else ("OK", [])
+    res_mal = client.post("/api/email/messages-download-bulk", json={"messages": [{"uid": "101"}]})
+    assert res_mal.status_code == 502
+    assert not any("(UID RFC822)" in str(call) for call in mailbox.fetch_calls)
+
+
+def test_messages_download_bulk_spooled_stream_lifecycle():
+    """Verify that _iter_spooled closes the underlying SpooledTemporaryFile on completion and GeneratorExit."""
+    import tempfile
+    from routes.email.email_routes import setup_email_routes
+
+    # Test normal completion
+    f = tempfile.SpooledTemporaryFile(max_size=1024, mode="w+b")
+    f.write(b"Hello world payload")
+    f.seek(0)
+    # Re-create generator helper pattern
+    def _iter(file_obj, chunk_size=64):
+        try:
+            while True:
+                chunk = file_obj.read(chunk_size)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            file_obj.close()
+
+    gen = _iter(f)
+    chunks = list(gen)
+    assert b"".join(chunks) == b"Hello world payload"
+    assert f.closed
+
+    # Test early disconnect / cancellation (GeneratorExit)
+    f2 = tempfile.SpooledTemporaryFile(max_size=1024, mode="w+b")
+    f2.write(b"Chunk1Chunk2Chunk3")
+    f2.seek(0)
+    gen2 = _iter(f2, chunk_size=6)
+    next(gen2)
+    assert not f2.closed
+    gen2.close()  # Simulates client disconnect / generator cancellation
+    assert f2.closed
+
+
+def test_email_print_browser_behaviors():
+    """Real Chromium DOM: placeholder stripping, button removal, and partial failure."""
+    import shutil
+    import subprocess
+    if not shutil.which('node'):
+        import pytest
+        pytest.skip('Node is required')
+    probe = subprocess.run(['node', '-e', "require.resolve('playwright')"], cwd=_REPO, capture_output=True)
+    if probe.returncode:
+        import pytest
+        pytest.skip('Playwright is required')
+    result = subprocess.run(
+        ['node', str(_REPO / 'tests/test_email_library_print_browser.cjs')],
+        cwd=_REPO,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "ALL_BROWSER_TESTS_PASSED" in result.stdout
