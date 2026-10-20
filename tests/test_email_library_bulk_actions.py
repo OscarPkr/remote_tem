@@ -858,6 +858,194 @@ def test_messages_download_bulk_case_insensitive_imap_atoms(monkeypatch):
     assert not any("(UID RFC822)" in str(call) for call in mailbox.fetch_calls)
 
 
+def test_messages_download_bulk_multi_group_preflight_failure_propagates_502(monkeypatch):
+    """A preflight safety failure in any group produces HTTP 502 for the entire request,
+    even when another group has already exported messages into the temporary ZIP.
+    Confirms temporary-file cleanup, zero body FETCH for the failed group, and both group orderings."""
+    import tempfile
+
+    msg101 = b"From: a@example.com\r\nSubject: Good\r\n\r\nBody 1"
+
+    spooled_instances: list[tempfile.SpooledTemporaryFile] = []
+    orig_spooled = tempfile.SpooledTemporaryFile
+
+    def tracking_spooled(*args, **kwargs):
+        inst = orig_spooled(*args, **kwargs)
+        spooled_instances.append(inst)
+        return inst
+
+    monkeypatch.setattr(tempfile, "SpooledTemporaryFile", tracking_spooled)
+
+    class MultiMailboxConn:
+        def __init__(self):
+            self.fetch_calls: list[tuple[str, tuple]] = []
+            self.current_folder = "INBOX"
+
+        def select(self, folder, readonly=True):
+            self.current_folder = str(folder)
+            return "OK", [b"1"]
+
+        def uid(self, command, *args):
+            self.fetch_calls.append((self.current_folder, args))
+            fetch_cmd = str(args[1]) if len(args) > 1 else ""
+            uid_set = args[0].decode() if isinstance(args[0], bytes) else str(args[0])
+
+            if "RFC822.SIZE" in fetch_cmd:
+                if "folder-fail" in self.current_folder:
+                    return "NO", []  # Preflight failure for folder-fail
+                return "OK", [f"1 (UID {uid_set} RFC822.SIZE 100)".encode()]
+
+            # Body fetch
+            if "folder-fail" in self.current_folder:
+                return "NO", []
+            return "OK", [(f"1 (UID {uid_set} RFC822 {{100}}".encode(), msg101), b")"]
+
+    # 1. Successful group followed by failed preflight
+    conn1 = MultiMailboxConn()
+    client1 = _create_test_app(monkeypatch, mailbox=conn1)
+    spooled_instances.clear()
+
+    res1 = client1.post("/api/email/messages-download-bulk", json={
+        "messages": [
+            {"uid": "101", "folder": "folder-good"},
+            {"uid": "202", "folder": "folder-fail"},
+        ]
+    })
+    assert res1.status_code == 502
+    assert "Unable to verify email size safety" in res1.json()["detail"]
+
+    # No RFC822 body FETCH for the failed group
+    failed_body_fetches1 = [
+        call for folder, call in conn1.fetch_calls
+        if "folder-fail" in folder and "(UID RFC822)" in str(call)
+    ]
+    assert len(failed_body_fetches1) == 0
+
+    # Temporary file cleanup confirmed
+    assert len(spooled_instances) == 1
+    assert spooled_instances[0].closed
+
+    # 2. Failed preflight followed by successful group
+    conn2 = MultiMailboxConn()
+    client2 = _create_test_app(monkeypatch, mailbox=conn2)
+    spooled_instances.clear()
+
+    res2 = client2.post("/api/email/messages-download-bulk", json={
+        "messages": [
+            {"uid": "202", "folder": "folder-fail"},
+            {"uid": "101", "folder": "folder-good"},
+        ]
+    })
+    assert res2.status_code == 502
+    assert "Unable to verify email size safety" in res2.json()["detail"]
+
+    # No RFC822 body FETCH for the failed group
+    failed_body_fetches2 = [
+        call for folder, call in conn2.fetch_calls
+        if "folder-fail" in folder and "(UID RFC822)" in str(call)
+    ]
+    assert len(failed_body_fetches2) == 0
+
+    # Temporary file cleanup confirmed
+    assert len(spooled_instances) == 1
+    assert spooled_instances[0].closed
+
+
+def test_messages_download_bulk_multi_group_both_successful(monkeypatch):
+    """When both groups succeed preflight and body fetch, return 200 with all messages in ZIP."""
+    import io
+    import zipfile
+
+    msg101 = b"From: a@example.com\r\nSubject: Item 1\r\n\r\nBody 1"
+    msg202 = b"From: b@example.com\r\nSubject: Item 2\r\n\r\nBody 2"
+
+    class MultiMailboxConn:
+        def __init__(self):
+            self.current_folder = "INBOX"
+
+        def select(self, folder, readonly=True):
+            self.current_folder = str(folder)
+            return "OK", [b"1"]
+
+        def uid(self, command, *args):
+            fetch_cmd = str(args[1]) if len(args) > 1 else ""
+            uid_set = args[0].decode() if isinstance(args[0], bytes) else str(args[0])
+            msg = msg101 if "101" in uid_set else msg202
+            if "RFC822.SIZE" in fetch_cmd:
+                return "OK", [f"1 (UID {uid_set} RFC822.SIZE {len(msg)})".encode()]
+            return "OK", [(f"1 (UID {uid_set} RFC822 {{{len(msg)}}}".encode(), msg), b")"]
+
+    conn = MultiMailboxConn()
+    client = _create_test_app(monkeypatch, mailbox=conn)
+
+    res = client.post("/api/email/messages-download-bulk", json={
+        "messages": [
+            {"uid": "101", "folder": "folder-1"},
+            {"uid": "202", "folder": "folder-2"},
+        ]
+    })
+    assert res.status_code == 200
+    assert res.headers["x-exported-emails"] == "2"
+    assert res.headers["x-skipped-emails"] == "0"
+    zf = zipfile.ZipFile(io.BytesIO(res.content))
+    assert len(zf.namelist()) == 2
+
+
+def test_messages_download_bulk_multi_group_genuinely_missing_message(monkeypatch):
+    """Genuinely missing messages (unreturned by preflight) do not cause 502;
+    they are skipped while verified messages in any group are successfully exported."""
+    import io
+    import zipfile
+
+    msg101 = b"From: a@example.com\r\nSubject: Exists\r\n\r\nBody"
+
+    class MissingMailboxConn:
+        def __init__(self):
+            self.fetch_calls: list = []
+            self.current_folder = "INBOX"
+
+        def select(self, folder, readonly=True):
+            self.current_folder = str(folder)
+            return "OK", [b"1"]
+
+        def uid(self, command, *args):
+            self.fetch_calls.append((self.current_folder, args))
+            fetch_cmd = str(args[1]) if len(args) > 1 else ""
+            uid_set = args[0].decode() if isinstance(args[0], bytes) else str(args[0])
+            if "RFC822.SIZE" in fetch_cmd:
+                # 101 exists on server; 999 is genuinely missing (unreported in size metadata)
+                res = []
+                if "101" in uid_set:
+                    res.append(f"1 (UID 101 RFC822.SIZE {len(msg101)})".encode())
+                return "OK", res
+            # Body fetch only returns 101
+            return "OK", [(f"1 (UID 101 RFC822 {{{len(msg101)}}}".encode(), msg101), b")"]
+
+    conn = MissingMailboxConn()
+    client = _create_test_app(monkeypatch, mailbox=conn)
+
+    res = client.post("/api/email/messages-download-bulk", json={
+        "messages": [
+            {"uid": "101", "folder": "folder-1"},
+            {"uid": "999", "folder": "folder-1"},
+        ]
+    })
+    assert res.status_code == 200
+    assert res.headers["x-exported-emails"] == "1"
+    assert res.headers["x-skipped-emails"] == "1"
+
+    zf = zipfile.ZipFile(io.BytesIO(res.content))
+    assert len(zf.namelist()) == 1
+
+    # Verify 999 was never requested in body fetch
+    body_fetches = [
+        call for folder, call in conn.fetch_calls
+        if "(UID RFC822)" in str(call)
+    ]
+    assert len(body_fetches) == 1
+    assert "999" not in str(body_fetches[0])
+
+
 def test_email_print_browser_behaviors():
     """Real Chromium DOM: placeholder stripping, button removal, and partial failure."""
     import shutil

@@ -4567,9 +4567,10 @@ def setup_email_routes():
                         skipped += remaining_rows
                         logger.warning("Bulk email export skipped mailbox folder=%s account=%s count=%s: %s", folder, account_id, remaining_rows, exc)
 
+            if preflight_error is not None:
+                raise preflight_error
+
             if exported <= 0:
-                if preflight_error is not None:
-                    raise preflight_error
                 raise HTTPException(status_code=404, detail="No selected emails could be exported")
 
             spooled_file.seek(0)
