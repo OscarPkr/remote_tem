@@ -411,3 +411,161 @@ def test_messages_download_bulk_enforces_account_ownership_guard(monkeypatch):
 
     assert res.status_code == 404
     assert "Account not found" in res.text
+
+
+def test_messages_download_bulk_mid_batch_failure_accounting(monkeypatch):
+    """When an exception occurs mid-batch after partial progress, already-exported
+    records must not be double-counted as skipped."""
+    class MidBatchFailImap:
+        def select(self, folder, readonly=True):
+            return "OK", [b"1"]
+        def uid(self, command, *args):
+            records = []
+            for i in range(1, 5):
+                records.append((f"{i} (UID {i} RFC822 {{{10}}}".encode(), f"Subject: Msg {i}\r\n\r\nBody {i}".encode()))
+            class BadRecord:
+                def __bytes__(self):
+                    raise RuntimeError("Corrupt memory buffer")
+            records.append((b"5 (UID 5 RFC822 {10}", BadRecord()))
+            return "OK", records
+
+    from contextlib import contextmanager
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from routes.email import email_routes as routes
+
+    @contextmanager
+    def mock_imap(account_id=None, owner=""):
+        yield MidBatchFailImap()
+
+    monkeypatch.setattr(routes, "_start_poller", lambda: None)
+    monkeypatch.setattr(routes, "_POOL_HOOKS", {})
+    monkeypatch.setattr(routes, "_imap", mock_imap)
+
+    app = FastAPI()
+    app.include_router(routes.setup_email_routes())
+    app.dependency_overrides[routes.require_owner] = lambda: "test-user"
+    client = TestClient(app)
+
+    rows = [{"uid": str(i)} for i in range(1, 11)]
+    res = client.post("/api/email/messages-download-bulk", json={"messages": rows})
+    assert res.status_code == 200
+    exp = int(res.headers.get("x-exported-emails"))
+    skp = int(res.headers.get("x-skipped-emails"))
+    assert exp == 4
+    assert skp == 6
+    assert exp + skp == 10
+
+
+def test_messages_download_bulk_size_cap_413_boundary(monkeypatch):
+    """Cumulative export size exceeding max_total_bytes returns HTTP 413."""
+    class LargeMessageImap:
+        def select(self, folder, readonly=True):
+            return "OK", [b"1"]
+        def uid(self, command, *args):
+            raw_uids = args[0] if isinstance(args[0], str) else args[0].decode()
+            if "(UID RFC822.SIZE)" in str(args):
+                records = []
+                for u in raw_uids.split(","):
+                    records.append(f"{u} (UID {u} RFC822.SIZE 10485760)".encode())
+                return "OK", records
+            records = []
+            big_chunk = b"X" * (10 * 1024 * 1024)
+            for u in raw_uids.split(","):
+                records.append((f"{u} (UID {u} RFC822".encode(), big_chunk))
+            return "OK", records
+
+    from contextlib import contextmanager
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from routes.email import email_routes as routes
+
+    @contextmanager
+    def mock_imap(account_id=None, owner=""):
+        yield LargeMessageImap()
+
+    monkeypatch.setattr(routes, "_start_poller", lambda: None)
+    monkeypatch.setattr(routes, "_POOL_HOOKS", {})
+    monkeypatch.setattr(routes, "_imap", mock_imap)
+
+    app = FastAPI()
+    app.include_router(routes.setup_email_routes())
+    app.dependency_overrides[routes.require_owner] = lambda: "test-user"
+    client = TestClient(app)
+
+    # 52 messages of 10 MB = 520 MB > 512 MiB limit
+    payload_52 = [{"uid": str(i + 1), "subject": f"Big {i}"} for i in range(52)]
+    res = client.post("/api/email/messages-download-bulk", json={"messages": payload_52})
+    assert res.status_code == 413
+    assert res.json()["detail"] == "Export too large"
+
+
+def test_messages_download_bulk_per_message_limit_413(monkeypatch):
+    """A single oversized message (>64 MiB) triggers HTTP 413."""
+    class HugeSingleMsgImap:
+        def select(self, folder, readonly=True):
+            return "OK", [b"1"]
+        def uid(self, command, *args):
+            return "OK", [b"1 (UID 101 RFC822.SIZE 73400320)"]
+
+    from contextlib import contextmanager
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from routes.email import email_routes as routes
+
+    @contextmanager
+    def mock_imap(account_id=None, owner=""):
+        yield HugeSingleMsgImap()
+
+    monkeypatch.setattr(routes, "_start_poller", lambda: None)
+    monkeypatch.setattr(routes, "_POOL_HOOKS", {})
+    monkeypatch.setattr(routes, "_imap", mock_imap)
+
+    app = FastAPI()
+    app.include_router(routes.setup_email_routes())
+    app.dependency_overrides[routes.require_owner] = lambda: "test-user"
+    client = TestClient(app)
+
+    res = client.post("/api/email/messages-download-bulk", json={
+        "messages": [{"uid": "101", "subject": "Huge Email"}]
+    })
+    assert res.status_code == 413
+    assert res.json()["detail"] == "Export too large"
+
+
+def test_messages_download_bulk_account_ownership_memoization(monkeypatch):
+    """Account ownership validation is memoized per distinct account_id to eliminate N+1 DB queries."""
+    owns_calls = []
+    def counting_assert_owns(account_id, owner):
+        owns_calls.append(account_id)
+
+    raw_rfc822 = b"From: sender@example.com\r\nSubject: Test\r\n\r\nBody"
+    msgs = {str(i): raw_rfc822 for i in range(1, 26)}
+    mailbox = _MockImapConn(msgs)
+    client = _create_test_app(monkeypatch, mailbox=mailbox, assert_owns_fn=counting_assert_owns)
+
+    # 25 messages all referencing the same account_id
+    payload = [{"uid": str(i), "account_id": "acc-shared"} for i in range(1, 26)]
+    res = client.post("/api/email/messages-download-bulk", json={"messages": payload})
+    assert res.status_code == 200
+    assert len(owns_calls) == 1
+
+
+def test_messages_download_bulk_corrupt_zip_fails_closed(monkeypatch):
+    """If ZIP construction fails (e.g. disk error), fail closed with 500 instead of returning corrupt archive."""
+    import zipfile
+    raw_rfc822 = b"From: sender@example.com\r\nSubject: Test\r\n\r\nBody"
+    mailbox = _MockImapConn({"101": raw_rfc822, "102": raw_rfc822})
+
+    orig_writestr = zipfile.ZipFile.writestr
+    def failing_writestr(self, zinfo_or_arcname, data=None, *args, **kwargs):
+        raise OSError("Disk write failed: No space left on device")
+
+    monkeypatch.setattr(zipfile.ZipFile, "writestr", failing_writestr)
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    res = client.post("/api/email/messages-download-bulk", json={
+        "messages": [{"uid": "101"}, {"uid": "102"}]
+    })
+    assert res.status_code == 500
+    assert "Failed to create export archive" in res.json()["detail"]

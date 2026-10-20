@@ -1132,32 +1132,70 @@ async function _printSelectedEmails(messages) {
     while (nextIndex < messages.length) {
       const index = nextIndex++;
       const message = messages[index];
-      const account = message.account_id ? `&account_id=${encodeURIComponent(message.account_id)}` : '';
-      const url = `${API_BASE}/api/email/read/${encodeURIComponent(message.uid)}?folder=${encodeURIComponent(message.folder || 'INBOX')}${account}&mark_seen=false&full=true`;
-      const response = await fetch(url, { credentials: 'same-origin' });
-      if (!response.ok) throw new Error(`Could not load "${message.subject || 'email'}" (HTTP ${response.status})`);
-      const data = await response.json();
-      if (data?.error) throw new Error(data.error);
-      loaded[index] = { message, data };
+      try {
+        const account = message.account_id ? `&account_id=${encodeURIComponent(message.account_id)}` : '';
+        const url = `${API_BASE}/api/email/read/${encodeURIComponent(message.uid)}?folder=${encodeURIComponent(message.folder || 'INBOX')}${account}&mark_seen=false&full=true`;
+        const response = await fetch(url, { credentials: 'same-origin' });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (data?.error) throw new Error(data.error);
+        loaded[index] = { ok: true, message, data };
+      } catch (err) {
+        loaded[index] = { ok: false, message, error: err?.message || 'Failed to load' };
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.min(4, messages.length) }, readWorker));
 
+  const successful = loaded.filter(item => item && item.ok);
+  const omitted = loaded.filter(item => !item || !item.ok);
+
+  if (successful.length === 0) {
+    throw new Error('None of the selected emails could be loaded for printing');
+  }
+
   // Build sanitized HTML for the print frame -- scripts and event handlers
   // cannot execute inside the sandboxed iframe.
   const articles = [];
-  for (const { message, data } of loaded) {
+  if (omitted.length > 0) {
+    const count = omitted.length;
+    articles.push(
+      `<div class="email-export-pdf-omitted-notice">Note: ${count} selected email${count === 1 ? ' was' : 's were'} unavailable and omitted from this print.</div>`
+    );
+  }
+
+  for (const { message, data } of successful) {
     const subject = String(data.subject || message.subject || '(no subject)');
     const from = data.from_name && data.from_address
       ? `${data.from_name} <${data.from_address}>`
       : data.from_name || data.from_address;
 
     const safeBody = new DOMParser().parseFromString(_safeRenderEmailBody(data), 'text/html');
-    safeBody.querySelectorAll('img').forEach(img => {
-      const placeholder = safeBody.createElement('span');
-      placeholder.textContent = img.alt ? `[Image: ${img.alt}]` : '[Inline image omitted]';
-      img.replaceWith(placeholder);
+
+    // Replace interactive image placeholder components with clean print-safe notices
+    safeBody.querySelectorAll('.email-inline-image-placeholder').forEach(ph => {
+      const title = ph.querySelector('.email-inline-image-title')?.textContent?.trim();
+      const ariaLabel = ph.getAttribute('aria-label')?.trim();
+      const label = title || ariaLabel || '';
+      const isGeneric = !label || /^inline image$|^remote image$|^image unavailable$|^image$/i.test(label);
+      const span = safeBody.createElement('span');
+      span.className = 'email-export-image-notice';
+      span.textContent = isGeneric ? '[Image omitted]' : `[Image: ${label}]`;
+      ph.replaceWith(span);
     });
+
+    // Replace any remaining raw <img> tags
+    safeBody.querySelectorAll('img').forEach(img => {
+      const alt = (img.getAttribute('alt') || img.getAttribute('title') || '').trim();
+      const span = safeBody.createElement('span');
+      span.className = 'email-export-image-notice';
+      span.textContent = alt ? `[Image: ${alt}]` : '[Image omitted]';
+      img.replaceWith(span);
+    });
+
+    // Strip interactive controls (buttons, inputs, actions) from the print document
+    safeBody.querySelectorAll('button, input, select, textarea, .email-inline-image-actions, .email-inline-image-btn').forEach(el => el.remove());
+
     safeBody.querySelectorAll('details').forEach(detail => { detail.open = true; });
     const bodyHtml = safeBody.body.innerHTML;
 
@@ -1192,11 +1230,14 @@ async function _printSelectedEmails(messages) {
     '.email-export-pdf-body a{color:#135f9b;text-decoration:underline}',
     '.email-export-pdf-body blockquote{margin-left:12px;padding-left:10px;border-left:2px solid #ccc;color:#555}',
     '.email-export-pdf-body pre{white-space:pre-wrap}',
+    '.email-inline-image-placeholder,.email-inline-image-actions,.email-inline-image-btn{display:none !important}',
+    '.email-export-image-notice{display:inline-block;color:#666;font-style:italic;font-size:11px;margin:4px 0}',
+    '.email-export-pdf-omitted-notice{margin:0 0 16px;padding:8px 12px;background:#f8f9fa;border:1px solid #e2e8f0;border-radius:4px;font-size:11px;color:#64748b}',
     '@page{margin:10mm}',
   ].join('\n');
 
-  const safeBaseName = messages.length === 1
-    ? String(loaded[0]?.data?.subject || messages[0]?.subject || 'email').replace(/[^\p{L}\p{N} ._-]+/gu, '_').trim().slice(0, 100) || 'email'
+  const safeBaseName = successful.length === 1
+    ? String(successful[0]?.data?.subject || successful[0]?.message?.subject || 'email').replace(/[^\p{L}\p{N} ._-]+/gu, '_').trim().slice(0, 100) || 'email'
     : 'selected-emails';
 
   // Use a sandboxed same-origin iframe following the established document.js
@@ -1209,6 +1250,17 @@ async function _printSelectedEmails(messages) {
   frame.setAttribute('sandbox', 'allow-same-origin allow-modals');
   frame.style.cssText = 'position:fixed;left:-10000px;top:0;width:800px;height:600px;border:0;';
   document.body.appendChild(frame);
+
+  let cleanedUp = false;
+  const cleanupFrame = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    try {
+      frame.remove();
+    } catch (_) {}
+    window.removeEventListener('afterprint', cleanupFrame);
+  };
+
   try {
     const printDoc = frame.contentDocument;
     printDoc.open();
@@ -1223,11 +1275,17 @@ async function _printSelectedEmails(messages) {
     container.innerHTML = articles.join('');
     printDoc.body.appendChild(container);
     await printDoc.fonts.ready;
-    frame.contentWindow.addEventListener('afterprint', () => frame.remove(), { once: true });
+    frame.contentWindow?.addEventListener('afterprint', cleanupFrame, { once: true });
+    window.addEventListener('afterprint', cleanupFrame, { once: true });
+    setTimeout(cleanupFrame, 60000);
     frame.contentWindow.focus();
     frame.contentWindow.print();
+    if (omitted.length > 0) {
+      const msg = `Printed ${successful.length} email${successful.length === 1 ? '' : 's'}; ${omitted.length} unavailable`;
+      showToast(msg);
+    }
   } catch (error) {
-    frame.remove();
+    cleanupFrame();
     throw error;
   }
 }

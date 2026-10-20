@@ -25,6 +25,7 @@ import json
 import re
 import html
 import io
+import tempfile
 import zipfile
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from html.parser import HTMLParser as _HTMLParser
@@ -640,6 +641,11 @@ def _message_id_chain(*values: str) -> list[str]:
 def _uid_from_fetch_meta(meta_b: bytes) -> str:
     m = re.search(rb"\bUID\s+(\d+)\b", meta_b)
     return m.group(1).decode() if m else ""
+
+
+def _size_from_fetch_meta(meta_b: bytes) -> int | None:
+    m = re.search(rb"\bRFC822\.SIZE\s+(\d+)\b", meta_b, re.IGNORECASE)
+    return int(m.group(1)) if m else None
 
 
 def _parse_list_unsubscribe_header(value: str | None) -> list[dict]:
@@ -4212,15 +4218,16 @@ def setup_email_routes():
             date_span = selected_dates[0] if len(selected_dates) == 1 else f"{selected_dates[0]} - {selected_dates[-1]}"
         export_folder = f"emails-{category}" + (f" ({date_span})" if date_span else "")
 
-        zip_buf = io.BytesIO()
+        # 512 MiB safety cap prevents unbounded memory growth when exporting
+        # many large messages.
+        max_total_bytes = 512 * 1024 * 1024
+        max_message_bytes = 64 * 1024 * 1024
+        spool_threshold_bytes = 32 * 1024 * 1024
         used_names: set[str] = set()
         exported = 0
         skipped = 0
         total_bytes = 0
-        # 512 MiB safety cap prevents unbounded memory growth when exporting
-        # many large messages.
-        max_total_bytes = 512 * 1024 * 1024
-        single_export: tuple[str, bytes] | None = None
+        validated_accounts: set[str] = set()
 
         def _email_filename(row: dict, uid: str) -> str:
             date = str(row.get("date") or "").strip()
@@ -4281,120 +4288,249 @@ def setup_email_routes():
                     logger.debug("Skipping malformed fixture email attachment uid=%s", uid, exc_info=True)
             return msg.as_bytes(policy=email_policy.SMTP)
 
-        seen_items: set[tuple[str | None, str, str]] = set()
-        remote_groups: dict[tuple[str | None, str], dict[str, tuple[str, dict]]] = {}
-        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for row in messages:
-                if not isinstance(row, dict):
-                    skipped += 1
-                    continue
-                uid = str(row.get("uid") or "").strip()
-                if not uid:
-                    skipped += 1
-                    continue
-                folder = str(row.get("folder") or "INBOX").strip() or "INBOX"
-                account_id = str(row.get("account_id") or row.get("account") or "").strip() or None
-                if account_id:
-                    _assert_owns_account(account_id, owner)
+        # Optimization: single message exports return raw .eml directly without ZIP compression.
+        if len(messages) == 1:
+            row = messages[0]
+            if not isinstance(row, dict):
+                raise HTTPException(status_code=404, detail="No selected emails could be exported")
+            uid = str(row.get("uid") or "").strip()
+            if not uid:
+                raise HTTPException(status_code=404, detail="No selected emails could be exported")
+            folder = str(row.get("folder") or "INBOX").strip() or "INBOX"
+            account_id = str(row.get("account_id") or row.get("account") or "").strip() or None
+            if account_id:
+                _assert_owns_account(account_id, owner)
 
-                item_key = (account_id, folder, uid)
-                if item_key in seen_items:
-                    skipped += 1
-                    continue
-                seen_items.add(item_key)
+            filename = _email_filename(row, uid)
+            message_bytes: bytes | None = None
 
-                fixture = _fixture_email_read(uid, folder, owner)
-                if fixture is not None and not fixture.get("error"):
-                    filename = _email_filename(row, uid)
-                    unique_name = filename
-                    suffix = 2
-                    while unique_name.lower() in used_names:
-                        unique_name = f"{Path(filename).stem}-{suffix}.eml"
-                        suffix += 1
-                    used_names.add(unique_name.lower())
-                    message_bytes = _fixture_message_bytes(fixture, uid, folder)
-                    total_bytes += len(message_bytes)
-                    if total_bytes > max_total_bytes:
-                        raise HTTPException(status_code=413, detail="Export too large")
-                    zf.writestr(f"{export_folder}/{unique_name}", message_bytes)
-                    single_export = (unique_name, message_bytes)
-                    exported += 1
-                    continue
-                if not re.fullmatch(r"\d+", uid):
-                    skipped += 1
-                    continue
-                group = remote_groups.setdefault((account_id, folder), {})
-                group.setdefault(uid, (_email_filename(row, uid), row))
-
-            # Fetch original RFC822 data in batches and store it byte-for-byte.
-            for (account_id, folder), rows_by_uid in remote_groups.items():
-                rows = list(rows_by_uid.items())
-                remaining_rows = len(rows)
+            fixture = _fixture_email_read(uid, folder, owner)
+            if fixture is not None and not fixture.get("error"):
+                message_bytes = _fixture_message_bytes(fixture, uid, folder)
+            elif re.fullmatch(r"\d+", uid):
                 try:
                     with _imap(account_id, owner=owner) as conn:
                         conn.select(_q(folder), readonly=True)
-                        for batch_start in range(0, len(rows), 20):
-                            batch = rows[batch_start:batch_start + 20]
-                            wanted = {uid: filename for uid, (filename, _row) in batch}
-                            uid_set = ",".join(wanted).encode()
-                            status, msg_data = _imap_uid_fetch(conn, uid_set, "(UID RFC822)")
-                            if status != "OK" or not msg_data:
-                                skipped += len(batch)
-                                remaining_rows -= len(batch)
-                                continue
-                            found: set[str] = set()
-                            for meta, raw_message in _group_uid_fetch_records(msg_data):
-                                uid = _uid_from_fetch_meta(meta)
-                                if uid not in wanted or not raw_message:
-                                    continue
-                                filename = wanted[uid]
-                                unique_name = filename
-                                suffix = 2
-                                while unique_name.lower() in used_names:
-                                    unique_name = f"{Path(filename).stem}-{suffix}.eml"
-                                    suffix += 1
-                                used_names.add(unique_name.lower())
-                                message_bytes = bytes(raw_message)
-                                total_bytes += len(message_bytes)
-                                if total_bytes > max_total_bytes:
-                                    raise HTTPException(status_code=413, detail="Export too large")
-                                zf.writestr(f"{export_folder}/{unique_name}", message_bytes)
-                                single_export = (unique_name, message_bytes)
-                                found.add(uid)
-                                exported += 1
-                            skipped += len(batch) - len(found)
-                            remaining_rows -= len(batch)
+                        uid_b = uid.encode()
+                        try:
+                            st_sz, sz_data = _imap_uid_fetch(conn, uid_b, "(UID RFC822.SIZE)")
+                            if st_sz == "OK" and sz_data:
+                                for item in sz_data:
+                                    meta = item[0] if isinstance(item, tuple) else item
+                                    if isinstance(meta, bytes):
+                                        sz = _size_from_fetch_meta(meta)
+                                        if sz is not None and (sz > max_message_bytes or sz > max_total_bytes):
+                                            raise HTTPException(status_code=413, detail="Export too large")
+                        except HTTPException:
+                            raise
+                        except Exception as sz_err:
+                            logger.debug("Single message size preflight error: %s", sz_err)
+
+                        st, msg_data = _imap_uid_fetch(conn, uid_b, "(UID RFC822)")
+                        if st == "OK" and msg_data:
+                            for meta, raw in _group_uid_fetch_records(msg_data):
+                                if _uid_from_fetch_meta(meta) == uid and raw:
+                                    message_bytes = bytes(raw)
+                                    break
                 except HTTPException:
                     raise
                 except Exception as exc:
-                    skipped += remaining_rows
-                    logger.warning("Bulk email export skipped mailbox folder=%s account=%s count=%s: %s", folder, account_id, remaining_rows, exc)
+                    logger.warning("Single email export failed for uid=%s folder=%s: %s", uid, folder, exc)
 
-        if exported <= 0:
-            raise HTTPException(status_code=404, detail="No selected emails could be exported")
-        if len(messages) == 1 and single_export:
-            filename, message_bytes = single_export
+            if not message_bytes:
+                raise HTTPException(status_code=404, detail="No selected emails could be exported")
+
+            if len(message_bytes) > max_message_bytes or len(message_bytes) > max_total_bytes:
+                raise HTTPException(status_code=413, detail="Export too large")
+
             return StreamingResponse(
                 io.BytesIO(message_bytes),
                 media_type="message/rfc822",
                 headers={
                     "Content-Disposition": f"attachment; filename=\"email.eml\"; filename*=UTF-8''{quote(filename, safe='')}",
                     "X-Exported-Emails": "1",
+                    "X-Skipped-Emails": "0",
+                },
+            )
+
+        seen_items: set[tuple[str | None, str, str]] = set()
+        remote_groups: dict[tuple[str | None, str], dict[str, tuple[str, dict]]] = {}
+        spooled_file = tempfile.SpooledTemporaryFile(max_size=spool_threshold_bytes, mode="w+b")
+        response_started = False
+        try:
+            with zipfile.ZipFile(spooled_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for row in messages:
+                    if not isinstance(row, dict):
+                        skipped += 1
+                        continue
+                    uid = str(row.get("uid") or "").strip()
+                    if not uid:
+                        skipped += 1
+                        continue
+                    folder = str(row.get("folder") or "INBOX").strip() or "INBOX"
+                    account_id = str(row.get("account_id") or row.get("account") or "").strip() or None
+                    if account_id and account_id not in validated_accounts:
+                        _assert_owns_account(account_id, owner)
+                        validated_accounts.add(account_id)
+
+                    item_key = (account_id, folder, uid)
+                    if item_key in seen_items:
+                        skipped += 1
+                        continue
+                    seen_items.add(item_key)
+
+                    fixture = _fixture_email_read(uid, folder, owner)
+                    if fixture is not None and not fixture.get("error"):
+                        filename = _email_filename(row, uid)
+                        unique_name = filename
+                        suffix = 2
+                        while unique_name.lower() in used_names:
+                            unique_name = f"{Path(filename).stem}-{suffix}.eml"
+                            suffix += 1
+                        used_names.add(unique_name.lower())
+                        message_bytes = _fixture_message_bytes(fixture, uid, folder)
+                        if len(message_bytes) > max_message_bytes:
+                            raise HTTPException(status_code=413, detail="Export too large")
+                        total_bytes += len(message_bytes)
+                        if total_bytes > max_total_bytes:
+                            raise HTTPException(status_code=413, detail="Export too large")
+                        try:
+                            zf.writestr(f"{export_folder}/{unique_name}", message_bytes)
+                        except Exception as zip_err:
+                            logger.error("ZIP entry write failed for fixture: %s", zip_err)
+                            raise HTTPException(status_code=500, detail="Failed to create export archive")
+                        exported += 1
+                        continue
+                    if not re.fullmatch(r"\d+", uid):
+                        skipped += 1
+                        continue
+                    group = remote_groups.setdefault((account_id, folder), {})
+                    group.setdefault(uid, (_email_filename(row, uid), row))
+
+                # Fetch original RFC822 data in batches and store it byte-for-byte.
+                for (account_id, folder), rows_by_uid in remote_groups.items():
+                    rows = list(rows_by_uid.items())
+                    remaining_rows = len(rows)
+                    try:
+                        with _imap(account_id, owner=owner) as conn:
+                            conn.select(_q(folder), readonly=True)
+
+                            # Size preflight query to catch oversized exports early and bound batch sizes.
+                            uid_set_all = ",".join(uid for uid, _ in rows).encode()
+                            size_by_uid: dict[str, int] = {}
+                            try:
+                                st_sz, sz_data = _imap_uid_fetch(conn, uid_set_all, "(UID RFC822.SIZE)")
+                                if st_sz == "OK" and sz_data:
+                                    for item in sz_data:
+                                        meta = item[0] if isinstance(item, tuple) else item
+                                        if isinstance(meta, bytes):
+                                            u = _uid_from_fetch_meta(meta)
+                                            s = _size_from_fetch_meta(meta)
+                                            if u and s is not None:
+                                                size_by_uid[u] = s
+                            except Exception as sz_err:
+                                logger.debug("IMAP size preflight query failed or unsupported: %s", sz_err)
+
+                            if size_by_uid:
+                                for u, s in size_by_uid.items():
+                                    if s > max_message_bytes:
+                                        raise HTTPException(status_code=413, detail="Export too large")
+                                if total_bytes + sum(size_by_uid.values()) > max_total_bytes:
+                                    raise HTTPException(status_code=413, detail="Export too large")
+
+                            # Form batches with at most 20 messages and capped at 10 MiB payload.
+                            batches: list[list[tuple[str, tuple[str, dict]]]] = []
+                            cur_batch: list[tuple[str, tuple[str, dict]]] = []
+                            cur_batch_bytes = 0
+                            max_batch_bytes = 10 * 1024 * 1024
+                            for item in rows:
+                                uid_val = item[0]
+                                sz = size_by_uid.get(uid_val, 0)
+                                if cur_batch and (
+                                    len(cur_batch) >= 20 or
+                                    (sz > 0 and cur_batch_bytes + sz > max_batch_bytes)
+                                ):
+                                    batches.append(cur_batch)
+                                    cur_batch = []
+                                    cur_batch_bytes = 0
+                                cur_batch.append(item)
+                                cur_batch_bytes += sz
+                            if cur_batch:
+                                batches.append(cur_batch)
+
+                            for batch in batches:
+                                wanted = {uid: filename for uid, (filename, _row) in batch}
+                                uid_set = ",".join(wanted).encode()
+                                status, msg_data = _imap_uid_fetch(conn, uid_set, "(UID RFC822)")
+                                if status != "OK" or not msg_data:
+                                    skipped += len(batch)
+                                    remaining_rows -= len(batch)
+                                    continue
+                                found: set[str] = set()
+                                for meta, raw_message in _group_uid_fetch_records(msg_data):
+                                    uid = _uid_from_fetch_meta(meta)
+                                    if uid not in wanted or not raw_message:
+                                        continue
+                                    filename = wanted[uid]
+                                    unique_name = filename
+                                    suffix = 2
+                                    while unique_name.lower() in used_names:
+                                        unique_name = f"{Path(filename).stem}-{suffix}.eml"
+                                        suffix += 1
+                                    used_names.add(unique_name.lower())
+                                    message_bytes = bytes(raw_message)
+                                    if len(message_bytes) > max_message_bytes:
+                                        raise HTTPException(status_code=413, detail="Export too large")
+                                    total_bytes += len(message_bytes)
+                                    if total_bytes > max_total_bytes:
+                                        raise HTTPException(status_code=413, detail="Export too large")
+                                    try:
+                                        zf.writestr(f"{export_folder}/{unique_name}", message_bytes)
+                                    except Exception as zip_err:
+                                        logger.error("ZIP entry write failed for remote message: %s", zip_err)
+                                        raise HTTPException(status_code=500, detail="Failed to create export archive")
+                                    found.add(uid)
+                                    exported += 1
+                                    remaining_rows -= 1
+                                missing = len(batch) - len(found)
+                                skipped += len(batch) - len(found)
+                                remaining_rows -= missing
+                    except HTTPException:
+                        raise
+                    except Exception as exc:
+                        skipped += remaining_rows
+                        logger.warning("Bulk email export skipped mailbox folder=%s account=%s count=%s: %s", folder, account_id, remaining_rows, exc)
+
+            if exported <= 0:
+                raise HTTPException(status_code=404, detail="No selected emails could be exported")
+
+            spooled_file.seek(0)
+            zip_name = _safe_attachment_zip_name(f"{export_folder}.zip", "selected-emails.zip")
+            logger.info("Bulk email export complete owner=%s selected=%s exported=%s skipped=%s", owner, len(messages), exported, skipped)
+
+            def _iter_spooled(f, chunk_size=64 * 1024):
+                try:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    f.close()
+
+            response_started = True
+            return StreamingResponse(
+                _iter_spooled(spooled_file),
+                media_type="application/zip",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{zip_name}"',
+                    "X-Exported-Emails": str(exported),
                     "X-Skipped-Emails": str(skipped),
                 },
             )
-        zip_buf.seek(0)
-        zip_name = _safe_attachment_zip_name(f"{export_folder}.zip", "selected-emails.zip")
-        logger.info("Bulk email export complete owner=%s selected=%s exported=%s skipped=%s", owner, len(messages), exported, skipped)
-        return StreamingResponse(
-            zip_buf,
-            media_type="application/zip",
-            headers={
-                "Content-Disposition": f'attachment; filename="{zip_name}"',
-                "X-Exported-Emails": str(exported),
-                "X-Skipped-Emails": str(skipped),
-            },
-        )
+        finally:
+            if not response_started:
+                spooled_file.close()
 
     @router.get("/inline-image/{uid}")
     async def inline_image(
