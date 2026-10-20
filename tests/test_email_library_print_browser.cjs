@@ -1,19 +1,115 @@
+/**
+ * Browser print regression tests for Email Library print and PDF export.
+ *
+ * Requirements:
+ * - Node.js (v20+)
+ * - Playwright (`npm ci` or `npm install -D @playwright/test`)
+ * - Chromium browser binary:
+ *     - Standard Playwright install: `npx playwright install chromium`
+ *     - Or custom executable via env vars:
+ *         - `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/path/to/chrome`
+ *         - `CHROME_PATH=/path/to/chrome`
+ *     - Or custom browsers cache dir via:
+ *         - `PLAYWRIGHT_BROWSERS_PATH=/path/to/cache`
+ */
+
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { chromium } = require('playwright');
+const os = require('os');
+
+let chromium;
+try {
+  ({ chromium } = require('playwright'));
+} catch (err) {
+  if (err && err.code === 'MODULE_NOT_FOUND') {
+    console.error(
+      'Error: Playwright module not found.\n' +
+      'Please install dependencies by running:\n' +
+      '  npm ci\n' +
+      'or ensure NODE_PATH contains the playwright package.'
+    );
+    process.exit(1);
+  }
+  throw err;
+}
 
 const ROOT = path.resolve(__dirname, '..');
 
-// Find available chromium executable or default to Playwright's cached browser
+// Discover available Chromium executable using standard Playwright resolution,
+// custom environment variables, standard cache paths, or system binaries.
 function findChromiumPath() {
-  const candidates = [
-    '/home/alteixeira20/.cache/ms-playwright/chromium_headless_shell-1248/chrome-headless-shell-linux64/chrome-headless-shell',
-    '/home/alteixeira20/.cache/ms-playwright/chromium-1248/chrome-linux/chrome',
-  ];
-  for (const c of candidates) {
-    if (fs.existsSync(c)) return c;
+  // 1. Explicit environment variable overrides
+  if (process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH && fs.existsSync(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH)) {
+    return process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH;
   }
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
+    return process.env.CHROME_PATH;
+  }
+
+  // 2. Playwright's configured/default executable path
+  try {
+    const defaultPath = chromium.executablePath();
+    if (defaultPath && fs.existsSync(defaultPath)) {
+      return defaultPath;
+    }
+  } catch (e) {
+    // chromium.executablePath() may throw if no default browser is installed
+  }
+
+  // 3. Inspect standard Playwright browser cache directories
+  const cacheDirs = [];
+  if (process.env.PLAYWRIGHT_BROWSERS_PATH) {
+    cacheDirs.push(process.env.PLAYWRIGHT_BROWSERS_PATH);
+  }
+  if (process.platform === 'win32') {
+    if (process.env.LOCALAPPDATA) {
+      cacheDirs.push(path.join(process.env.LOCALAPPDATA, 'ms-playwright'));
+    }
+    cacheDirs.push(path.join(os.homedir(), 'AppData', 'Local', 'ms-playwright'));
+  } else if (process.platform === 'darwin') {
+    cacheDirs.push(path.join(os.homedir(), 'Library', 'Caches', 'ms-playwright'));
+  } else {
+    cacheDirs.push(path.join(os.homedir(), '.cache', 'ms-playwright'));
+  }
+
+  for (const cacheDir of cacheDirs) {
+    if (!fs.existsSync(cacheDir)) continue;
+    try {
+      const entries = fs.readdirSync(cacheDir).sort().reverse();
+      for (const entry of entries) {
+        const entryPath = path.join(cacheDir, entry);
+        const candidates = [
+          path.join(entryPath, 'chrome-headless-shell-linux64', 'chrome-headless-shell'),
+          path.join(entryPath, 'chrome-linux64', 'chrome'),
+          path.join(entryPath, 'chrome-linux', 'chrome'),
+          path.join(entryPath, 'chrome-win64', 'chrome.exe'),
+          path.join(entryPath, 'chrome-win', 'chrome.exe'),
+          path.join(entryPath, 'chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'),
+        ];
+        for (const candidate of candidates) {
+          if (fs.existsSync(candidate)) {
+            return candidate;
+          }
+        }
+      }
+    } catch (e) {}
+  }
+
+  // 4. System browser fallbacks
+  const systemCandidates = process.platform === 'win32' ? [
+    path.join(process.env['PROGRAMFILES'] || 'C:\\Program Files', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+    path.join(process.env['PROGRAMFILES(X86)'] || 'C:\\Program Files (x86)', 'Google', 'Chrome', 'Application', 'chrome.exe'),
+  ] : [
+    '/usr/bin/google-chrome',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/snap/bin/chromium',
+  ];
+  for (const sc of systemCandidates) {
+    if (fs.existsSync(sc)) return sc;
+  }
+
   return undefined;
 }
 
@@ -97,7 +193,18 @@ async function run() {
   const chromePath = findChromiumPath();
   if (chromePath) launchOpts.executablePath = chromePath;
 
-  const browser = await chromium.launch(launchOpts);
+  let browser;
+  try {
+    browser = await chromium.launch(launchOpts);
+  } catch (launchErr) {
+    throw new Error(
+      `Failed to launch Chromium browser: ${launchErr.message}\n` +
+      'Missing or unexecutable Chromium binary.\n' +
+      'To install Playwright Chromium, run:\n' +
+      '  npx playwright install chromium\n' +
+      'Or set PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH to a valid Chromium executable.'
+    );
+  }
   const context = await browser.newContext();
   const page = await context.newPage();
 

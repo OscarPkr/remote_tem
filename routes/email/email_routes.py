@@ -639,7 +639,7 @@ def _message_id_chain(*values: str) -> list[str]:
 
 
 def _uid_from_fetch_meta(meta_b: bytes) -> str:
-    m = re.search(rb"\bUID\s+(\d+)\b", meta_b)
+    m = re.search(rb"\bUID\s+(\d+)\b", meta_b, re.IGNORECASE)
     return m.group(1).decode() if m else ""
 
 

@@ -753,6 +753,111 @@ def test_messages_download_bulk_spooled_stream_lifecycle():
     assert f2.closed
 
 
+def test_uid_and_size_from_fetch_meta_case_insensitivity_and_validation():
+    """Unit test: _uid_from_fetch_meta and _size_from_fetch_meta case insensitivity and boundary validation."""
+    from routes.email.email_routes import _uid_from_fetch_meta, _size_from_fetch_meta
+
+    # 1. Standard uppercase UID and RFC822.SIZE
+    meta_upper = b"1 (UID 101 RFC822.SIZE 1234)"
+    assert _uid_from_fetch_meta(meta_upper) == "101"
+    assert _size_from_fetch_meta(meta_upper) == 1234
+
+    # 2. Lowercase uid and rfc822.size
+    meta_lower = b"1 (uid 202 rfc822.size 5678)"
+    assert _uid_from_fetch_meta(meta_lower) == "202"
+    assert _size_from_fetch_meta(meta_lower) == 5678
+
+    # 3. Mixed-case combinations
+    combos = [
+        (b"1 (Uid 303 Rfc822.Size 1000)", "303", 1000),
+        (b"1 (uID 404 RFC822.size 2000)", "404", 2000),
+        (b"1 (UID 505 rfc822.size 3000)", "505", 3000),
+        (b"1 (uid 606 RFC822.SIZE 4000)", "606", 4000),
+        (b"1 (uId 707 Rfc822.SIZE 5000)", "707", 5000),
+        (b"1 (FLAGS (\\Seen) uid 808 rfc822.Size 6000)", "808", 6000),
+    ]
+    for meta_bytes, exp_uid, exp_sz in combos:
+        assert _uid_from_fetch_meta(meta_bytes) == exp_uid
+        assert _size_from_fetch_meta(meta_bytes) == exp_sz
+
+    # 4. Malformed metadata cases
+    assert _uid_from_fetch_meta(b"1 (rfc822.size 1234)") == ""
+    assert _size_from_fetch_meta(b"1 (uid 101 flags (\\seen))") is None
+    assert _uid_from_fetch_meta(b"1 (uid abc rfc822.size 1234)") == ""
+    assert _size_from_fetch_meta(b"1 (uid 101 rfc822.size invalid)") is None
+    assert _size_from_fetch_meta(b"1 (uid 101 rfc822.size -50)") is None
+
+    # 5. Boundary integrity (must not match substrings like UUID, GUID, NOT_RFC822.SIZE)
+    assert _uid_from_fetch_meta(b"1 (UUID 101 GUID 202 NOT_RFC822.SIZE 1234)") == ""
+    assert _size_from_fetch_meta(b"1 (UUID 101 GUID 202 NOT_RFC822.SIZE 1234)") is None
+    assert _uid_from_fetch_meta(b"1 (uid101 rfc822.size1234)") == ""
+    assert _size_from_fetch_meta(b"1 (uid101 rfc822.size1234)") is None
+    assert _uid_from_fetch_meta(b"") == ""
+    assert _size_from_fetch_meta(b"") is None
+
+
+def test_messages_download_bulk_case_insensitive_imap_atoms(monkeypatch):
+    """End-to-end: Bulk and single-message export with lowercase and mixed-case IMAP atoms."""
+    import io
+    import zipfile
+
+    msg101 = b"From: a@example.com\r\nSubject: Item 101\r\n\r\nBody 1"
+    msg102 = b"From: b@example.com\r\nSubject: Item 102\r\n\r\nBody 2"
+    mailbox = _MockImapConn({"101": msg101, "102": msg102})
+
+    def custom_fetch(args):
+        fetch_cmd = str(args[1]) if len(args) > 1 else ""
+        if "RFC822.SIZE" in fetch_cmd or "rfc822.size" in fetch_cmd.lower():
+            # Server returns lowercase/mixed-case atoms
+            return "OK", [
+                b"1 (uid 101 rfc822.size " + str(len(msg101)).encode() + b")",
+                b"2 (Uid 102 Rfc822.Size " + str(len(msg102)).encode() + b")",
+            ]
+        # In body fetch, server returns mixed-case atoms
+        return "OK", [
+            (b"1 (uid 101 rfc822 {" + str(len(msg101)).encode(), msg101),
+            b")",
+            (b"2 (Uid 102 RFC822 {" + str(len(msg102)).encode(), msg102),
+            b")",
+        ]
+
+    mailbox.fetch_cb = custom_fetch
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    # 1. Bulk download (2 items) with lowercase / mixed-case IMAP responses
+    res_bulk = client.post("/api/email/messages-download-bulk", json={
+        "messages": [{"uid": "101"}, {"uid": "102"}]
+    })
+    assert res_bulk.status_code == 200
+    assert res_bulk.headers["x-exported-emails"] == "2"
+    assert res_bulk.headers["x-skipped-emails"] == "0"
+    zf = zipfile.ZipFile(io.BytesIO(res_bulk.content))
+    assert len(zf.namelist()) == 2
+
+    # 2. Single message download fast path with lowercase IMAP response
+    mailbox.fetch_calls.clear()
+    res_single = client.post("/api/email/messages-download-bulk", json={
+        "messages": [{"uid": "101"}]
+    })
+    assert res_single.status_code == 200
+    assert res_single.headers["content-type"].startswith("message/rfc822")
+    assert res_single.content == msg101
+
+    # 3. Lowercase malformed preflight fails safely with 502 and NO body fetch
+    mailbox.fetch_calls.clear()
+    mailbox.fetch_cb = lambda args: (
+        ("OK", [b"1 (uid 101 rfc822.size NaN)"])
+        if "RFC822.SIZE" in str(args) or "rfc822.size" in str(args).lower()
+        else ("OK", [])
+    )
+    res_malformed = client.post("/api/email/messages-download-bulk", json={
+        "messages": [{"uid": "101"}]
+    })
+    assert res_malformed.status_code == 502
+    assert "Invalid email size metadata from server" in res_malformed.json()["detail"]
+    assert not any("(UID RFC822)" in str(call) for call in mailbox.fetch_calls)
+
+
 def test_email_print_browser_behaviors():
     """Real Chromium DOM: placeholder stripping, button removal, and partial failure."""
     import shutil
