@@ -134,10 +134,24 @@ def test_email_eml_export_handles_partial_batch_failures():
 
     # The skipped counter increments for UIDs not found in the batch response.
     assert "skipped += len(batch) - len(found)" in backend
-    # Whole-connection failures count all rows as skipped.
-    assert "skipped += len(rows)" in backend
+    # Whole-connection failures count remaining unprocessed rows as skipped.
+    assert "skipped += remaining_rows" in backend
     assert '"X-Exported-Emails"' in backend
     assert '"X-Skipped-Emails"' in backend
+
+
+def test_email_eml_export_enforces_account_ownership():
+    """The /messages-download-bulk endpoint must assert account ownership."""
+    backend = _EMAIL_ROUTES.read_text(encoding="utf-8")
+
+    assert "_assert_owns_account(account_id, owner)" in backend
+
+
+def test_email_eml_export_deduplicates_selection():
+    """Duplicate items in selection must be skipped to avoid duplicate files."""
+    backend = _EMAIL_ROUTES.read_text(encoding="utf-8")
+
+    assert "seen_items" in backend
 
 
 def test_fixture_tag_filter_supports_receipt_tag_flow():
@@ -247,3 +261,153 @@ def test_email_compose_can_attach_gallery_images():
     assert "GalleryImage" in backend
     assert "_gallery_image_path(img.filename)" in backend
     assert "_stage_compose_file" in backend
+
+
+class _MockImapConn:
+    def __init__(self, messages_by_uid: dict[str, bytes] | None = None, fetch_exc: Exception | None = None):
+        self.messages = messages_by_uid or {}
+        self.fetch_exc = fetch_exc
+
+    def select(self, folder, readonly=True):
+        return "OK", [b"1"]
+
+    def uid(self, command, *args):
+        if command == "FETCH":
+            if self.fetch_exc is not None:
+                raise self.fetch_exc
+            uid_set_b = args[0]
+            uid_set = uid_set_b.decode() if isinstance(uid_set_b, bytes) else str(uid_set_b)
+            uids = [u.strip() for u in uid_set.split(",") if u.strip()]
+            res = []
+            for u in uids:
+                if u in self.messages:
+                    meta = f"1 (UID {u} RFC822 {{{len(self.messages[u])}}}".encode()
+                    res.append((meta, self.messages[u]))
+                    res.append(b")")
+            return "OK", res
+        return "NO", []
+
+
+def _create_test_app(monkeypatch, mailbox: _MockImapConn | None = None, assert_owns_fn=None):
+    from contextlib import contextmanager
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from routes.email import email_routes as routes
+
+    conn = mailbox or _MockImapConn()
+
+    @contextmanager
+    def mock_imap(account_id=None, owner=""):
+        yield conn
+
+    monkeypatch.setattr(routes, "_start_poller", lambda: None)
+    monkeypatch.setattr(routes, "_POOL_HOOKS", {})
+    monkeypatch.setattr(routes, "_imap", mock_imap)
+    if assert_owns_fn:
+        monkeypatch.setattr(routes, "_assert_owns_account", assert_owns_fn)
+
+    app = FastAPI()
+    app.include_router(routes.setup_email_routes())
+    app.dependency_overrides[routes.require_owner] = lambda: "test-user"
+    return TestClient(app)
+
+
+def test_messages_download_bulk_validates_empty_and_oversized_payload(monkeypatch):
+    client = _create_test_app(monkeypatch)
+
+    res_empty = client.post("/api/email/messages-download-bulk", json={"messages": []})
+    assert res_empty.status_code == 400
+    assert "No emails selected" in res_empty.text
+
+    oversized = [{"uid": str(i)} for i in range(251)]
+    res_over = client.post("/api/email/messages-download-bulk", json={"messages": oversized})
+    assert res_over.status_code == 400
+    assert "Too many emails selected" in res_over.text
+
+
+def test_messages_download_bulk_single_message_eml_export(monkeypatch):
+    raw_rfc822 = b"From: sender@example.com\r\nTo: test-user\r\nSubject: Report\r\n\r\nReport content"
+    mailbox = _MockImapConn({"101": raw_rfc822})
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    res = client.post("/api/email/messages-download-bulk", json={
+        "messages": [{"uid": "101", "subject": "Quarterly Report", "date": "2026-10-20"}]
+    })
+
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("message/rfc822")
+    assert res.headers["x-exported-emails"] == "1"
+    assert res.headers["x-skipped-emails"] == "0"
+    assert "email.eml" in res.headers["content-disposition"]
+    assert res.content == raw_rfc822
+
+
+def test_messages_download_bulk_multi_message_zip_export(monkeypatch):
+    import io
+    import zipfile
+
+    msg1 = b"From: a@example.com\r\nSubject: First\r\n\r\nOne"
+    msg2 = b"From: b@example.com\r\nSubject: Second\r\n\r\nTwo"
+    mailbox = _MockImapConn({"101": msg1, "102": msg2})
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    res = client.post("/api/email/messages-download-bulk", json={
+        "messages": [
+            {"uid": "101", "subject": "First Msg", "date": "2026-10-18"},
+            {"uid": "102", "subject": "Second Msg", "date": "2026-10-19"},
+        ]
+    })
+
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/zip"
+    assert res.headers["x-exported-emails"] == "2"
+    assert res.headers["x-skipped-emails"] == "0"
+
+    zf = zipfile.ZipFile(io.BytesIO(res.content))
+    namelist = zf.namelist()
+    assert len(namelist) == 2
+    assert any("101.eml" in name for name in namelist)
+    assert any("102.eml" in name for name in namelist)
+
+
+def test_messages_download_bulk_partial_failure_and_duplicate_dedup(monkeypatch):
+    import io
+    import zipfile
+
+    msg1 = b"From: a@example.com\r\nSubject: Exists\r\n\r\nExists body"
+    # UID 101 exists, UID 999 does not exist in mailbox
+    mailbox = _MockImapConn({"101": msg1})
+    client = _create_test_app(monkeypatch, mailbox=mailbox)
+
+    res = client.post("/api/email/messages-download-bulk", json={
+        "messages": [
+            {"uid": "101", "subject": "Exists"},
+            {"uid": "999", "subject": "Missing"},
+            {"uid": "101", "subject": "Duplicate"}, # duplicate must be skipped
+        ]
+    })
+
+    assert res.status_code == 200
+    assert res.headers["content-type"] == "application/zip"
+    assert res.headers["x-exported-emails"] == "1"
+    assert res.headers["x-skipped-emails"] == "2"
+
+    zf = zipfile.ZipFile(io.BytesIO(res.content))
+    assert len(zf.namelist()) == 1
+
+
+def test_messages_download_bulk_enforces_account_ownership_guard(monkeypatch):
+    from fastapi import HTTPException
+
+    def mock_assert_owns(account_id, owner):
+        if account_id == "other-tenant-acct":
+            raise HTTPException(status_code=404, detail="Account not found")
+
+    client = _create_test_app(monkeypatch, assert_owns_fn=mock_assert_owns)
+
+    res = client.post("/api/email/messages-download-bulk", json={
+        "messages": [{"uid": "101", "account_id": "other-tenant-acct"}]
+    })
+
+    assert res.status_code == 404
+    assert "Account not found" in res.text

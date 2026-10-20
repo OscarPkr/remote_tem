@@ -4281,6 +4281,7 @@ def setup_email_routes():
                     logger.debug("Skipping malformed fixture email attachment uid=%s", uid, exc_info=True)
             return msg.as_bytes(policy=email_policy.SMTP)
 
+        seen_items: set[tuple[str | None, str, str]] = set()
         remote_groups: dict[tuple[str | None, str], dict[str, tuple[str, dict]]] = {}
         with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             for row in messages:
@@ -4293,6 +4294,15 @@ def setup_email_routes():
                     continue
                 folder = str(row.get("folder") or "INBOX").strip() or "INBOX"
                 account_id = str(row.get("account_id") or row.get("account") or "").strip() or None
+                if account_id:
+                    _assert_owns_account(account_id, owner)
+
+                item_key = (account_id, folder, uid)
+                if item_key in seen_items:
+                    skipped += 1
+                    continue
+                seen_items.add(item_key)
+
                 fixture = _fixture_email_read(uid, folder, owner)
                 if fixture is not None and not fixture.get("error"):
                     filename = _email_filename(row, uid)
@@ -4319,6 +4329,7 @@ def setup_email_routes():
             # Fetch original RFC822 data in batches and store it byte-for-byte.
             for (account_id, folder), rows_by_uid in remote_groups.items():
                 rows = list(rows_by_uid.items())
+                remaining_rows = len(rows)
                 try:
                     with _imap(account_id, owner=owner) as conn:
                         conn.select(_q(folder), readonly=True)
@@ -4329,6 +4340,7 @@ def setup_email_routes():
                             status, msg_data = _imap_uid_fetch(conn, uid_set, "(UID RFC822)")
                             if status != "OK" or not msg_data:
                                 skipped += len(batch)
+                                remaining_rows -= len(batch)
                                 continue
                             found: set[str] = set()
                             for meta, raw_message in _group_uid_fetch_records(msg_data):
@@ -4351,9 +4363,12 @@ def setup_email_routes():
                                 found.add(uid)
                                 exported += 1
                             skipped += len(batch) - len(found)
+                            remaining_rows -= len(batch)
+                except HTTPException:
+                    raise
                 except Exception as exc:
-                    skipped += len(rows)
-                    logger.warning("Bulk email export skipped mailbox folder=%s account=%s count=%s: %s", folder, account_id, len(rows), exc)
+                    skipped += remaining_rows
+                    logger.warning("Bulk email export skipped mailbox folder=%s account=%s count=%s: %s", folder, account_id, remaining_rows, exc)
 
         if exported <= 0:
             raise HTTPException(status_code=404, detail="No selected emails could be exported")

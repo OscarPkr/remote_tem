@@ -1143,19 +1143,6 @@ async function _printSelectedEmails(messages) {
   };
   await Promise.all(Array.from({ length: Math.min(4, messages.length) }, readWorker));
 
-  const addField = (doc, parent, label, value) => {
-    if (!value) return;
-    const row = doc.createElement('div');
-    row.className = 'email-export-pdf-field';
-    const labelEl = doc.createElement('span');
-    labelEl.className = 'email-export-pdf-label';
-    labelEl.textContent = label;
-    const valueEl = doc.createElement('span');
-    valueEl.textContent = value;
-    row.append(labelEl, valueEl);
-    parent.appendChild(row);
-  };
-
   // Build sanitized HTML for the print frame -- scripts and event handlers
   // cannot execute inside the sandboxed iframe.
   const articles = [];
