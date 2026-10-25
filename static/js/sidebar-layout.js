@@ -322,9 +322,11 @@ export function initSidebarLayout(Storage, opts) {
       syncRailSide();
     } else if (window.innerWidth >= AUTO_COLLAPSE_WIDTH && isHidden && _wasAutoCollapsed) {
       // Only restore if chat won't be too narrow. Suppress the width
-      // transition so the reflow measures the sidebar at its full width.
+      // transition and sync the mode classes (ody-sidebar-mini also forces
+      // width 0) so the reflow measures the sidebar at its full width.
       sidebar.style.transition = 'none';
       sidebar.classList.remove('hidden');
+      syncRailSide();
       void document.body.offsetWidth; // reflow
       if (chatContainer && chatContainer.offsetWidth < MIN_CHAT_WIDTH) {
         sidebar.classList.add('hidden');
