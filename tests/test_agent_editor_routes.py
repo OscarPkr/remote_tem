@@ -989,11 +989,12 @@ def test_editor_agent_models_route_shape(client):
         assert m["source"] in ("local", "hosted")
 
 
-def test_list_editor_agent_models_includes_base_url():
+def test_list_editor_agent_models_includes_base_url(monkeypatch):
     import asyncio
 
     import src.editor_agent_model as eam
 
+    monkeypatch.setattr(eam, "local_bases", lambda: ["http://editor.test/v1"])
     models = asyncio.run(eam.list_editor_agent_models(None))
     assert any(m["source"] == "local" for m in models), models
     for m in models:
@@ -1134,6 +1135,7 @@ def test_plan_special_recolor_overrides_a_model_plan(client):
 def test_self_check_endpoint_parses_retry(client, monkeypatch):
     import src.editor_agent_model as eam
 
+    monkeypatch.setattr(eam, "local_bases", lambda: ["http://editor.test/v1"])
     async def _retry(*a, **k):  # noqa: ANN001
         return "RETRY: brighten the subject"
 
