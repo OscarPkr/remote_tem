@@ -18,42 +18,6 @@ DONE = 'data: [DONE]\n\n'
 
 
 @pytest.mark.asyncio
-async def test_answer_deltas_are_visible_before_terminal_completion_check():
-    finish = asyncio.Event()
-
-    @with_completion_gate
-    async def stream(messages):
-        yield _event({'delta': 'Live answer starts. '})
-        await finish.wait()
-        yield _event({'type': 'metrics', 'data': {}})
-        yield DONE
-
-    output = stream([])
-    first = await asyncio.wait_for(anext(output), timeout=0.2)
-    assert json.loads(first[6:])['delta'] == 'Live answer starts. '
-    finish.set()
-    remaining = [chunk async for chunk in output]
-    assert _decision([first, *remaining])['can_complete'] is True
-
-
-@pytest.mark.asyncio
-async def test_completion_replacement_replaces_already_streamed_answer_for_turn():
-    @with_completion_gate
-    async def stream(messages):
-        yield _event({'delta': 'The function returns a boolean. I ran pytest and all tests passed.'})
-        yield _event({'type': 'metrics', 'data': {}})
-        yield DONE
-
-    chunks = [chunk async for chunk in stream([{'role': 'user', 'content': 'Explain this code.'}])]
-    frames = [data for event, data in _frames(chunks) if event == 'message' and isinstance(data, dict)]
-    assert any(item.get('delta') == 'The function returns a boolean.' for item in frames)
-    assert not any('I ran pytest' in str(item.get('delta', '')) for item in frames)
-    replacement = next(item for item in frames if item.get('type') == 'final_response')
-    assert 'I ran pytest' not in replacement['content']
-    assert replacement['replacement_scope'] == 'turn'
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize('terminal_texts', [[], ['', ''], ['Recovered answer with literal [DONE] text.']])
 async def test_terminal_round_retraction_does_not_resurrect_buffered_drafts(terminal_texts):
     @with_completion_gate

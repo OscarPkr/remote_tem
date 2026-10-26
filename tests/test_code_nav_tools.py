@@ -61,10 +61,19 @@ def test_grep_ignore_case(repo):
     assert "b.txt:2:" in r["output"]
 
 
-def test_grep_glob_filter(repo):
+def test_grep_glob_filter(repo, monkeypatch):
     r = _run("grep", f'{{"pattern": "needle", "ignore_case": true, "glob": "*.py", "path": "{repo}"}}')
+    assert r["exit_code"] == 0
     assert "a.py" in r["output"]
     assert "b.txt" not in r["output"]
+
+    # Positive control: verify that fallback path honors the exact same glob contract
+    real_which = shutil.which
+    monkeypatch.setattr(shutil, "which", lambda name, *a, **kw: None if name == "rg" else real_which(name, *a, **kw))
+    r_fallback = _run("grep", f'{{"pattern": "needle", "ignore_case": true, "glob": "*.py", "path": "{repo}"}}')
+    assert r_fallback["exit_code"] == 0
+    assert "a.py" in r_fallback["output"]
+    assert "b.txt" not in r_fallback["output"]
 
 
 def test_grep_no_match(repo):
@@ -92,6 +101,17 @@ def test_grep_python_fallback_when_no_rg(repo, monkeypatch):
     assert "a.py:2:" in r["output"]
     assert "node_modules" not in r["output"]
     assert ".git/config" not in r["output"]
+
+
+def test_grep_python_fallback_uses_relative_glob_paths(repo, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    r = _run(
+        "grep",
+        f'{{"pattern": "needle|python", "glob": "**/*.py", "path": "{repo}"}}',
+    )
+    assert r["exit_code"] == 0
+    assert "a.py" in r["output"]
+    assert "sub/deep/c.py" in r["output"]
 
 
 @pytest.mark.skipif(shutil.which("rg") is None, reason="targets the ripgrep fast-path")

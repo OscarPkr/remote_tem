@@ -20,7 +20,11 @@ from pathlib import Path
 import httpx
 import jsonschema
 
-from src.context_compactor import prune_multimodal_images, trim_for_context
+from src.context_compactor import (
+    keep_recent_image_turns,
+    prune_multimodal_images,
+    trim_for_context,
+)
 from src.agent_runtime.runtime_selection import COMPACT_PREVIEW_MODE
 from src import agent_runs
 from src.agent_evidence import command_has_mutation_effect, workspace_artifact_is_usable
@@ -32,11 +36,17 @@ from src.tool_schemas import (
     normalized_native_function_argument_error,
 )
 from src.tool_types import ToolBlock
-from src.tool_parsing import parse_tool_blocks, strip_tool_blocks
+from src.tool_parsing import iter_email_addresses, parse_tool_blocks, strip_tool_blocks, strip_angle_tags
+from src.text_scanning import (
+    contains_detailed_sequence_request,
+    contains_search_engine_navigation,
+    iter_prefixed_token_matches,
+)
 from src.turn_contract import (
     _REQUEST_PREFIX,
     calendar_retiming_request,
     FAMILY_TOOLS, broad_web_briefing_request, required_read_operation_for_request,
+    note_read_intent,
     targets_bound_editor_request, inline_text_transformation, editor_request_instructions,
     _bound_editor_requests_web_verification, scheduled_automation_request, creation_container_tool,
 )
@@ -44,7 +54,6 @@ from src.prompt_security import untrusted_context_message
 from src.model_profiles import (
     model_id_leaf,
     is_odysseus_merged_tools_model,
-    supports_user_thinking_toggle,
     uses_odysseus_progressive_thinking,
 )
 
@@ -54,6 +63,94 @@ MODE = COMPACT_PREVIEW_MODE
 
 class ProviderStreamError(Exception):
     """A provider reported failure inside an otherwise successful SSE response."""
+
+
+# Only these audited, fixed domain messages may cross the exception boundary.
+# Return the canonical constants rather than arbitrary exception text.
+_PUBLIC_PREVIEW_TOOL_ERRORS = {message: message for message in (
+    'An equivalent search already returned evidence. Change the angle, missing subtopic, source type, or corroboration target instead of only changing freshness wording.',
+    'Browser navigation already failed for this exact URL; use another source page.',
+    'Do not infer image content repeatedly from filenames; use inspect_media on representative files, then continue from visual evidence.',
+    'Equivalent search intent was repeated after a correction reminder; web_search is disabled for this turn.',
+    'Look up the target with list_sessions before changing a chat. Use its exact returned ID; never invent last-chat/latest aliases. If the target is ambiguous, ask using the candidate chat titles.',
+    'Resolve the named recipient with resolve_contact before drafting. Never invent an email address.',
+    'Selection-only edits cannot use replace_all. Use a unique contextual FIND inside the selected passage.',
+    'The bounded search-attempt budget is exhausted. Do not search again; answer from usable evidence already gathered, or clearly report what could not be verified and suggest a concrete next step.',
+    'The calendar read has not succeeded yet. Obtain the requested calendar evidence before creating the dependent email draft.',
+    'The latest note search returned no candidates, so this reference has no note to open. Do not reuse an older list item; report the empty result or ask which note was intended.',
+    'The latest research search returned no candidates, so this reference has no report to open. Do not reuse an unrelated older report.',
+    'The proposed expansion only adds placeholder/meta text. Write substantive content that continues the existing document’s subject, voice, and format; do not announce that a paragraph was added.',
+    'The recipient address is not supported by the contact lookup. Use an exact returned address for the requested person; if no match exists, explain the missing recipient instead of guessing.',
+    'The same artifact target was already rewritten three times; finish from the latest successful version instead of rewriting it again.',
+    'These suggestions collapse multiple different passages into the same much shorter replacement, violating the request to preserve meaning. Produce passage-specific revisions that retain each source passage’s claims and intent.',
+    'This exact call already failed twice and will not be executed again; change strategy or finish from existing evidence.',
+    'This exact failed call was repeated after a correction reminder; the tool is disabled for this turn. Finish from existing evidence.',
+    'This exact invalid call was repeated after two validation failures; the tool is disabled for this turn.',
+    'This exact successful call already returned evidence. Do not repeat it; change the arguments or tool to gather different evidence, or finish from the evidence already available.',
+    'This still image was already inspected and the same visual evidence is already in context. inspect_media is withheld for the next correction round; use that evidence, inspect a different file, or finish.',
+    'This operation is outside the preview safety policy. No change was made.',
+    'This replacement does not make its passage more concise. Shorten the wording while retaining its facts and meaning; a spelling-only change does not satisfy the requested action. Retry with shorter replacements.',
+    'Tool arguments could not be converted for execution.',
+    'Tool arguments must be a JSON object.',
+    'Tool execution budget exhausted; finish from existing evidence.',
+    'Tool is not offered or permitted.',
+    'Two equivalent searches already returned no evidence. Do not repeat this search wording; use a different offered tool or a materially different query.',
+    'Unresolved video target: this ID was not supplied by the user or observed in a successful tool result. Do not guess it from the title. Open/read the referenced browser link or call youtube_tool latest_channel_video for the observed channel, then use its returned ID.',
+    'inspect_media exports only extract video stills and require an explicit timestamp plus output_path for every item. First inspect the video to find the timestamp; use write_file or python to author a diagram or other new artifact.',
+    'web_fetch requires url or urls. query only filters a supplied page; it is not a search or writing request.',
+)}
+
+
+def _schema_argument_hint(args, schema):
+    """Describe a schema mismatch from the schema and the call's own arguments.
+
+    Rebuilt from a fresh validation rather than read off the caught exception,
+    so nothing the exception carries can reach the model.
+    """
+    if not isinstance(schema, dict):
+        return ''
+    try:
+        validator = jsonschema.validators.validator_for(schema)(schema)
+        error = jsonschema.exceptions.best_match(validator.iter_errors(args))
+    except jsonschema.exceptions.SchemaError:
+        return ''
+    if error is None:
+        return ''
+    location = '.'.join(str(part) for part in error.absolute_path)[:80]
+    field = f"'{location}' " if location else ''
+    if error.validator == 'required' and isinstance(error.instance, dict):
+        missing = [str(name) for name in error.validator_value if name not in error.instance]
+        prefix = f'{location}.' if location else ''
+        hint = 'Missing required argument: ' + ', '.join(f"'{prefix}{name}'" for name in missing) + '.'
+    elif error.validator == 'type':
+        expected = error.validator_value
+        expected = ' or '.join(expected) if isinstance(expected, list) else str(expected)
+        hint = f'Argument {field}must be of type {expected}.'
+    elif error.validator == 'enum':
+        allowed = ', '.join(str(value) for value in error.validator_value[:12])
+        hint = f'Argument {field}must be one of: {allowed}.'
+    elif error.validator == 'additionalProperties':
+        hint = 'Remove arguments the offered tool schema does not define.'
+    else:
+        return ''
+    return f'{hint} Correct the call using the offered tool schema.'
+
+
+def _public_preview_tool_error(exc, *, execution_attempted=False):
+    """Keep useful domain guidance while withholding arbitrary diagnostics."""
+    if execution_attempted:
+        return 'The tool failed unexpectedly. Check the server log and retry.'
+    if isinstance(exc, json.JSONDecodeError):
+        return 'Tool arguments are not valid JSON. Correct the JSON object and retry.'
+    if isinstance(exc, jsonschema.ValidationError):
+        return 'Tool arguments do not match the required schema. Correct the call using the offered tool schema.'
+    detail = str(exc)
+    if detail.startswith('Artifact completion Python must reference the required '):
+        return 'Artifact completion Python must create non-empty output at the required artifact target.'
+    if detail.startswith('Shell access to credential variable '):
+        return 'Shell access to credentials is blocked. Use brokered native tools.'
+    return _PUBLIC_PREVIEW_TOOL_ERRORS.get(detail, 'The tool call could not be validated. Check its arguments and retry.')
+
 
 # Native unattended workspaces routinely require several inspections followed
 # by several artifact writes.  The interactive preview keeps its six-call
@@ -80,13 +177,6 @@ ARTIFACT_RESEARCH_TOOLS = frozenset({
     'web_search', 'web_fetch', 'private_browser', 'pdf_extract', 'youtube_tool',
     'inspect_media', 'extract_text', 'transcribe_media',
 })
-DETAILED_VIDEO_REQUEST = re.compile(
-    r"\b(?:how\s+many|count|sequence|in\s+order|chronological|"
-    r"timestamps?|what\s+time|at\s+what\s+time|when\s+.*(?:end|happen)|"
-    r"first\s+.*(?:save|attempt|event)|score(?:board)?s?)\b|"
-    r"(?:多少|几次|何时|什么时候|时间|顺序)",
-    re.IGNORECASE,
-)
 READ_TOOLS = frozenset({
     'manage_notes', 'manage_calendar', 'manage_memory', 'manage_skills', 'manage_tasks',
     'manage_documents', 'manage_research', 'manage_contact', 'list_sessions',
@@ -111,13 +201,6 @@ SAFE_WRITE_TOOLS = frozenset({
 EXPLICIT_EXECUTE_TOOLS = frozenset({'bash', 'python'})
 SAFE_UI_TOOLS = frozenset({'ui_control'})
 BROKERED_JOB_TOOLS = frozenset({'trigger_research'})
-# Scoped NL photo-editor surface. These are offered only when the
-# ``photo_editor`` capability family is active (editor Quick Edit popup or an
-# image-edit chat turn); they drive the in-process, owner-scoped editor bridge
-# and the existing AI image ops.
-EDITOR_AGENT_TOOLS = frozenset({
-    'plan_edit', 'run_editor_command', 'get_editor_screenshot', 'ai_edit_image',
-})
 CONTRACT_REQUIRED_TOOLS = frozenset({
     'send_email', 'reply_to_email',
     'create_session', 'send_to_session', 'manage_session',
@@ -128,6 +211,13 @@ CONTRACT_REQUIRED_TOOLS = frozenset({
 })
 from src.turn_contract import CONTRACT_CORE_TOOLS
 
+# Scoped NL photo-editor surface. These are offered only when the
+# ``photo_editor`` capability family is active (editor Quick Edit popup or an
+# image-edit chat turn); they drive the in-process, owner-scoped editor bridge
+# and the existing AI image ops.
+EDITOR_AGENT_TOOLS = frozenset({
+    'plan_edit', 'run_editor_command', 'get_editor_screenshot', 'ai_edit_image',
+})
 PREVIEW_TOOLS = (
     READ_TOOLS | SAFE_WRITE_TOOLS | EXPLICIT_EXECUTE_TOOLS | SAFE_UI_TOOLS
     | BROKERED_JOB_TOOLS | CONTRACT_REQUIRED_TOOLS | CONTRACT_CORE_TOOLS
@@ -221,19 +311,23 @@ def provider_compatible_tool_choice_request(request, model):
                 # Ajax's forced decoder emits incomplete optional payloads
                 # (and named choice can emit scalar/repeated-number arguments).
                 # Keep the selected schema; validate completion in the harness.
-                # (Ajax's auto decoding is designed around a single-tool
-                # boundary, so this narrowing is intentional here. The
-                # tool-hiding bug was in the deepseek/kimi branch below, which
-                # must keep the full offered set.)
                 return {**request, 'tools': selected, 'tool_choice': 'auto'}
         if choice == 'required':
             return {**request, 'tool_choice': 'auto'}
     if model_name.startswith(('deepseek', 'kimi')) and 'tool_choice' in request:
         compatible = dict(request)
-        # DeepSeek/Kimi reject a forced named choice. Drop the unsupported
-        # choice but KEEP the full offered tool set: narrowing `tools` to the
-        # named schema would hide every other tool the turn offered (e.g. a
-        # required calendar read hiding the email tools the user asked for).
+        choice = compatible.get('tool_choice')
+        selected_name = (
+            (choice.get('function') or {}).get('name')
+            if isinstance(choice, dict) else None
+        )
+        if selected_name:
+            selected = [
+                schema for schema in compatible.get('tools') or []
+                if (schema.get('function') or {}).get('name') == selected_name
+            ]
+            if selected:
+                compatible['tools'] = selected
         compatible.pop('tool_choice', None)
         return compatible
     if (
@@ -814,13 +908,95 @@ def malformed_write_handoff_target(arguments, required_artifacts=(), user_text='
     return target
 
 
+_PAGE_LISTING_WORDS = ("stories", "articles", "posts", "headlines", "pages")
+
+
+def _listing_allowed(char):
+    return char == " " or char in ".:/-" or char == "_" or char.isalnum()
+
+
+def _allowed_then_space(value):
+    """Whether value can be class+ followed by whitespace+, without retries."""
+    if len(value) < 2:
+        return False
+    first_disallowed = next((i for i, char in enumerate(value) if not _listing_allowed(char)), len(value))
+    if first_disallowed < len(value):
+        return first_disallowed > 0 and all(char.isspace() for char in value[first_disallowed:])
+    return value[-1].isspace()
+
+
+def _space_then_allowed(value):
+    """Whether value can be whitespace+ followed by the listing class+."""
+    if len(value) < 2:
+        return False
+    first_nonspace = next((i for i, char in enumerate(value) if not char.isspace()), len(value))
+    if first_nonspace < len(value):
+        return first_nonspace > 0 and all(_listing_allowed(char) for char in value[first_nonspace:])
+    trailing_spaces = len(value) - len(value.rstrip(" "))
+    return trailing_spaces > 0 and (len(value) > trailing_spaces or trailing_spaces >= 2)
+
+
+def _page_listing_request(user_text):
+    value = str(user_text or '').lstrip()
+    nonspace_end = len(value.rstrip())
+    if value[nonspace_end - 1:nonspace_end] in ("!", "?"):
+        value = value[:nonspace_end - 1]
+    lead = re.match(
+        r"(?:top|latest|recent|list(?: the)?|show(?: me)?(?: the)?)(?=\s)",
+        value, re.I,
+    )
+    if not lead:
+        return False
+    cursor = lead.end()
+    while cursor < len(value) and value[cursor].isspace():
+        cursor += 1
+    body = value[cursor:]
+    nonspace_end = len(body.rstrip())
+    terminal_end = nonspace_end
+    if body[terminal_end - 1:terminal_end] == ".":
+        terminal_end = len(body[:terminal_end - 1].rstrip())
+    first_disallowed = len(body)
+    last_disallowed = -1
+    first_nonspace_after_disallowed = len(body)
+    for index, char in enumerate(body):
+        if not _listing_allowed(char):
+            first_disallowed = min(first_disallowed, index)
+            if index < nonspace_end:
+                last_disallowed = index
+        if index >= first_disallowed and not char.isspace():
+            first_nonspace_after_disallowed = min(first_nonspace_after_disallowed, index)
+    last_literal_space = body.rfind(" ")
+    for word in _PAGE_LISTING_WORDS:
+        for candidate in re.finditer(word, body, re.I):
+            start = candidate.start()
+            prefix_allowed = start >= 2 and (
+                body[start - 1].isspace() if start <= first_disallowed
+                else first_disallowed > 0 and start <= first_nonspace_after_disallowed
+            )
+            if start == 0 or prefix_allowed:
+                after_start = candidate.end()
+                if after_start >= terminal_end:
+                    return True
+                on = after_start
+                while on < len(body) and body[on].isspace():
+                    on += 1
+                if on > after_start and body[on:on + 2].casefold() == "on":
+                    tail_start = on + 2
+                    tail_end = tail_start
+                    while tail_end < len(body) and body[tail_end].isspace():
+                        tail_end += 1
+                    if len(body) - tail_start >= 2 and tail_end > tail_start:
+                        if tail_end < len(body):
+                            if last_disallowed < tail_end:
+                                return True
+                        elif last_literal_space > tail_start:
+                            return True
+    return False
+
+
 def page_listing_response(entries, user_text, max_items=10):
     """Render simple page listings from observed titles/URLs, never synthesized rankings."""
-    if not re.fullmatch(
-        r'\s*(?:top|latest|recent|list(?: the)?|show(?: me)?(?: the)?)\s+'
-        r'(?:[\w .:/-]+\s+)?(?:stories|articles|posts|headlines|pages)'
-        r'(?:\s+on\s+[\w .:/-]+)?[.!?]?\s*', user_text, re.I,
-    ) or re.search(r'\b(?:and|compare|summarize|analyse|analyze|about|by|since|yesterday)\b', user_text, re.I):
+    if not _page_listing_request(user_text) or re.search(r'\b(?:and|compare|summarize|analyse|analyze|about|by|since|yesterday)\b', user_text, re.I):
         return ''
     from urllib.parse import quote, urlsplit
     from html import escape
@@ -870,6 +1046,22 @@ def notes_terminal_response(raw, *, user_text='', max_items=20):
         raw, max_items=requested_item_limit(user_text, default=max_items),
     )
     return _bounded_structured_list(summary, user_text=user_text)
+
+
+def note_locator_followup(raw, *, user_text=''):
+    """Require a body read before answering a note-content request."""
+    _, needs_body = note_read_intent(user_text)
+    if not needs_body or note_search_result_empty(raw):
+        return ''
+    listing = notes_terminal_response(raw, user_text=user_text, max_items=5)
+    match = re.search(r'\(#note-([A-Za-z0-9_-]+)\)', listing)
+    if not match:
+        return ''
+    return (
+        'The notes result contains titles only, not the body. '
+        f'Call manage_notes with action="view" and id="{match.group(1)}" now. '
+        'Use the returned body to answer the request; do not infer content from the title.'
+    )
 
 
 def documents_terminal_response(raw, *, user_text='', max_items=8):
@@ -1205,17 +1397,26 @@ def contentless_final_response(content):
 
 
 def action_promise_response(content):
-    """Recognize a short promise to do work that contains no result yet."""
-    text = re.sub(r'\s+', ' ', str(content or '')).strip()
-    if not text or len(text.split()) > 48:
+    """Recognize a short promise to do work that contains no result yet.
+
+    Fenced code blocks are stripped before the word count and the verb match,
+    so a promise followed by a code block (e.g. "I will browse Google Maps ..."
+    plus a requests/BeautifulSoup snippet and no tool call) still counts as an
+    action promise. The caller only reaches this when no tool call was made.
+    """
+    without_code = re.sub(
+        r'\s+', ' ', re.sub(r'```.*?```', ' ', str(content or ''), flags=re.DOTALL)
+    ).strip()
+    if not without_code or len(without_code.split()) > 48:
         return False
-    if re.search(r'\b(?:answer|result|score|served|created|saved)\s*:', text, re.I):
+    if re.search(r'\b(?:answer|result|score|served|created|saved)\s*:', without_code, re.I):
         return False
     return bool(re.match(
         r"^(?:okay[,.:]?\s*)?(?:let me|i(?:'ll| will)|next[,.:]?\s+i(?:'ll| will))\s+"
         r"(?:now\s+)?(?:inspect|extract|read|check|review|analy[sz]e|verify|open|"
-        r"search|look|create|write|render|run|use|continue|finish|provide)\b",
-        text,
+        r"search|look|create|write|render|run|use|continue|finish|provide|"
+        r"browse|find|fetch|visit|navigate|go|get|scrape)\b",
+        without_code,
         re.I,
     ))
 
@@ -1236,17 +1437,21 @@ def incomplete_broad_web_answer(content, user_text, *, recovery_attempts=0):
     return len(words) < 80 or not re.search(r'https?://\S+', str(content or ''))
 
 
-def progressive_thinking_for_turn(model, offered_schemas, thinking_mode=None, *, tool_failed=False, deliberate=False):
-    """Ajax Compact owns reasoning; legacy session preferences do not control it."""
-    if not uses_odysseus_progressive_thinking(model):
+def progressive_thinking_for_turn(model, offered_schemas, thinking_mode=None):
+    """Use Qwen reasoning only when this turn has no Odysseus tool surface."""
+
+    if str(thinking_mode or '').lower() == 'off':
         return False
-    return tool_failed or deliberate or not bool(offered_schemas)
+    return uses_odysseus_progressive_thinking(model) and not bool(offered_schemas)
 
 
 def spec_router_thinking_decision(endpoint_url, model, owner, headers, direct_user_text):
     """Env-gated router decision for spec tool-surface turns. Fail open (None)."""
     try:
-        from src import spec_router
+        import sys as _sys
+        spec_router = _sys.modules.get('src.spec_router')
+        if spec_router is None:
+            from src import spec_router  # noqa: F401
         if not spec_router.think_router_enabled():
             return None
         from src.agent_loop import _configured_model_tool_surface_raw
@@ -1268,6 +1473,144 @@ def spec_router_think_reason(round_number, decision, existing_deliberate):
             and isinstance(decision, dict) and decision.get('think')):
         return 'router_think'
     return ''
+
+
+def spec_direct_mode():
+    """Which direct-answer behaviour to use when the gate is on.
+
+    'tool_choice_none' (default) keeps the tools list but forbids a tool call
+    for the round; 'empty_menu' sends no tools at all. Any other value falls
+    back to the default.
+    """
+    mode = str(
+        os.getenv('ODYSSEUS_SPEC_DIRECT_MODE', 'tool_choice_none') or ''
+    ).strip().lower()
+    return 'empty_menu' if mode == 'empty_menu' else 'tool_choice_none'
+
+
+def spec_direct_no_tools_p(user_message, endpoint_url, model, owner, headers):
+    """Env-gated confidence for a spec 'answer_directly' turn.
+
+    Returns the answer_directly probability when the spec router just decided
+    to answer directly with enough confidence, else None. Default OFF, so the
+    caller behaves exactly as before unless ODYSSEUS_SPEC_DIRECT_NOTOOLS is set.
+    """
+    if str(os.getenv('ODYSSEUS_SPEC_DIRECT_NOTOOLS', '')).strip().lower() not in (
+        '1', 'true', 'yes', 'on'):
+        return None
+    try:
+        from src.agent_loop import _configured_model_tool_surface_raw
+        if _configured_model_tool_surface_raw(
+            endpoint_url, model, owner, headers=headers
+        ) != 'spec':
+            return None
+        import sys as _sys
+        spec_router = _sys.modules.get('src.spec_router')
+        if spec_router is None:
+            from src import spec_router  # noqa: F401
+        decisions = getattr(spec_router, 'LAST_DECISIONS', None) or []
+        if not decisions:
+            return None
+        decision = decisions[-1]
+        if not isinstance(decision, dict):
+            return None
+        # Guard against a stale decision from a previous turn.
+        msg = str(user_message or '')
+        decided_msg = str(decision.get('message') or '')
+        if decided_msg and msg and decided_msg[:40] != msg[:40]:
+            return None
+        if decision.get('choice') != 'answer_directly':
+            return None
+        try:
+            p = float(decision.get('answer_directly') or 0.0)
+        except (TypeError, ValueError):
+            return None
+        try:
+            min_p = float(os.getenv('ODYSSEUS_SPEC_DIRECT_MIN_P', '0.9') or 0.9)
+        except (TypeError, ValueError):
+            min_p = 0.9
+        return p if p >= min_p else None
+    except Exception:
+        logging.getLogger(__name__).warning(
+            'spec direct-answer decision failed; using rules only', exc_info=True)
+        return None
+
+
+def spec_driver_active(endpoint_url, model, owner, headers):
+    """True when ODYSSEUS_SPEC_MODE=driver and the turn uses the spec surface."""
+    if str(os.getenv('ODYSSEUS_SPEC_MODE', '') or '').strip().lower() != 'driver':
+        return False
+    try:
+        from src.agent_loop import _configured_model_tool_surface_raw
+        return _configured_model_tool_surface_raw(
+            endpoint_url, model, owner, headers=headers) == 'spec'
+    except Exception:
+        return False
+
+
+def spec_driver_pick(conversation, disabled_tools, user_text, schemas=None):
+    """Per-round ODYSSEUS_SPEC_MODE=driver decision: the router drives tools.
+
+    Ask the router once for this round and return its TOP-1 choice at ANY
+    confidence: ``{'choice': 'tool'|'answer_directly'|'ask_user', 'p': float,
+    'tool_name': str|None}``. Returns None on any router error/timeout or an
+    unusable pick, so the caller keeps the normal menu for that round.
+
+    ``schemas`` is the round's offered menu; the router only ever picks from
+    it, so a top-1 tool is always one the turn can actually execute (passing
+    every known tool here made the driver name tools outside the offered set,
+    which then looped on permission errors).
+    """
+    try:
+        from src.tool_schemas import FUNCTION_TOOL_SCHEMAS
+        import sys as _sys
+        spec_router = _sys.modules.get('src.spec_router')
+        if spec_router is None:
+            from src import spec_router  # noqa: F401
+        menu = list(schemas) if schemas else list(FUNCTION_TOOL_SCHEMAS)
+        picks, _decided = spec_router.spec_route_tools(
+            str(user_text or ''), menu,
+            set(disabled_tools or ()), list(conversation or []),
+            return_decision=True,
+        )
+        decisions = getattr(spec_router, 'LAST_DECISIONS', None) or []
+        decision = decisions[-1] if decisions else {}
+        if not isinstance(decision, dict) or decision.get('error'):
+            return None
+        choice = decision.get('choice')
+        top = decision.get('top') or []
+        if choice == 'answer_directly':
+            return {'choice': 'answer_directly',
+                    'p': float(decision.get('answer_directly') or 0.0),
+                    'tool_name': None}
+        if choice == 'ask_user':
+            return {'choice': 'ask_user',
+                    'p': float(decision.get('ask_user') or 0.0),
+                    'tool_name': None}
+        # Driver mode takes the router's TOP-1 at ANY confidence, so read the
+        # ranked ``top`` (not the MIN_CONF-filtered ``picks``/``added``).
+        if top and isinstance(top[0], (list, tuple)) and top[0]:
+            name = str(top[0][0] or '')
+            p = None
+            if len(top[0]) >= 2:
+                try:
+                    p = float(top[0][1])
+                except (TypeError, ValueError):
+                    p = None
+            if name:
+                return {'choice': 'tool', 'p': p, 'tool_name': name}
+        if picks:
+            try:
+                name = str(next(iter(picks)))
+            except TypeError:
+                name = str(picks[0]) if len(picks) else ''
+            if name:
+                return {'choice': 'tool', 'p': None, 'tool_name': name}
+        return None
+    except Exception:
+        logging.getLogger(__name__).warning(
+            'spec driver decision failed; using the normal menu', exc_info=True)
+        return None
 
 
 def tool_deliberation_reason(name, args):
@@ -1322,10 +1665,10 @@ def qwen_think_split_events(content, state):
     lead = len('<think>') if lowered.startswith('<think>') else 0
     close = lowered.find('</think>')
     if close < 0:
-        if '<think>' not in lowered:
-            return events
-        # Hold back a possible partial '</think>' so it is never shown as
-        # thinking text.
+        # The opening <think> is injected by the chat template, so a progressive
+        # trace can arrive with no marker until </think>. Emit the buffered text
+        # as thinking - holding back a possible partial close tag - so the trace
+        # streams live instead of dumping in one block at the end.
         think_region = text[lead:max(lead, len(text) - len('</think>'))]
         answer_region = ''
     else:
@@ -1621,17 +1964,24 @@ def prior_workspace_path_answer(user_text, history):
     return ''
 
 
+def _prior_web_source_request(text):
+    text = str(text or '')
+    candidate = text.lstrip().rstrip()
+    candidate = candidate.rstrip(".!? ")
+    return bool(re.fullmatch(
+        r"(?:(?:where|what)\s+did\s+you\s+(?:get|find)\s+(?:that|this)\s+from[?., ]*"
+        r"(?:give|show|send)\s+me\s+(?:the\s+)?(?:source\s+)?link"
+        r"|(?:give|show|send)\s+me\s+(?:the\s+)?(?:source\s+)?link(?:\s+for\s+that)?"
+        r"|what(?:['’]?s|\s+is)\s+(?:the\s+)?source(?:\s+link)?)",
+        candidate,
+        re.I,
+    ))
+
+
 def prior_web_source_answer(user_text, history):
     """Return the latest source URL for an explicit source-only follow-up."""
     text = str(user_text or '')
-    if not re.fullmatch(
-        r"\s*(?:(?:where|what)\s+did\s+you\s+(?:get|find)\s+(?:that|this)\s+from[?., ]*"
-        r"(?:give|show|send)\s+me\s+(?:the\s+)?(?:source\s+)?link[.!? ]*"
-        r"|(?:give|show|send)\s+me\s+(?:the\s+)?(?:source\s+)?link(?:\s+for\s+that)?[.!? ]*"
-        r"|what(?:['’]?s|\s+is)\s+(?:the\s+)?source(?:\s+link)?[.!? ]*)\s*",
-        text,
-        re.I,
-    ):
+    if not _prior_web_source_request(text):
         return ''
     call_names = {}
     candidates = []
@@ -2273,7 +2623,7 @@ def canonical_tools_for_mode(tools, mode):
 def contract_builder():
     root = Path(os.environ.get(
         'ODYSSEUS_TOOL_CONTRACT_ROOT',
-        '/home/pewds/odysseus-tool-work/scripts',
+        str(Path(__file__).resolve().parents[1] / "scripts"),
     )).resolve()
     contract_path = root / 'eval_alltools_unseen_compare.py'
     if contract_path.is_file():
@@ -2296,6 +2646,9 @@ def compact_schemas(schemas, *, model=None):
     # The evaluator's short email names and live MCP aliases share the same
     # contract; keep live dispatch names intact.
     compact = contract_builder()(copy.deepcopy(schemas), 'compact_contract_v5')
+    if re.match(r'^ajax(?:$|[-_])', model_id_leaf(model)):
+        compact = [schema for schema in compact
+                   if canonical(schema['function']['name']) != 'ask_user']
     # Description dropout makes edit_document's legacy free-form ``command``
     # field indistinguishable from a verb/action hint.  Small models then emit
     # values such as {"command":"replace"}, which cannot identify either side
@@ -2626,6 +2979,18 @@ def normalize_preview_entity_anchor_args(name, args):
         value = args.get(field)
         if isinstance(value, str) and value.startswith(prefix):
             args[field] = value[len(prefix):]
+    if canonical(name) == 'manage_notes':
+        # Some models copy the rendered note href without its leading '#'.
+        # Decode only a complete UUID; partial selectors retain the existing
+        # owner-bound resolution policy instead of gaining a new alias.
+        value = args.get('note_id')
+        if isinstance(value, str):
+            match = re.fullmatch(
+                r'note-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})',
+                value, re.I,
+            )
+            if match:
+                args['note_id'] = match.group(1)
     return args
 
 
@@ -2666,6 +3031,9 @@ def normalize_preview_function_args(name, args, *, user_text=''):
             args.pop('filter', None)
     if canonical(name) == 'manage_notes':
         action = str(args.get('action') or '').strip().replace('-', '_').casefold()
+        if action == 'read' and (args.get('id') or args.get('note_id')):
+            args['action'] = 'view'
+            action = 'view'
         if action == 'list':
             request = str(user_text or '').casefold()
             # The notes backend interprets title/query/content on ``list`` as
@@ -2682,6 +3050,10 @@ def normalize_preview_function_args(name, args, *, user_text=''):
                 args.pop('archived', None)
             if not re.search(r'\b(?:checklists?|freeform\s+notes?|notes?\s+only)\b', request):
                 args.pop('note_type', None)
+            query, _ = note_read_intent(user_text)
+            if query:
+                args['action'] = 'search'
+                args['query'] = query
     if canonical(name) == 'manage_skills':
         action = str(args.get('action') or '').strip().replace('-', '_').casefold()
         if action in {'update', 'change', 'revise'}:
@@ -2810,7 +3182,8 @@ def scope_preview_contract(preview_contract, routed_contract, active_capabilitie
     available_requested = routed_canonical & offered_canonical & requested_family_tools
     routed_canonical.update(canonical(name) for name in extra_tools)
     if 'image_generation' not in active and 'photo_editor' not in active:
-        # A past image request must not keep generation warm on email/doc turns.
+        # A past image request must not keep generation warm on email/doc turns,
+        # unless the photo_editor family (which bundles generate_image) is active.
         routed_canonical.discard('generate_image')
     missing_active = {
         f'capability:{family}' for family in active
@@ -2909,12 +3282,11 @@ def draft_contact_evidence_error(name, args, *, dependencies=(), executions=(), 
                     and not e.get('blocked')]
     if not observations:
         return 'Resolve the named recipient with resolve_contact before drafting. Never invent an email address.'
-    address_pattern = r'[A-Za-z0-9.!#$%&\x27*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
     known = {address.casefold() for e in observations
-             for address in re.findall(address_pattern, str(e.get('output') or ''))}
-    known.update(address.casefold() for address in re.findall(address_pattern, user_text))
+             for address in iter_email_addresses(str(e.get('output') or ''), ascii_only=True)}
+    known.update(address.casefold() for address in iter_email_addresses(user_text, ascii_only=True))
     proposed = {address.casefold() for field in ('to', 'cc', 'bcc')
-                for address in re.findall(address_pattern, str(args.get(field) or ''))}
+                for address in iter_email_addresses(str(args.get(field) or ''), ascii_only=True)}
     if not proposed or not proposed <= known:
         return ('The recipient address is not supported by the contact lookup. Use an exact '
                 'returned address for the requested person; if no match exists, explain '
@@ -3143,7 +3515,11 @@ def _successful_email_identifiers(history):
     for message in history or ():
         if not isinstance(message, dict):
             continue
-        if message.get('role') == 'system' and 'Message UID:' in str(message.get('content') or ''):
+        active_reader = (
+            message.get('_agent_injected') == 'context'
+            and (message.get('metadata') or {}).get('source') == 'active email reader'
+        )
+        if (message.get('role') == 'system' or active_reader) and 'Message UID:' in str(message.get('content') or ''):
             extracted = _email_identifiers_from_text(message.get('content'))
             known['uid'].update(extracted['uid'])
             known['message_id'].update(extracted['message_id'])
@@ -3431,6 +3807,20 @@ def evaluate_preview_call(name, args, user_text='', *, allow_execute_code=False,
     runtime_tools = PREVIEW_TOOLS | (
         NATIVE_WORKSPACE_TOOLS if allow_native_workspace else frozenset()
     ) | ({canonical(tool) for tool in external_runtime_tools} if allow_native_workspace else set())
+    # Spec turns are driven by the router: the Spec contract (its offered set)
+    # IS the model runtime, so a Spec pick is runnable. Keyed off the same
+    # marker the spec hook sets (`routing_experiment == 'spec-router'`), never
+    # a new flag, and never applied to compact/native turns.
+    try:
+        from src.turn_contract import active_turn_contract as _atc
+        _spec_contract = _atc()
+        if _spec_contract is not None and getattr(
+                _spec_contract, 'routing_experiment', '') == 'spec-router':
+            runtime_tools = runtime_tools | {
+                canonical(tool) for tool in getattr(_spec_contract, 'offered', ()) or ()
+            }
+    except Exception:
+        pass
     if bare not in runtime_tools:
         return decision(False, 'tool_not_in_model_runtime')
     if bare in {canonical(tool) for tool in external_runtime_tools}:
@@ -3774,6 +4164,29 @@ def conversation(history_session, messages, *, owner=None, diagnostics=None):
     from src.turn_contract import result_reference_followup
     source_context = (recent_source_reference_context(groups[-2])
                       if len(groups) > 1 and result_reference_followup(current_text) else None)
+    # Tool output can dwarf the dialogue (especially a web search). Keep the
+    # visible exchange before enforcing the history cap, so one search-heavy
+    # turn cannot erase the subject of the next follow-up.
+    for index, group in enumerate(groups[:-1]):
+        if len(json.dumps(group)) <= 5000 or len(group) < 2:
+            continue
+        # Keep non-web tool evidence intact: a note/list follow-up may need
+        # exact result identifiers, and shortening it would be misleading.
+        if not any(
+            canonical((call.get('function') or {}).get('name', '')) in {'web_search', 'web_fetch'}
+            for message in group if message.get('role') == 'assistant'
+            for call in message.get('tool_calls') or ()
+        ):
+            continue
+        answer = next((message.get('content') for message in reversed(group)
+                       if message.get('role') == 'assistant'
+                       and str(message.get('content') or '').strip()), None)
+        if answer is None:
+            continue
+        answer_text = str(answer)
+        if len(answer_text) > 3500:
+            answer_text = answer_text[:3500] + '\n[Earlier answer shortened for context.]'
+        groups[index] = [group[0], {'role': 'assistant', 'content': answer_text}]
     # Drop whole turns only, never orphan tool results from their native calls.
     groups = groups[-8:]
     while len(groups) > 1 and len(json.dumps(groups)) > 22000:
@@ -4044,7 +4457,7 @@ def active_document_revision_quality_error(name, args, *, active_document, user_
     if not incoming:
         return None
     addition = incoming[len(existing):].strip() if existing and incoming.startswith(existing) else ''
-    candidate = re.sub(r'<[^>]+>', ' ', addition).strip()
+    candidate = strip_angle_tags(addition, ' ').strip()
     candidate = re.sub(r'\s+', ' ', candidate)
     if not candidate or candidate.casefold() in str(user_text or '').casefold():
         return None
@@ -4069,8 +4482,8 @@ def document_suggestion_quality_error(name, args, *, user_text):
         for suggestion in suggestions:
             if not isinstance(suggestion, dict):
                 continue
-            source = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', str(suggestion.get('find') or ''))).strip()
-            result = re.sub(r'\s+', ' ', re.sub(r'<[^>]*>', ' ', str(suggestion.get('replace') or ''))).strip()
+            source = re.sub(r'\s+', ' ', strip_angle_tags(str(suggestion.get('find') or ''), ' ', allow_empty=True)).strip()
+            result = re.sub(r'\s+', ' ', strip_angle_tags(str(suggestion.get('replace') or ''), ' ', allow_empty=True)).strip()
             if not source or not result:
                 continue
             source_words = len(re.findall(r"\b[\w’'-]+\b", source))
@@ -4145,7 +4558,9 @@ def workspace_process_denial(executions) -> bool:
         blob = ' '.join(
             str(entry.get(key) or '') for key in ('error', 'output', 'failure_kind')
         )
-        if 'sealed workspace' in blob or 'resource_identity_denied' in blob:
+        # Resource identity also covers missing note and document selectors.
+        # Those denials must not turn into instructions to open a code workspace.
+        if 'sealed workspace' in blob.casefold():
             return True
     return False
 
@@ -4169,7 +4584,7 @@ _MUTATION_REQUEST = re.compile(
     r'\b(?:add|creat(?:e|ing)?|make|writ(?:e|ing)|sav(?:e|ing)|updat(?:e|ing)|edit(?:ing)?|chang(?:e|ing)|'
     r'set|schedul(?:e|ing)|reschedul(?:e|ing)|paus(?:e|ing)|resum(?:e|ing)|toggle|mark|'
     r'pin|archive|delet(?:e|ing)|remov(?:e|ing)|send|reply|draft|publish|run|launch|serve|start|stop|'
-    r'remember|remeber|forget|remind|review|proofread|suggest(?:ions?)?|expand|broaden|deepen|lighten|feedback|reserve|block)\b|'
+    r'remember|remeber|forget|remind|review|proofread|suggest(?:ions?)?|expand|broaden|deepen|lighten|reserve|block)\b|'
     r'\bgo\s+deeper\b',
     re.I,
 )
@@ -4205,7 +4620,7 @@ def mutation_action_requested(user_text):
     actionable = re.sub(
         r"\b(?:do\s+not|don't|never|without)\s+"
         r"(?:(?:chang(?:e|ing)|modif(?:y|ying)|edit(?:ing)?|delet(?:e|ing)|"
-        r"remov(?:e|ing)|send(?:ing)?|writ(?:e|ing)|creat(?:e|ing))\b)"
+        r"remov(?:e|ing)|send(?:ing)?|writ(?:e|ing)|creat(?:e|ing)|schedul(?:e|ing))\b)"
         r"[^.;\n]{0,120}?(?=(?:[.;\n]|\bbut\b|\binstead\b|$))",
         '', text, flags=re.I,
     )
@@ -4244,13 +4659,17 @@ _WORKSPACE_FILE_RE = re.compile(
     r"/workspace/[^\s,，、;；`\"'<>]+\.[A-Za-z0-9]{1,12}",
     re.I,
 )
+_WORKSPACE_PREFIX_RE = re.compile(r"/workspace/", re.I)
+_WORKSPACE_FILE_TOKEN_TAIL_RE = re.compile(r"[^\s,，、;；`\"'<>]*")
 
 
 def declared_workspace_artifacts(user_text):
     """Return explicit output paths, excluding paths used only as inputs."""
     text = str(user_text or '')
     paths = []
-    for match in _WORKSPACE_FILE_RE.finditer(text):
+    for match in iter_prefixed_token_matches(
+        text, _WORKSPACE_PREFIX_RE, _WORKSPACE_FILE_RE, _WORKSPACE_FILE_TOKEN_TAIL_RE
+    ):
         path = match.group(0).rstrip('.!?)）]}')
         if path.startswith('/workspace/fixtures/') or path in paths:
             continue
@@ -4370,17 +4789,61 @@ def evidence_tool_keeps_distinct_requests_available(name):
     }
 
 
+def _terminal_source_link_clause(text):
+    """Recognize the terminal short source/link clause from right to left."""
+    value = str(text or '')
+    def matches_at(end):
+        while end and value[end - 1] in ".!?":
+            end -= 1
+        while end and value[end - 1].isspace():
+            end -= 1
+        lowered = value[:end].casefold()
+        for courtesy in ("please", "pls"):
+            if lowered.endswith(courtesy):
+                boundary = end - len(courtesy)
+                end = boundary
+                while end and value[end - 1].isspace():
+                    end -= 1
+                lowered = value[:end].casefold()
+                break
+        token_match = re.search(r"(?:sources?|citations?|links?)$", lowered)
+        if token_match is None:
+            return False
+        prefix = value[:token_match.start()]
+        original_cursor = len(prefix)
+        courtesy_end = original_cursor
+        while courtesy_end and prefix[courtesy_end - 1].isspace():
+            courtesy_end -= 1
+        cursors = [original_cursor]
+        for courtesy in ("please", "pls"):
+            start = courtesy_end - len(courtesy)
+            if start >= 0 and prefix[start:courtesy_end].casefold() == courtesy:
+                if courtesy_end < original_cursor and (start == 0 or prefix[start - 1].isspace()):
+                    cursors.append(start)
+                break
+        for cursor in cursors:
+            while cursor and prefix[cursor - 1].isspace():
+                if prefix[cursor - 1] == "\n":
+                    return True
+                cursor -= 1
+            if cursor == 0 or prefix[cursor - 1] in ".!?;,":
+                return True
+        return False
+
+    return matches_at(len(value)) or (value.endswith("\n") and matches_at(len(value) - 1))
+
+
 def requested_web_source_links(user_text):
-    return bool(re.search(
+    text = str(user_text or '')
+    return _terminal_source_link_clause(text) or bool(re.search(
         r'\b(?:return|give|show|include|provide|cite|find)\b.{0,35}\b(?:source\s+)?links?\b'
-        r'|(?:^|[.!?;,\n])\s*(?:(?:pls|please)\s+)?(?:sources?|citations?|links?)\s*(?:pls|please)?\s*[.!?]*$'
         r'|\b(?:\d+|one|two|three|four|five)\s+(?:official\s+)?(?:source\s+)?links?\b'
         r'|\bofficial\s+source\b'
         r'|\b(?:with|include|provide|cite|show|give|find)\s+(?:the\s+)?(?:official\s+)?(?:sources|citations)\b'
         r'|\blink\s+(?:to\s+)?(?:the\s+|your\s+)?(?:original\s+|official\s+)?(?:instructions|sources|documentation|articles?|reports?|studies|manuals?|guides?)\b'
         r'|\b(?:find|locate|get|download)\b.{0,60}\bofficial\b.{0,60}\b(?:manual|guide|handbook|pdf|documentation)\b'
         r'|\b(?:find|locate|get|download)\b.{0,80}\b(?:manual|guide|handbook|pdf)\b.{0,40}\b(?:online|official)\b',
-        str(user_text or ''),
+        text,
         re.IGNORECASE,
     ))
 
@@ -4417,12 +4880,67 @@ def unbound_lookup_reference(user_text, history, *, supplied_context=False):
     ))
 
 
+def _web_source_rows(text):
+    """Extract numbered source title/URL rows with monotonic line scans."""
+    rows = []
+    position = 0
+    length = len(text)
+    while position < length:
+        if position and text[position - 1] != "\n":
+            newline = text.find("\n", position)
+            if newline < 0:
+                break
+            position = newline + 1
+            continue
+        cursor = position
+        if cursor >= length or text[cursor] != "[":
+            newline = text.find("\n", cursor)
+            if newline < 0:
+                break
+            position = newline + 1
+            continue
+        cursor += 1
+        digit_start = cursor
+        while cursor < length and text[cursor].isdigit():
+            cursor += 1
+        if cursor == digit_start or cursor >= length or text[cursor] != "]":
+            position += 1
+            continue
+        cursor += 1
+        if cursor >= length or not text[cursor].isspace():
+            position += 1
+            continue
+        while cursor < length and text[cursor].isspace():
+            cursor += 1
+        title_start = cursor
+        title_line_end = text.find("\n", title_start)
+        if title_line_end < 0:
+            break
+        title_end = title_line_end
+        while title_end > title_start and text[title_end - 1].isspace():
+            title_end -= 1
+        url_start = title_line_end + 1
+        while url_start < length and text[url_start].isspace():
+            url_start += 1
+        scheme_length = 7 if text.startswith("http://", url_start) else 8 if text.startswith("https://", url_start) else 0
+        if title_end > title_start and scheme_length:
+            url_end = url_start + scheme_length
+            while url_end < length and not text[url_end].isspace():
+                url_end += 1
+            rows.append((text[title_start:title_end], text[url_start:url_end]))
+            position = url_end
+            continue
+        newline = text.find("\n", position)
+        if newline < 0:
+            break
+        position = newline + 1
+    return rows
+
+
 def web_source_links(raw, *, max_items=1, prefer_official=False, query=''):
     """Extract stable title/URL pairs from the web tool's source preamble."""
     text = str(raw or '')
-    rows = re.findall(
-        r'^\[\d+\]\s+(.+?)\s*\n\s*(https?://\S+)', text, re.MULTILINE,
-    )
+    rows = _web_source_rows(text)
     query_tokens = set(re.findall(r'[a-z0-9]+', str(query or '').casefold())) - {
         'the', 'a', 'an', 'official', 'source', 'link', 'page', 'website',
         'site', 'guide', 'search', 'find', 'for', 'return',
@@ -5075,6 +5593,7 @@ from src.agent_runtime.authority import MISSING_AUTHORITY, with_request_authorit
 async def stream_preview(*, endpoint_url, model, messages, headers, turn_contract,
                          session_id, owner, disabled_tools, tool_policy,
                          history_session=None, external_untrusted_context_seen=False,
+                         delegated_credential=False,
                          active_document=None, active_email=None, workspace=None,
                          client_runtime_context=None, max_tokens=768, max_rounds=8,
                          max_tool_calls=0,
@@ -5110,7 +5629,20 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
             suggestion_only=suggestion_target,
             source_verification=_bound_editor_requests_web_verification(direct_user_text),
         )
-    offered = compact_schemas(turn_contract.schemas(), model=model)
+    from src.tool_security import delegated_credential_blocked_tools
+    from src.tool_capabilities import delegated_tool_is_blocked
+    disabled_tools = set(disabled_tools or ())
+    if delegated_credential:
+        disabled_tools.update(delegated_credential_blocked_tools())
+    hard_disabled = disabled_tools | (set(tool_policy.all_disabled_names()) if tool_policy else set())
+    def permitted_schema(schema):
+        name = schema['function']['name']
+        return (not (tool_policy and tool_policy.block_all_tool_calls)
+                and name not in hard_disabled
+                and not (delegated_credential and delegated_tool_is_blocked(name)))
+
+    offered = [schema for schema in compact_schemas(turn_contract.schemas(), model=model)
+               if permitted_schema(schema)]
     if standalone_social_turn(direct_user_text) or inline_text_transformation(direct_user_text):
         offered = []
     external_schema_by_name = {
@@ -5128,11 +5660,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
         for schema in offered
     ]
     progressive_thinking = progressive_thinking_for_turn(model, offered, ignored.get('thinking_mode'))
-    recovery_thinking_pending = False
-    recovery_thinking_rounds = []
-    operation_thinking_pending = ''
-    deliberated_operations = set()
-    operation_thinking_rounds = []
     external_runtime_tools = frozenset(
         str((schema.get('function') or {}).get('name') or '')
         for schema in (external_tool_schemas or ())
@@ -5166,7 +5693,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
         'This is a tool preview connected to the authenticated user’s real data. '
     )
     system = (
-        f'You are Ajax, the assistant in Odysseus. Current UTC date and time: {datetime.now(timezone.utc).isoformat()}. '
+        f'You are Odysseus. Current UTC date and time: {datetime.now(timezone.utc).isoformat()}. '
         + runtime_scope_clause
         + 'Use available tools when needed, including for personal records and current information. '
         'Preserve conversation context on follow-ups and choose arguments yourself. '
@@ -5303,6 +5830,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
     initial_length = len(history)
     security = ToolRunSecurityContext(
         external_untrusted_context_seen=bool(external_untrusted_context_seen),
+        delegated_credential=bool(delegated_credential),
         unattended_tools=(
             NATIVE_WORKSPACE_TOOLS if native_workspace_enabled else frozenset()
         ),
@@ -5372,6 +5900,11 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
     action_promise_recovery_attempts = 0
     citation_recovery_attempted = False
     force_no_tools_next_round = False
+    # Research can support an editor operation without owning its deliverable.
+    web_briefing_target = (
+        not active_editor_target and broad_current_web_request(direct_user_text)
+    )
+    force_web_search_next_round = web_briefing_target and not native_workspace_enabled
     force_private_browser_next_round = False
     force_web_fetch_next_round = False
     suggestion_retry_required = False
@@ -5439,23 +5972,14 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
     required_artifacts = runtime_required_artifacts(
         direct_user_text, client_runtime_context,
     ) if native_workspace_enabled else tuple()
-    # Editor/artifact tasks have their own completion checks and reserved write
-    # budget. Do not reopen general briefing research after producing the output.
-    web_briefing_target = (
-        not active_editor_target and not required_artifacts
-        and broad_current_web_request(direct_user_text)
-    )
-    force_web_search_next_round = web_briefing_target and not native_workspace_enabled
+    if required_artifacts:
+        web_briefing_target = False
     yield event({'type': 'turn_contract', **turn_contract.audit(), 'schema_mode': 'compact_contract_v5',
                  'native_workspace': native_workspace_enabled,
                  'required_artifacts': list(required_artifacts),
                  'multimodal_image_count': image_context_count,
                  'attachment_reference_count': attachment_refs,
                  'image_rehydration': conversation_diagnostics.get('image_rehydration')})
-    # A photo-edit turn with no open editor has no canvas to drive; offering the
-    # editor tools would only loop until the round cap and end with no answer.
-    # Answer deterministically and ask the user to open the attached image in
-    # the editor (Quick Edit) before applying the request.
     _photo_editor_active = 'photo_editor' in (getattr(turn_contract, 'active_capabilities', ()) or ())
     _photo_editor_open = bool(
         ((client_runtime_context or {}).get('web_ui_state') or {}).get('photo_editor_open')
@@ -5468,18 +5992,12 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
         )
         history.append({'role': 'assistant', 'content': _editor_guidance})
         yield event({'delta': _editor_guidance})
-        # The user text can carry harness attachment annotations
-        # ("[Image: x.png]", "[No vision model ...]"). Strip them so the
-        # one-click action re-sends only what the user typed.
         _action_prompt = str(direct_user_text or '')
         for _annotation in ('\n\n[Image:', '\n[Image:', '\n\n[Attached', '\n[No vision model'):
             _cut = _action_prompt.find(_annotation)
             if _cut != -1:
                 _action_prompt = _action_prompt[:_cut]
         _action_prompt = _action_prompt.strip() or str(direct_user_text or '').strip()
-        # Machine-readable action so the chat UI can render a one-click
-        # "Open in editor & apply" button that loads the attached image and
-        # re-sends this prompt through the photo_editor endpoint.
         yield event({
             'type': 'final_response',
             'content': _editor_guidance,
@@ -5585,6 +6103,25 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     _spec_route_think.get('think'),
                     _spec_route_think.get('p_think'),
                     _spec_route_think.get('ms'))
+            # Optional env-gated direct-answer override (spec surface only):
+            # when the spec router chose answer_directly with high confidence,
+            # round 1 is sent with tool_choice 'none' (same tools list).
+            _spec_direct_p = spec_direct_no_tools_p(
+                direct_user_text, endpoint_url, model, owner, headers)
+            # Option B: send round 1 with no tools at all for a direct answer.
+            _spec_direct_empty_menu = (
+                _spec_direct_p is not None and spec_direct_mode() == 'empty_menu')
+            # ODYSSEUS_SPEC_MODE=driver: the router (not the 9B) picks the tool
+            # every round; the 9B only writes the arguments or the answer.
+            _spec_driver_on = spec_driver_active(endpoint_url, model, owner, headers)
+            # Driver mode narrows the contract per round to the Spec pick.
+            # Rebuild each round from this frozen base so the narrowing does
+            # not accumulate/mutate across rounds.
+            _driver_base_contract = turn_contract
+            # Per-round Spec pick (driver mode): 'answer_directly' | 'ask_user'
+            # | 'tool' | None (router fallback). Set inside the round loop.
+            _driver_round_kind = None
+            _driver_round_pick = None
             # One extra iteration is available only when a provider emits raw
             # tool markup during the normal final no-tools round. Ordinary
             # turns still obey ``round_limit`` exactly.
@@ -5721,7 +6258,9 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         'completion_reserve_seconds': artifact_completion_reserve_seconds,
                     })
                 request_messages = provider_request_messages(
-                    prune_multimodal_images(history, max_images=3)
+                    prune_multimodal_images(
+                        keep_recent_image_turns(history, keep=2), max_images=3
+                    )
                 )
                 if prior_summary_answer or force_no_tools_next_round or reserve_final_synthesis:
                     round_offered = []
@@ -5742,6 +6281,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     round_offered = artifact_completion_tool_schemas(
                         round_offered, required_artifacts,
                     )
+                round_offered = [schema for schema in round_offered if permitted_schema(schema)]
                 research_choice = None
                 if not required_artifacts:
                     round_offered, research_choice, _ = bounded_research_tool_policy(
@@ -5755,53 +6295,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 # budget avoids a reasoning-only response that leaves the
                 # required artifact unwritten.
                 round_max_tokens = request_max_tokens
-                editor_write_complete = (
-                    active_editor_target and successful_write
-                    and not editor_partial_pending and not editor_batch_pending
-                )
-                deliberate = operation_thinking_pending or (
-                    'document_edit' if active_editor_target and not editor_write_complete else
-                    'code' if standalone_code_request(direct_user_text) and not successful_write else
-                    'research_synthesis' if web_briefing_target and successful_web_retrievals >= 2 else ''
-                )
-                if not deliberate:
-                    deliberate = spec_router_think_reason(
-                        round_number, _spec_route_think, deliberate)
-                progressive_thinking = progressive_thinking_for_turn(
-                    model, offered, ignored.get('thinking_mode'),
-                    tool_failed=recovery_thinking_pending,
-                    deliberate=bool(deliberate),
-                )
-                if progressive_thinking and deliberate:
-                    deliberated_operations.add(deliberate)
-                    operation_thinking_rounds.append({'round': round_number, 'reason': deliberate})
-                operation_thinking_pending = ''
-                if progressive_thinking and recovery_thinking_pending:
-                    recovery_thinking_rounds.append(round_number)
-                    yield event({'type': 'tool_loop_recovery',
-                                 'reason': 'progressive_thinking', 'round': round_number})
-                # Reserve room for a private reasoning trace. Progressive Qwen
-                # asks for it explicitly; reasoning-capable providers such as
-                # DeepSeek V4 stream reasoning_content against max_tokens, so the
-                # default 768-token budget can starve the visible answer.
-                if progressive_thinking:
-                    # Reserve room for reasoning and repair, honoring explicit limits.
-                    round_max_tokens = max(round_max_tokens, 4096)
-                    if max_tokens and int(max_tokens) > 0:
-                        round_max_tokens = min(round_max_tokens, int(max_tokens))
-                elif (
-                    supports_user_thinking_toggle(model)
-                    and str(ignored.get('thinking_mode') or '').strip().lower() != 'off'
-                ):
-                    # Reasoning is on by default for these providers and its
-                    # tokens count against max_tokens, so raise the ceiling above
-                    # the 768-token chat default. An explicit larger cap still
-                    # wins; the model stops early, so this is a ceiling only.
-                    floor = 4096
-                    if max_tokens and int(max_tokens) > floor:
-                        floor = min(int(max_tokens), 8192)
-                    round_max_tokens = max(round_max_tokens, floor)
-                recovery_thinking_pending = False
                 request = {'model': model, 'messages': request_messages, 'temperature': temperature,
                            'max_tokens': round_max_tokens, 'stream': True,
                            'stream_options': {'include_usage': True},
@@ -5814,8 +6307,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     and not editor_partial_pending and not editor_batch_pending
                 )
                 if editor_write_complete:
-                    request['chat_template_kwargs']['enable_thinking'] = False
-                    progressive_thinking = False
                     request['max_tokens'] = min(round_max_tokens, 256)
                     request['messages'] = [*request['messages'], {
                         'role': 'user', 'content':
@@ -5966,9 +6457,106 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         break
                     request['tools'] = source_tools
                     request['tool_choice'] = 'required'
+                # ODYSSEUS_SPEC_MODE=driver: the router is the tool driver.
+                # Ask it for this round's single next action (any confidence);
+                # the 9B then only writes the arguments (a named tool_choice) or
+                # the answer (tools key omitted; vLLM rejects an empty array).
+                # Router error/timeout keeps the normal menu for this round.
+                if _spec_driver_on and round_offered:
+                    # The router chooses from the FULL Ajax Spec surface (~all
+                    # built-ins minus disabled), not the compact round menu, so
+                    # a Spec pick is never silently out of reach. The 9B then
+                    # only writes the arguments (a named tool_choice) or the
+                    # answer (tools key omitted; vLLM rejects an empty array).
+                    # Router error/timeout keeps the normal menu this round.
+                    from src.tool_schemas import FUNCTION_TOOL_SCHEMAS as _SPEC_SURFACE
+                    _drv = spec_driver_pick(history, disabled_tools, direct_user_text)
+                    if _drv is not None:
+                        _drv_choice = _drv.get('choice')
+                        if _drv_choice == 'answer_directly':
+                            _driver_round_kind = 'answer_directly'
+                            request.pop('tools', None)
+                            request.pop('tool_choice', None)
+                        elif _drv_choice == 'ask_user':
+                            _driver_round_kind = 'ask_user'
+                            _ask = [s for s in _SPEC_SURFACE
+                                    if (s.get('function') or {}).get('name') == 'ask_user']
+                            if _ask:
+                                request['tools'] = [_ask[0]]
+                                request['tool_choice'] = {
+                                    'type': 'function',
+                                    'function': {'name': 'ask_user'},
+                                }
+                                if _ask[0] not in round_offered:
+                                    round_offered = list(round_offered) + [_ask[0]]
+                        elif _drv_choice == 'tool' and _drv.get('tool_name'):
+                            _name = _drv['tool_name']
+                            _sel = [s for s in list(round_offered) + list(_SPEC_SURFACE)
+                                    if (s.get('function') or {}).get('name') == _name]
+                            if _sel:
+                                _driver_round_kind = 'tool'
+                                _driver_round_pick = _name
+                                request['tools'] = [_sel[0]]
+                                request['tool_choice'] = {
+                                    'type': 'function',
+                                    'function': {'name': _name},
+                                }
+                                # The per-call validator looks the schema up in
+                                # `round_offered` (not `request['tools']`), so the
+                                # Spec pick must be present there too.
+                                round_offered = [_sel[0]]
+                                # Driver mode narrows the whole contract to the
+                                # Spec pick for this round: the router is the
+                                # authority, and the executor must be able to run
+                                # the picked tool. Build a valid contract (the
+                                # TurnContract invariant requires
+                                # required <= offered <= executable and
+                                # schema_json names == offered).
+                                try:
+                                    from src.turn_contract import (
+                                        _ACTIVE_CONTRACT as _TC,
+                                        canonical_tool as _ct,
+                                    )
+                                    _pick = _ct(_name)
+                                    turn_contract = replace(
+                                        _driver_base_contract,
+                                        required=frozenset(),
+                                        offered=frozenset({_pick}),
+                                        executable=frozenset(
+                                            set(_driver_base_contract.executable) | {_pick}),
+                                        schema_json=(json.dumps(_sel[0]),),
+                                        required_read_operation=None,
+                                    )
+                                    _TC.set(turn_contract)
+                                except Exception:
+                                    turn_contract = _driver_base_contract
+                                    logging.getLogger(__name__).info(
+                                        '[spec-driver] round=%s pick=%s contract admit failed; '
+                                        'normal contract kept', round_number, _name)
+                            else:
+                                logging.getLogger(__name__).info(
+                                    '[spec-driver] round=%s pick=%s not executable; normal menu this round',
+                                    round_number, _name)
+                        logging.getLogger(__name__).info(
+                            '[spec-driver] round=%s pick=%s p=%s', round_number,
+                            (_drv.get('tool_name') if _drv_choice == 'tool'
+                             else _drv_choice),
+                            _drv.get('p'))
+                    else:
+                        logging.getLogger(__name__).info(
+                            '[spec-driver] round=%s pick=fallback p=None', round_number)
                 pending, content, round_reasoning = {}, '', ''
                 document_preview_index = None
                 document_preview_content = ''
+                if 'tools' in request:
+                    request['tools'] = [schema for schema in request['tools'] if permitted_schema(schema)]
+                    offered_names = {schema['function']['name'] for schema in request['tools']}
+                    choice = request.get('tool_choice')
+                    if not request['tools']:
+                        for key in ('tools', 'tool_choice', 'parallel_tool_calls'):
+                            request.pop(key, None)
+                    elif isinstance(choice, dict) and choice.get('function', {}).get('name') not in offered_names:
+                        request.pop('tool_choice', None)
                 can_preview_document = any(
                     schema.get('function', {}).get('name') == 'create_document'
                     for schema in request.get('tools', [])
@@ -5990,6 +6578,36 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         for schema in (request.get('tools') or [])
                     ][:40],
                 )
+                if round_number == 1 and _spec_direct_p is not None:
+                    # The router decided to answer directly with high
+                    # confidence.
+                    if _spec_direct_empty_menu:
+                        # Option B: an empty menu — send no tools at all, so
+                        # nothing can be executed and no markup is recovered.
+                        request['tools'] = []
+                        request.pop('tool_choice', None)
+                        tool_call_requested = False
+                        # Keep the thinking router's decision; never let the
+                        # no-tools progressive rule turn thinking on when the
+                        # router said off.
+                        if not (_spec_route_think or {}).get('think'):
+                            ctk = dict(request.get('chat_template_kwargs') or {})
+                            ctk['enable_thinking'] = False
+                            request['chat_template_kwargs'] = ctk
+                        logging.getLogger(__name__).info(
+                            '[spec-harness] direct answer: empty menu p=%s',
+                            _spec_direct_p)
+                    else:
+                        # Default: keep the same tools list (prefix-cache
+                        # friendly) but forbid a tool call this round. Thinking
+                        # is left to the thinking router; offered stays
+                        # non-empty so this does not switch progressive
+                        # thinking on.
+                        request['tool_choice'] = 'none'
+                        tool_call_requested = False
+                        logging.getLogger(__name__).info(
+                            '[spec-harness] direct answer: tool_choice none p=%s',
+                            _spec_direct_p)
                 if active_editor_target and request.get('tools'):
                     # Edits share mutable document state. Await a saved result
                     # before asking for another call; one call may still batch
@@ -6028,17 +6646,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     # established budget/error semantics.
                     round_offered = list(request.get('tools') or [])
                 finish_during_stream = False
-                # stream_preview talks to the provider directly and therefore
-                # bypasses the llm_core request pipeline. Apply the DeepSeek V4
-                # reasoning toggle here too, otherwise a user's thinking_mode
-                # choice is silently ignored for these sessions.
-                from src.llm_core import _apply_deepseek_v4_reasoning_defaults
-                _apply_deepseek_v4_reasoning_defaults(
-                    request, endpoint_url, model, ignored.get('thinking_mode'),
-                )
-                think_split_state = {'think_emitted': 0, 'answer_emitted': 0, 'closed': False}
-                round_reasoning_seen = False
-                think_answer_streamed = False
                 async with preview_model_response(client, endpoint_url, headers, request, context_recovery) as response:
                     response.raise_for_status()
                     finish_event = (
@@ -6056,7 +6663,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             provider_error = payload['error']
                             if isinstance(provider_error, dict):
                                 provider_error = provider_error.get('message') or provider_error.get('detail')
-                            detail = str(provider_error or 'Unknown provider error').strip()[:300]
+                            detail = str(provider_error or 'Unknown provider error').strip()
                             raise ProviderStreamError(detail)
                         usage = payload.get('usage') or {}
                         if usage:
@@ -6080,45 +6687,16 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         )
                         if reasoning:
                             round_reasoning += str(reasoning)
-                            round_reasoning_seen = True
                         text = delta.get('content') or ''
                         if text:
                             first_token = first_token or time.monotonic()
                             content += text
                             if (
-                                progressive_thinking
-                                and not round_reasoning_seen
-                                and not prior_summary_answer
-                                and not source_lookup_pending
-                                and not tool_call_requested
-                                and not pending
-                            ):
-                                # No reasoning parser: the model's <think>…</think>
-                                # trace arrives as ordinary content. Stream the
-                                # trace as thinking deltas and the text after
-                                # </think> as content instead of buffering the
-                                # whole round (which showed nothing, then dumped
-                                # the answer at once).
-                                for split_event in qwen_think_split_events(content, think_split_state):
-                                    if (
-                                        replace_streamed_draft_on_finish
-                                        and not streamed_round_text
-                                        and not split_event.get('thinking')
-                                    ):
-                                        split_event = {
-                                            **split_event,
-                                            'render_owner': 'streamed',
-                                            'replacement_scope': 'turn',
-                                        }
-                                    yield event(split_event)
-                                    if not split_event.get('thinking'):
-                                        streamed_round_text = True
-                                        think_answer_streamed = True
-                            elif (
                                 not prior_summary_answer
                                 and not progressive_thinking
                                 and not source_lookup_pending
                                 and not tool_call_requested
+                                and not _spec_direct_empty_menu
                             ):
                                 text_event = {'delta': text}
                                 if replace_streamed_draft_on_finish and not streamed_round_text:
@@ -6169,14 +6747,16 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     break
                 if progressive_thinking:
                     content = visible_content_after_qwen_thinking(content)
-                    if think_answer_streamed:
-                        # The answer already went out as live deltas during the
-                        # split; never dump it a second time.
-                        streamed_round_text = True
-                    elif (content and not prior_summary_answer and not source_lookup_pending
-                            and not pending):
+                    if content and not prior_summary_answer and not source_lookup_pending:
                         yield event({'delta': content})
                         streamed_round_text = True
+                if _spec_direct_empty_menu and pending:
+                    # Option B: nothing is offered, so never execute a tool
+                    # call the model still produced (native shape).
+                    logging.getLogger(__name__).info(
+                        '[spec-harness] direct answer: dropped %d tool call(s)',
+                        len(pending))
+                    pending = {}
                 proposed = [pending[i] for i in sorted(pending)]
                 # A lead-in emitted before a tool call is live progress, not
                 # part of the terminal answer. Replace that draft when the
@@ -6184,7 +6764,9 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 if proposed and streamed_round_text:
                     replace_streamed_draft_on_finish = True
                 unexecutable_dsml_completion = False
-                if not proposed and 'DSML' in content:
+                if (not proposed and not _spec_direct_empty_menu
+                        and _driver_round_kind != 'answer_directly'
+                        and 'DSML' in content):
                     offered_by_canonical = {
                         canonical(schema['function']['name']): schema['function']['name']
                         for schema in round_offered
@@ -6232,6 +6814,15 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             })
                         else:
                             unexecutable_dsml_completion = True
+                if _spec_direct_empty_menu and content:
+                    # Option B: show the answer text without any tool-call
+                    # markup the model may still have written (nothing offered).
+                    _stripped = re.sub(
+                        r'<tool_call\b[^>]*>.*?</tool_call>', '',
+                        content, flags=re.DOTALL | re.IGNORECASE).strip()
+                    if _stripped != content.strip():
+                        content = _stripped
+                        replace_streamed_draft_on_finish = True
                 if source_lookup_pending and not proposed:
                     if source_answer_retries < 1 and round_number < round_limit:
                         source_answer_retries += 1
@@ -6256,6 +6847,37 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 )
                 if active_editor_target:
                     proposed = drop_redundant_editor_noops(proposed)
+                # ODYSSEUS_SPEC_MODE=driver: Spec is the tool driver, so execute
+                # ONLY the call Spec picked this round. Drop (never execute) any
+                # other native call and any text/DSML-recovered call; when Spec
+                # said answer_directly, keep no calls and strip tool markup so
+                # the remaining text is the answer.
+                if _driver_round_kind == 'answer_directly':
+                    if proposed:
+                        for _c in proposed:
+                            logging.getLogger(__name__).info(
+                                '[spec-driver] dropped off-pick call name=%s',
+                                (_c.get('function') or {}).get('name'))
+                        proposed = []
+                    if content:
+                        _stripped = strip_tool_blocks(content, skip_fenced=True).strip()
+                        _stripped = re.sub(
+                            r'<tool_call\b[^>]*>.*?</tool_call>', '',
+                            _stripped, flags=re.DOTALL | re.IGNORECASE).strip()
+                        if _stripped != content:
+                            content = _stripped
+                            replace_streamed_draft_on_finish = True
+                elif _driver_round_kind in ('tool', 'ask_user'):
+                    _want = 'ask_user' if _driver_round_kind == 'ask_user' else _driver_round_pick
+                    _keep = []
+                    for _c in proposed:
+                        _cn = (_c.get('function') or {}).get('name')
+                        if canonical(str(_cn or '')) == canonical(str(_want or '')):
+                            _keep.append(_c)
+                        else:
+                            logging.getLogger(__name__).info(
+                                '[spec-driver] dropped off-pick call name=%s', _cn)
+                    proposed = _keep
                 if model_choice_experiment:
                     for proposal in proposed:
                         yield event({'type': 'model_tool_proposal', 'round': round_number,
@@ -6516,7 +7138,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                     result.get('error')
                                     or result.get('exit_code') not in (None, 0)
                                 )
-                                recovery_thinking_pending |= failed
                                 output = result.get('output') or result.get('error') or result
                                 output = output if isinstance(output, str) else json.dumps(
                                     output, ensure_ascii=False,
@@ -6611,7 +7232,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     if (
                         native_workspace_enabled
                         and content
-                        and DETAILED_VIDEO_REQUEST.search(direct_user_text)
+                        and contains_detailed_sequence_request(direct_user_text)
                         and successful_video_inspections == 1
                         and not media_detail_nudge_sent
                         and round_number < round_limit
@@ -6726,7 +7347,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 # policy. A harmless read followed by blocked mutations must
                 # not partially execute or emit one denial per attempted row.
                 batch_policy_denied = False
-                batch_deliberation = ''
                 for call in proposed:
                     try:
                         preflight_name = offered_tool_alias(
@@ -6789,12 +7409,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             policy_decisions.append({'round': round_number, **decision.audit()})
                             batch_policy_denied = True
                             break
-                        if not batch_deliberation:
-                            reason = tool_deliberation_reason(preflight_name, preflight_args)
-                            if reason and progressive_thinking:
-                                deliberated_operations.add(reason)
-                            if reason not in deliberated_operations:
-                                batch_deliberation = reason
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError, jsonschema.ValidationError):
                         # Malformed calls still enter the normal tool-error
                         # feedback path so the model can repair their syntax.
@@ -6805,21 +7419,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     history.append({'role': 'assistant', 'content': refusal})
                     yield event({'type': 'final_response', 'content': refusal})
                     break
-                if (batch_deliberation and not progressive_thinking
-                        and uses_odysseus_progressive_thinking(model)
-                        and round_number < round_limit):
-                    # No call has executed. Remove the unexecuted call envelope
-                    # so the next request contains no orphaned tool-call IDs.
-                    history.pop()
-                    operation_thinking_pending = batch_deliberation
-                    history.append({'role': 'user', '_harness_control': True, 'content':
-                        'Before executing the proposed operation, review its arguments against '
-                        'the user request and the available evidence. Nothing in this proposed '
-                        'batch has executed. Return the corrected tool calls, or obtain missing '
-                        'evidence first. Do not expand permissions or assume missing facts. '
-                        'Proposed batch: ' + json.dumps(proposed, ensure_ascii=False)})
-                    replace_streamed_draft_on_finish |= streamed_round_text
-                    continue
                 terminal_denial = False
                 terminal_suppression_violation = False
                 terminal_search_budget_violation = False
@@ -6832,7 +7431,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 # request with HTTP 400.  Collect visual evidence while the
                 # batch executes and append it only after every tool result.
                 round_visual_blocks = []
-                ask_user_turn_end = False
                 for call in proposed:
                     name = offered_tool_alias(call['function']['name'], round_offered)
                     arguments = call['function']['arguments']
@@ -6840,6 +7438,10 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     result, desc, policy_denied, block = None, name, False, None
                     args = {}
                     execution_attempted = False
+                    # Guidance a preview validator authored for this call. It
+                    # is the only failure text returned verbatim; exception
+                    # text goes through _public_preview_tool_error.
+                    validator_error = ''
                     call_signature = None
                     semantic_scope = None
                     try:
@@ -6898,11 +7500,12 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             prior_outcome = browser_navigation_outcomes.get(requested_url)
                             if requested_url and prior_outcome and prior_outcome[1] >= 2:
                                 calls += 1
-                                raise ValueError(
+                                validator_error = (
                                     f'Opening {requested_url} twice reached the same page '
                                     f'({prior_outcome[0]}). Do not repeat it; use the current '
                                     'page evidence or a different navigation strategy.'
                                 )
+                                raise ValueError(validator_error)
                         if tool_type == 'web_search':
                             web_search_attempts += 1
                             if not native_workspace_enabled and web_search_attempts > 3:
@@ -6996,6 +7599,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                     'This exact invalid call was repeated after two validation failures; '
                                     'the tool is disabled for this turn.'
                                 )
+                            validator_error = semantic_error
                             raise ValueError(semantic_error)
                         if canonical(name) == 'bash':
                             command = str(args.get('command') or '')
@@ -7004,6 +7608,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                 calls += 1
                                 suppressed_tool_until_round['bash'] = round_number + 1
                                 round_recovery_messages.append(sensitive_error)
+                                validator_error = sensitive_error
                                 raise ValueError(sensitive_error)
                             misused_native_tool = shell_native_tool_command_misuse(
                                 command, round_offered,
@@ -7017,6 +7622,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                     'with its offered schema.'
                                 )
                                 round_recovery_messages.append(recovery)
+                                validator_error = recovery
                                 raise ValueError(recovery)
                         semantic_scope = semantic_repeat_scope(name, args)
                         if (
@@ -7073,10 +7679,11 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         if canonical(name) in permanently_suppressed_tools:
                             calls += 1
                             terminal_suppression_violation = True
-                            raise ValueError(
+                            validator_error = (
                                 f'{name} was disabled after repeated identical calls; '
                                 'no further execution was attempted.'
                             )
+                            raise ValueError(validator_error)
                         success_repeat_limit = (
                             private_browser_success_repeat_limit(args)
                             if tool_type == 'private_browser' else 1
@@ -7169,6 +7776,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             )
                             if artifact_code_error:
                                 round_recovery_messages.append(artifact_code_error)
+                                validator_error = artifact_code_error
                                 raise ValueError(artifact_code_error)
                         decision = evaluate_preview_call(
                             name, args, latest_user,
@@ -7371,7 +7979,19 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         ):
                             artifact_body_handoff_attempts += 1
                             artifact_body_handoff_target = handoff_target
-                        result = {'error': str(exc).splitlines()[0][:300], 'exit_code': 1}
+                        logging.getLogger(__name__).warning(
+                            'Clean v3 tool call failed: %s', exc, exc_info=True,
+                        )
+                        if not validator_error and isinstance(exc, jsonschema.ValidationError) and schema:
+                            validator_error = _schema_argument_hint(args, schema['function']['parameters'])
+                        result = {
+                            'error': (
+                                validator_error if validator_error and not execution_attempted
+                                else _public_preview_tool_error(exc, execution_attempted=execution_attempted)
+                            ),
+                            'error_category': 'tool_execution_error' if execution_attempted else 'invalid_tool_arguments',
+                            'exit_code': 1,
+                        }
                     if (canonical(block.tool_type if block is not None else name) == 'youtube_tool'
                             and result.get('exit_code') not in (None, 0)):
                         round_recovery_messages.append(
@@ -7448,7 +8068,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             'type': 'tool_loop_recovery',
                             'reason': 'web_fetch_boilerplate_fallback',
                         })
-                    recovery_thinking_pending |= failed
                     if not failed and canonical(actual_tool) == 'web_search':
                         embedded_urls = search_embedded_article_urls(output)
                         if embedded_urls:
@@ -7497,8 +8116,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     browser_access_blocked = (
                         canonical(actual_tool) == 'private_browser'
                         and not failed
-                        # Compaction is for model readability; title/snapshot
-                        # relationships must remain intact for recovery checks.
                         and browser_observation_access_blocked(result.get('output') or result)
                     )
                     browser_page_missing = (
@@ -7506,7 +8123,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         and not failed
                         and browser_observation_page_missing(output)
                     )
-                    recovery_thinking_pending |= browser_access_blocked or browser_page_missing
                     if browser_page_missing:
                         round_recovery_messages.append(
                             'The browser displayed a missing-page error, not article evidence. '
@@ -7564,12 +8180,9 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         requested_browser_url = private_browser_open_url(args)
                         effective_browser_url = private_browser_effective_url(result)
                         browser_search_url = requested_browser_url or effective_browser_url
-                        is_search_engine_navigation = bool(re.search(
-                            r'https?://(?:[^/]+\.)?(?:google\.[^/]+|bing\.com|duckduckgo\.com)'
-                            r'/(?:search|sorry|html|lite|\?)',
-                            browser_search_url,
-                            re.I,
-                        )) or bool(re.search(
+                        is_search_engine_navigation = contains_search_engine_navigation(
+                            browser_search_url
+                        ) or bool(re.search(
                             r'https?://(?:[^/]+\.)?google\.[^/]+/sorry/',
                             effective_browser_url,
                             re.I,
@@ -7737,11 +8350,9 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                                   'execution_attempted': execution_attempted,
                                   'blocked': policy_denied or schema is None,
                                   'desc': desc, 'round': round_number}
-                    if isinstance(result.get('ask_user'), dict):
-                        # Copy the interactive payload into the persisted tool
-                        # event so history reload can reconstruct the card even
-                        # after the turn ends without another provider round.
-                        tool_event['ask_user'] = result['ask_user']
+                    for error_category in ('tool_execution_error', 'invalid_tool_arguments'):
+                        if result.get('error_category') == error_category:
+                            tool_event['error_category'] = error_category
                     reader_event = email_reader_event(direct_user_text, actual_tool, args, result, failed=failed)
                     if reader_event:
                         yield event(reader_event)
@@ -7853,19 +8464,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                     record_tool_execution(executions, tool_event)
                     yield event(tool_event)
                     history.append({'role': 'tool', 'tool_call_id': call['id'], 'content': output})
-                    ask_user_payload = result.get('ask_user')
-                    if isinstance(ask_user_payload, dict) and str(ask_user_payload.get('question') or '').strip():
-                        # ask_user is a turn boundary, not an ordinary tool.
-                        # Emit the interactive card, persist the question as the
-                        # assistant text (so the model sees it was already asked
-                        # next turn), and stop without feeding the tool result
-                        # back for another provider round.
-                        ask_question = str(ask_user_payload['question']).strip()
-                        history.append({'role': 'assistant', 'content': ask_question})
-                        yield event({'type': 'final_response', 'content': ask_question})
-                        yield event({'type': 'ask_user', 'data': ask_user_payload})
-                        ask_user_turn_end = True
-                        break
                     if (not failed and block is not None and block.tool_type == 'web_fetch'
                             and len(proposed) == 1 and result.get('page_entries')
                             and set(turn_contract.required) <= {'web_fetch', 'web_search', 'extract_text'}):
@@ -7971,6 +8569,15 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                             output, user_text=latest_user,
                             max_items=contract_item_limit(turn_contract, 20),
                         )
+                        followup = note_locator_followup(output, user_text=latest_user)
+                        if followup:
+                            if round_number < round_limit:
+                                structured_terminal_response = ''
+                                round_recovery_messages.append(followup)
+                            else:
+                                structured_terminal_response = (
+                                    'I found a note, but could not read its content in this turn.'
+                                )
                         action = str(args.get('action') or '').replace('-', '_').casefold()
                         if (
                             action in {'search', 'find'}
@@ -8092,10 +8699,6 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         )
                     if policy_denied:
                         terminal_denial = True
-                if ask_user_turn_end:
-                    # The ask_user card is the final UI event; end the turn and
-                    # wait for the user's selection instead of advancing a round.
-                    break
                 if round_visual_blocks:
                     visual_message = untrusted_context_message(
                         'tool visual evidence',
@@ -8166,43 +8769,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                         'round': round_number,
                     })
                 if terminal_denial:
-                    usable_evidence = any(
-                        not e.get('error') and e.get('exit_code', 0) == 0 and not e.get('blocked')
-                        for e in executions
-                    )
-                    if usable_evidence:
-                        # A denied call must not discard evidence a successful call already
-                        # produced. Recover by answering from the evidence we have and stating
-                        # plainly what could not be done, instead of a blanket refusal.
-                        if not round_recovery_messages:
-                            recovery = (
-                                'One or more tool calls were denied, but earlier tool calls in '
-                                'this turn returned usable evidence. Do not repeat any denied '
-                                'call and do not call more tools. Using only the evidence '
-                                'already returned, provide the best complete final answer now, '
-                                'and briefly state what you could not do because it was not '
-                                'permitted.'
-                            )
-                            if history and history[-1].get('_harness_control'):
-                                history[-1]['content'] = (
-                                    str(history[-1].get('content') or '') + ' ' + recovery
-                                )
-                            else:
-                                history.append({
-                                    'role': 'user', '_harness_control': True, 'content': recovery,
-                                })
-                        force_no_tools_next_round = True
-                        yield event({
-                            'type': 'completion_recovery',
-                            'reason': 'denial_after_successful_evidence',
-                            'round': round_number,
-                        })
-                        continue
-                    refusal = (
-                        WORKSPACE_REQUIRED_REFUSAL
-                        if workspace_process_denial(executions)
-                        else denied_response()
-                    )
+                    refusal = denied_response()
                     history.append({'role': 'assistant', 'content': refusal})
                     yield event({'type': 'final_response', 'content': refusal})
                     break
@@ -8367,9 +8934,9 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 else:
                     yield event({'delta': '\nThe preview reached its round limit. Please narrow the request.'})
     except ProviderStreamError as exc:
-        detail = f'The selected model provider failed while generating: {exc}'
-        logging.getLogger(__name__).warning('Clean v3 provider stream failed: %s', exc)
-        yield f'event: error\ndata: {json.dumps({"status": 502, "error": detail})}\n\n'
+        detail = 'The selected model provider failed while generating. Retry or choose another model.'
+        logging.getLogger(__name__).warning('Clean v3 provider stream failed: %s', exc, exc_info=True)
+        yield f'event: error\ndata: {json.dumps({"status": 502, "error": detail, "error_category": "provider_stream_error"})}\n\n'
         return
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code
@@ -8423,7 +8990,5 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
         'policy_decisions': policy_decisions,
         'schema_mode': 'compact_contract_v5', 'clean_v3_preview': True,
         'thinking_mode': 'progressive_on' if progressive_thinking else 'off',
-        'recovery_thinking_rounds': recovery_thinking_rounds,
-        'operation_thinking_rounds': operation_thinking_rounds,
     }})
     yield 'data: [DONE]\n\n'

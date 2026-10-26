@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from functools import wraps
 from inspect import signature
 import json
+import os
 from pathlib import Path
 import re
 from uuid import uuid4
@@ -140,11 +141,20 @@ class RequestAuthority:
             raise ValueError("Malformed request authority")
         if self.resource_roots is None:
             roots = ()
-            if self.workspace:
-                try:
-                    roots = (FilesystemRoot.seal(self.workspace, owner=self.owner),)
-                except (OSError, ValueError, RuntimeError):
-                    pass  # An unresolved workspace grants no filesystem root.
+            # With no workspace, bash/python run in the agent workspace
+            # (agent_cwd), so the file tools get that same root (#6679).
+            # Imported here: authority -> execution is a new edge, and
+            # tool_execution imports this module at load time.
+            from src import tool_execution
+            try:
+                root = self.workspace
+                if not root:
+                    # Vetted like agent_cwd(): a symlinked agent workspace
+                    # raises and so grants no root.
+                    root = tool_execution.default_agent_workspace()
+                roots = (FilesystemRoot.seal(root, owner=self.owner),)
+            except (OSError, ValueError, RuntimeError):
+                pass  # An unresolved workspace grants no filesystem root.
             object.__setattr__(self, "resource_roots", roots)
         if (not isinstance(self.resource_roots, tuple)
                 or any(not isinstance(r, FilesystemRoot) or (r.owner and r.owner != self.owner)
@@ -316,12 +326,7 @@ class RequestAuthority:
 
 
 _BROWSER_READ_ACTIONS = frozenset({"open", "navigate", "snapshot", "text", "read", "find",
-    "screenshot", "scroll", "back", "forward", "wait", "status", "close", "tabs", "session_info",
-    "batch"})
-# Interaction classes are admitted on a strict router (spec) surface whenever
-# the server itself offered private_browser: the router decides the tool set,
-# so requiring the verb in the text would break "browse X then click Y".
-_BROWSER_INTERACTION_ACTIONS = frozenset({"click", "fill", "type", "press", "evaluate", "select"})
+    "screenshot", "scroll", "back", "forward", "wait", "status", "close", "tabs", "session_info"})
 
 
 @dataclass(frozen=True)
@@ -368,8 +373,7 @@ def interpret_request(request_text, *, history=(), workspace=None, active_docume
 
 def create_request_authority(request_text, *, owner=None, session_id=None, workspace=None,
                              history=(), policy=None, active_document=False,
-                             image_attachment=False, capabilities=None, client_runtime_context=None,
-                             spec_surface=False):
+                             image_attachment=False, capabilities=None, client_runtime_context=None):
     """Deterministic server policy over semantic facts, never schema inventory."""
     if not isinstance(request_text, str):
         raise TypeError("Authority requires trusted request text")
@@ -378,25 +382,10 @@ def create_request_authority(request_text, *, owner=None, session_id=None, works
     families = intent.capabilities
     if capabilities is not None:
         families |= frozenset(capabilities)
-    if spec_surface:
-        # Strict router (spec) surface: agent_loop builds the final tool set in
-        # src/spec_router.py AFTER this runs, so turn_contract.offered is still
-        # the compact inventory here. The router already limits schemas to its
-        # picks + sticky prior tools + ask_user/update_plan, and
-        # _resolve_tool_blocks drops calls to unoffered tools, so admit every
-        # family and let the spec surface be the boundary. Selected-tool
-        # narrowing is skipped for the same reason.
-        families |= frozenset(FAMILY_TOOLS)
     tools = set().union(*(FAMILY_TOOLS.get(f, ()) for f in families))
-    selected = None if spec_surface else intent.selected_tools
+    selected = intent.selected_tools
     if selected is not None:
         tools = tools & set(selected) if families else set(selected)
-        if "web_search" in tools:
-            # Search selection narrows to the query tool, but reading a source
-            # it surfaces is the same bounded read operation. Without the
-            # sibling reader every discovered result is a dead end and the
-            # turn fails closed on the first web_fetch of a found URL.
-            tools.add("web_fetch")
         if tools & {"web_search", "web_fetch"}:
             tools.add("private_browser")
     operation = intent.required_read
@@ -410,28 +399,13 @@ def create_request_authority(request_text, *, owner=None, session_id=None, works
         actions = inputs = None
         if name == "private_browser":
             actions = _BROWSER_READ_ACTIONS
-            if spec_surface:
-                # The strict router itself offered a working browser: admit its
-                # interaction classes too, not only when the verb is in the text.
-                actions |= _BROWSER_INTERACTION_ACTIONS
-            elif re.search(r"\b(?:browser|browse|private_browser)\b", request_text, re.I):
-                # Explicit interaction intent admits its operation class. A
-                # browser offered only as static-Web fallback gets no such grant.
+            # Explicit interaction intent admits its operation class. A
+            # browser offered only as static-Web fallback gets no such grant.
+            if re.search(r"\b(?:browser|browse|private_browser)\b", request_text, re.I):
                 actions |= frozenset(action for action in ("click", "fill", "type", "press", "evaluate", "select")
                                      if re.search(r"\b" + action + r"\b", request_text, re.I))
         if operation is not None and name == canonical_tool(operation.tool):
-            required_args = dict(operation.args)
-            if set(required_args) <= {"action"}:
-                # An action-only read ("list my tasks/memories") pins the action
-                # class, not the exact JSON: a model that adds benign arguments
-                # (limit/offset/filter) still performs the same admitted read.
-                # Reads that name an identity keep the exact-input seal below.
-                required_action = str(required_args.get("action") or "").strip().casefold() or None
-                if required_action:
-                    actions = (frozenset({required_action}) if actions is None
-                               else actions & frozenset({required_action}))
-            else:
-                inputs = frozenset({ExactOperation.normalize(name, _json(required_args)).input})
+            inputs = frozenset({ExactOperation.normalize(name, _json(dict(operation.args))).input})
         grants.append(OperationGrant(name, actions, inputs))
     authority = RequestAuthority(uuid4().hex, _owner(owner), str(session_id or ""),
                                  str(workspace or ""), tuple(grants))

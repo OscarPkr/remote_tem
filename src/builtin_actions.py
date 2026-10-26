@@ -2297,10 +2297,10 @@ async def action_audit_skills(owner: str, **kwargs) -> Tuple[str, bool]:
 
 async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
     """Background note-due scanner. Fires a reminder for any note whose
-    `due_date` falls in the current ±5-minute window and hasn't been pinged
-    within the last 25 minutes. Mirrors `action_ping_events` for calendar.
+    `due_date` falls in the current ±90-second window and hasn't been delivered
+    through its configured channel in the last 25 minutes.
 
-    State (`data/note_pings.json`): {note_id: iso_ts_of_last_ping}. Pruned
+    Per-owner state: {note_id: {at, channel}}, with legacy timestamp support. Pruned
     on each run by dropping entries for notes that are gone/archived/replied.
     """
     try:
@@ -2309,6 +2309,11 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
         from datetime import datetime as _dt, timezone as _tz, timedelta as _td
         from pathlib import Path as _P
         from core.database import SessionLocal as _SL, Note as _N
+        from src.settings import load_settings
+
+        channel = load_settings().get("reminder_channel", "browser")
+        external_channel = channel in ("email", "ntfy", "webhook")
+        delivery_key = f"{channel}_sent" if external_channel else "browser_sent"
 
         # Per-owner state file so cache-pruning doesn't cross-delete other
         # users' entries (review C4). Legacy path kept as fallback so a
@@ -2373,20 +2378,27 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
                 due = _parse_due(n.due_date)
                 if not due:
                     continue
-                # Inside the ±5min window?
+                # Inside the due window?
                 if abs((due - now).total_seconds()) > window.total_seconds():
                     continue
                 # Recently pinged? Skip.
                 last = cache.get(n.id)
+                browser_recent = False
                 if last:
                     try:
+                        last_channel = None
                         if isinstance(last, dict):
+                            last_channel = last.get("channel")
                             last = last.get("at")
                         last_dt = _dt.fromisoformat(str(last))
                         if last_dt.tzinfo is None:
                             last_dt = last_dt.replace(tzinfo=_tz.utc)
                         if last_dt >= reping_cutoff:
-                            continue
+                            if not external_channel or last_channel == channel:
+                                continue
+                            # Browser-only receipts do not prove external
+                            # delivery, but the fallback must not be queued twice.
+                            browser_recent = last_channel in (None, "browser")
                     except Exception:
                         pass
                 # Compose + dispatch.
@@ -2410,15 +2422,26 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
                 body = "\n\n".join(p for p in body_parts if p) or title
                 try:
                     from routes.note_routes import dispatch_reminder
-                    await dispatch_reminder(
+                    result = await dispatch_reminder(
                         title=title, note_body=body, note_id=n.id,
                         owner=n.owner or owner or "",
+                        queue_browser=not browser_recent,
                     )
-                    cache[n.id] = now.isoformat()
-                    sent.append(title)
+                    if result.get("skipped"):
+                        continue
+                    if result.get(delivery_key):
+                        sent.append(title)
+                    else:
+                        logger.warning("ping_notes: %s delivery failed for %s", channel, n.id)
                 except Exception as e:
                     logger.warning(f"ping_notes: dispatch failed for {n.id}: {e}")
 
+            # Dispatch owns delivery receipts. Reload before pruning so this
+            # scanner cannot replace a fresh channel receipt with a timestamp.
+            try:
+                cache = _json.loads(STATE.read_text(encoding="utf-8")) if STATE.exists() else {}
+            except Exception:
+                pass
             # Prune cache entries for notes that no longer exist.
             for stale in [k for k in cache if k not in seen_ids]:
                 cache.pop(stale, None)
@@ -2429,7 +2452,7 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
                 logger.warning(f"ping_notes: cache write failed: {e}")
 
             if not sent:
-                raise TaskNoop(f"scanned {len(notes)} note(s), none due in ±{WINDOW_SEC}s")
+                raise TaskNoop(f"scanned {len(notes)} note(s), no reminders delivered")
             preview = "; ".join(sent[:3])
             extra = f" (+{len(sent) - 3} more)" if len(sent) > 3 else ""
             return f"Pinged {len(sent)} note(s): {preview}{extra}", True
@@ -2440,6 +2463,100 @@ async def action_ping_notes(owner: str, **kwargs) -> Tuple[str, bool]:
     except Exception as e:
         logger.exception("ping_notes action failed")
         return str(e), False
+
+
+async def _spec_triage_email_urgency(item: dict, *, triage_version: int) -> dict | None:
+    """Classify one email's urgency with the trained jeff ``triage`` adapter.
+
+    Returns an email-urgency verdict (same shape as the LLM path) or None when
+    the per-job flag is off or the adapter is unavailable, so the caller falls
+    through to the LLM candidate chain. Only the ``urgency`` question is sent:
+    jeff scores each question in its own forward pass, and that is the question
+    this adapter was trained on.
+    """
+    from src.jeff_decision import jeff_job_enabled, jeff_systemone, score_value
+
+    if not jeff_job_enabled("EMAIL_URGENCY"):
+        return None
+    message = f"Subject: {item.get('subject','')}\n\n{item.get('body','')}".strip()
+    if not message:
+        return None
+    answers = await jeff_systemone(
+        "triage",
+        {"channel": "email", "message": message[:8000]},
+        {"urgency": {
+            "type": "score",
+            "instructions": "How urgently does this need a response?",
+            "criteria": [
+                "No action needed",
+                "Can wait a few days",
+                "Handle within a day",
+                "Handle within hours",
+                "Handle immediately",
+            ],
+        }},
+    )
+    if not answers:
+        return None
+    exp = score_value(answers.get("urgency"))
+    if exp is None:
+        return None
+
+    # Adapter's 0-4 urgency scale -> the app's 0-3 score.
+    score = max(0, min(3, int(round(exp))))
+    reason = "triage adapter"
+
+    # Same high-precision correction the prompt path applies: a person waiting
+    # in person is always urgent, whatever the model thinks.
+    blob = f"{item.get('headers','')}\n{item.get('subject','')}\n{item.get('body','')}".lower()
+    if re.search(r"\b(i'?m|i am|im|we'?re|we are)\s+outside\b", blob) or re.search(
+        r"\b(waiting outside|at the door|locked out|can'?t get in|cannot get in)\b", blob
+    ):
+        if score < 3:
+            reason = "person is waiting outside"
+        score = 3
+
+    # Same bulk/marketing guard the prompt path applies: a newsletter or
+    # promotion is not urgent no matter how time-limited it sounds.
+    bulkish = bool(re.search(
+        r"\b(list-unsubscribe|list-id|mailchimp|mailchimpapp|view this email in your browser|unsubscribe|newsletter|digest|precedence:\s*bulk)\b",
+        blob,
+    ))
+    # The adapter was trained on support tickets, so it over-rates promotions.
+    # Require a clear bulk header or several marketing terms before zeroing.
+    marketing_hits = sum(1 for t in (
+        "advertisement", "sponsored", "promo", "promotion", "sale", "discount",
+        "offer", "limited time", "deal", "coupon", "shop now", "buy now",
+        "sold out", "low tickets",
+    ) if t in blob)
+    if bulkish or marketing_hits >= 2:
+        score = 0
+        reason = "bulk mail; no personal reply needed"
+
+    tags = []
+    if score >= 3:
+        tags.append("urgent")
+    elif score >= 2:
+        tags.append("reply-soon")
+
+    _from_raw = item.get("from", "") or ""
+    if "<" in _from_raw:
+        _from_short = _from_raw.split("<", 1)[0].strip().strip('"') or _from_raw
+    else:
+        _from_short = _from_raw
+
+    return {
+        "score": score,
+        "tags": tags[:4],
+        "spam": False,
+        "reason": reason,
+        "subject": (item.get("subject") or "")[:200],
+        "from": _from_short[:120],
+        "triage_version": triage_version,
+        "message_id": (item.get("message_id") or "").strip(),
+        "unread": bool(item.get("unread")),
+        "ts": time.time(),
+    }
 
 
 async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
@@ -2827,6 +2944,16 @@ async def action_check_email_urgency(owner: str, **kwargs) -> Tuple[str, bool]:
                 if verdict.get("tags") or verdict.get("reason") != "categorized by email metadata":
                     cache.setdefault("uids", {})[item["uid"]] = verdict
                     per_uid_scores[key] = verdict
+                    saved_classifications += 1
+                    continue
+                # ── Spec decision adapter (triage): a calibrated urgency score
+                # with no generated-text prompt. Enabled per-job via
+                # ODYSSEUS_JEFF_EMAIL_URGENCY; any failure returns None and the
+                # LLM candidate chain below still runs.
+                _tri = await _spec_triage_email_urgency(item, triage_version=TRIAGE_VERSION)
+                if _tri is not None:
+                    cache.setdefault("uids", {})[item["uid"]] = _tri
+                    per_uid_scores[key] = _tri
                     saved_classifications += 1
                     continue
                 # ── LLM-classify. JSON-only response; bullet-proof parse.

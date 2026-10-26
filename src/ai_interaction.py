@@ -464,6 +464,8 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
             return {"error": "Edit needs line 2: memory_id, line 3: new text"}
         memory_id = lines[1].strip()
         new_text = lines[2].strip()
+        if not memory_id:
+            return {"error": "Edit needs line 2: memory_id"}
         if not new_text:
             return {"error": "New text cannot be empty"}
 
@@ -497,6 +499,8 @@ async def do_manage_memory(content: str, session_id: Optional[str] = None, owner
         if len(lines) < 2:
             return {"error": "Delete needs line 2: memory_id"}
         memory_id = lines[1].strip()
+        if not memory_id:
+            return {"error": "Delete needs line 2: memory_id"}
 
         memories = _memory_manager.load_all()
         original_len = len(memories)
@@ -961,7 +965,7 @@ async def do_ui_control(content: str, session_id: Optional[str] = None, owner: O
 
     elif action == "open_panel":
         # Open a top-level panel/modal: documents/library, gallery,
-        # calendar, email, sessions, notes, memories, skills, settings, theme, cookbook.
+        # calendar, email, sessions, notes, tasks, memories, skills, settings, theme, cookbook.
         panel = parts[1].lower() if len(parts) > 1 else ""
         view = ""
         view_label = ""
@@ -989,6 +993,8 @@ async def do_ui_control(content: str, session_id: Optional[str] = None, owner: O
             "note": "notes",
             "todo": "notes",
             "todos": "notes",
+            "tasks": "tasks",
+            "task": "tasks",
             "memories": "memories",
             "memory": "memories",
             "brain": "memories",
@@ -1006,7 +1012,7 @@ async def do_ui_control(content: str, session_id: Optional[str] = None, owner: O
         }
         target = _panel_aliases.get(panel)
         if not target:
-            return {"error": f"Unknown panel '{panel}'. Valid: documents, gallery, calendar, email, sessions, notes, memories, skills, settings, theme, cookbook."}
+            return {"error": f"Unknown panel '{panel}'. Valid: documents, gallery, calendar, email, sessions, notes, tasks, memories, skills, settings, theme, cookbook."}
         if target == "cookbook":
             cookbook_views = {
                 "models": ("Search", "models"), "model": ("Search", "models"),
@@ -1294,6 +1300,14 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
 
     async def _resolve_image_model(model_name: str):
         def _call():
+            # Try a plain by-name lookup first. Gateway endpoints (OpenRouter)
+            # register as `llm` yet serve image models, and the image-typed
+            # query's last-resort fallback would otherwise hijack a cloud model
+            # onto the local image endpoint (gpt-5-image -> qwen-image-edit).
+            try:
+                return _resolve_model(model_name, owner=owner)
+            except ValueError:
+                pass
             try:
                 return _resolve_model(model_name, owner=owner, model_type="image")
             except TypeError as exc:
@@ -1412,6 +1426,9 @@ async def do_generate_image(content: str, session_id: Optional[str] = None, owne
                 filename = f"{uuid.uuid4().hex[:12]}.png"
                 img_path = img_dir / filename
                 img_path.write_bytes(image_bytes)
+                if owner:
+                    from src.generated_images import register_generated_image
+                    register_generated_image(filename, owner)
                 return f"/api/generated-image/{filename}", _save_to_gallery(filename)
 
             # Private results stay in the response, never in the gallery or on disk.
@@ -1578,6 +1595,9 @@ async def do_edit_image(
         img_dir.mkdir(parents=True, exist_ok=True)
         filename = f"{uuid.uuid4().hex[:12]}{suffix}"
         (img_dir / filename).write_bytes(image_bytes)
+        if owner:
+            from src.generated_images import register_generated_image
+            register_generated_image(filename, owner)
         return f"/api/generated-image/{filename}", _save_edited_image_to_gallery(filename)
 
     async def _try_local_img2img_fallback(client: httpx.AsyncClient) -> Optional[Dict[str, Any]]:

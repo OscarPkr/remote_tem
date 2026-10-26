@@ -8,6 +8,7 @@ Extracted from agent_tools.py to keep schema definitions separate from
 tool parsing / execution logic.
 """
 
+import os
 import json
 import logging
 import re
@@ -70,7 +71,7 @@ def _repair_function_arg_aliases(tool_type: str, args: dict[str, Any]) -> dict[s
         command = args.get("command")
         if isinstance(command, str):
             path, separator, content = command.partition("\n")
-            if separator and path.strip() and content:
+            if separator and path.strip() and content.strip():
                 args["path"] = path.strip()
                 args["content"] = content
                 logger.warning("Normalized legacy `command` write shape to path/content")
@@ -113,6 +114,15 @@ def _repair_function_arg_aliases(tool_type: str, args: dict[str, Any]) -> dict[s
             args["url"] = path
             args.pop("path", None)
             args.pop("file_path", None)
+    elif (
+        tool_type == "ui_control"
+        and str(args.get("action") or "").casefold() == "open_panel"
+        and not str(args.get("name") or "").strip()
+    ):
+        panel = _first_nonempty_string(args, ("panel",))
+        if panel:
+            args["name"] = panel
+            args.pop("panel", None)
     if tool_type == "manage_documents" and "limit" not in args and "max_results" in args:
         # Collection APIs use both names across the native tool surface. The
         # document contract calls this integer ``limit``.
@@ -494,14 +504,14 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "youtube_tool",
-            "description": "Read YouTube-specific data (comments, transcripts, metadata, or latest video from a channel) without fighting the YouTube JS UI. YOUTUBE ONLY: it accepts only youtube.com or youtu.be links — a video URL, a shorts/live link, or an 11-character video_id, or a channel /@handle/videos URL. It does NOT accept any other website. For a non-YouTube URL do not use this tool: use web_fetch for one specific page or web_search for an open-ended lookup; use private_browser only to drive the visible browser.",
+            "description": "Read YouTube-specific data without fighting the JS UI. Use for YouTube video comments, transcripts, metadata, or latest video from a channel. For general web lookup use web_search; for interacting with the visible site use private_browser.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["comments", "transcript", "metadata", "latest_channel_video"], "description": "What YouTube data to retrieve. Use latest_channel_video with max_results for latest N uploads from a channel."},
-                    "url": {"type": "string", "description": "A youtube.com or youtu.be URL (video, watch?v=, shorts, or a channel /@handle/videos URL). No other hosts."},
-                    "video_url": {"type": "string", "description": "A youtube.com or youtu.be video URL"},
-                    "video_id": {"type": "string", "description": "The 11-character YouTube video id (e.g. jNQXAC9IVRw)"},
+                    "url": {"type": "string", "description": "YouTube video or channel URL"},
+                    "video_url": {"type": "string", "description": "YouTube video URL"},
+                    "video_id": {"type": "string", "description": "YouTube video id"},
                     "channel_url": {"type": "string", "description": "YouTube channel URL or /@handle/videos URL"},
                     "handle": {"type": "string", "description": "YouTube handle, e.g. @OpenAI"},
                     "max_results": {"type": "integer", "description": "Maximum comments, uploads, or results to return, capped at 50"}
@@ -904,13 +914,13 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "ui_control",
-            "description": "Control the user interface. Actions: toggle (turn tools on/off), open_panel (open a modal: documents/library, gallery, calendar/schedule, email, sessions, notes, memories/brain, skills, settings, theme, cookbook; calendar supports month/week/year/agenda plus a date; Cookbook supports models/download, launch/serve, active/running, dependencies, and settings views), open_email_reply (legacy UI-only reply opener; prefer email MCP draft_email_reply for assistant-written reply drafts so a normal document-backed email draft is created), set_mode, switch_model, set_theme (built-in presets: dark, light, midnight, cyberpunk, retrowave, forest, ocean, ume, terminal, organs, gpt, claude, cute, eclipse, porcelain, arcade, blueprint, monolith, yoyo), create_theme (CREATE any custom theme with a name + colors object — pick distinctive, evocative hex colors that match the requested aesthetic, NOT generic defaults. The theme auto-applies after creation), get_theme, and get_toggles. When a user asks for ANY theme not in the built-in preset list, ALWAYS use create_theme.",
+            "description": "Control the user interface. Actions: toggle (turn tools on/off), open_panel (open a modal: documents/library, gallery, calendar/schedule, email, sessions, notes, tasks, memories/brain, skills, settings, theme, cookbook; calendar supports month/week/year/agenda plus a date; Cookbook supports models/download, launch/serve, active/running, dependencies, and settings views), open_email_reply (legacy UI-only reply opener; prefer email MCP draft_email_reply for assistant-written reply drafts so a normal document-backed email draft is created), set_mode, switch_model, set_theme (built-in presets: dark, light, midnight, cyberpunk, retrowave, forest, ocean, ume, terminal, organs, gpt, claude, cute, eclipse, porcelain, arcade, blueprint, monolith, yoyo), create_theme (CREATE any custom theme with a name + colors object — pick distinctive, evocative hex colors that match the requested aesthetic, NOT generic defaults. The theme auto-applies after creation), get_theme, and get_toggles. When a user asks for ANY theme not in the built-in preset list, ALWAYS use create_theme.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["toggle", "open_panel", "open_email_reply", "set_mode", "switch_model", "set_theme", "create_theme", "get_theme", "get_toggles"],
                                "description": "The UI action. Use set_theme for presets, create_theme to build a custom theme with any hex colors"},
-                    "name": {"type": "string", "description": "For toggle: web, bash, research, incognito, document_editor (aliases: shell, search, deepresearch, documents). For open_panel: documents, gallery, calendar/schedule, email, sessions, notes, brain/memories, skills, settings, theme/themes, cookbook; models and serve are Cookbook-view aliases. For open_email_reply: email UID. For set_theme: a preset theme name. For create_theme: the custom theme name."},
+                    "name": {"type": "string", "description": "For toggle: web, bash, research, incognito, document_editor (aliases: shell, search, deepresearch, documents). For open_panel: documents, gallery, calendar/schedule, email, sessions, notes, tasks, brain/memories, skills, settings, theme/themes, cookbook; models and serve are Cookbook-view aliases. For open_email_reply: email UID. For set_theme: a preset theme name. For create_theme: the custom theme name."},
                     "view": {"type": "string", "description": "Optional open_panel subview: calendar day/week/month/year/agenda, or Cookbook models/download, launch/serve, active/running, dependencies, settings."},
                     "value": {"type": "string", "description": "Value: on/off for toggle, agent/chat for set_mode, model name for switch_model, theme name for set_theme, or folder for open_email_reply"},
                     "uid": {"type": "string", "description": "Email UID for open_email_reply"},
@@ -1497,7 +1507,7 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "generate_image",
-            "description": "Generate a NEW image from a text prompt and place it as a layer in the open editor or save it to the gallery. Use for adding content that is not already in the photo (e.g. 'add a full moon in the sky'). If this tool reports that no image model or endpoint is configured, report that limitation directly; do NOT substitute deterministic editor ops (selection/adjustments/filters), Bash, Python, or SVG.",
+            "description": "Generate an AI image from a text prompt and save it to the gallery. If this tool reports that no image model or endpoint is configured, report that limitation directly; do not substitute Bash, Python, SVG, or another tool.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1507,23 +1517,6 @@ FUNCTION_TOOL_SCHEMAS = [
                     "quality": {"type": "string", "description": "Optional output quality"}
                 },
                 "required": ["prompt"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_image",
-            "description": "Edit an existing gallery image, preserving it as the source. For follow-ups such as adding an object or changing colors, use action=prompt with the previous tool result's image_id and the edit instructions. This sends the actual image plus prompt to the configured image model and saves a new copy. Also supports upscale and rembg. Report a missing optional dependency or unavailable editing directly; do not install packages or substitute a new text-only generation or shell commands.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_id": {"type": "string", "description": "Gallery image ID or supplied odysseus://attachment/ID reference for an owned upload"},
-                    "action": {"type": "string", "enum": ["prompt", "upscale", "rembg"], "description": "Edit action"},
-                    "prompt": {"type": "string", "description": "For action=prompt: requested changes, preserving the rest of the source image"},
-                    "scale": {"type": "number", "description": "For upscale: scale factor (default 2)"},
-                },
-                "required": ["image_id", "action"]
             }
         }
     },
@@ -1593,6 +1586,23 @@ FUNCTION_TOOL_SCHEMAS = [
                     "session": {"type": "string", "description": "Editor session id"}
                 },
                 "required": ["op"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_image",
+            "description": "Edit an existing gallery image, preserving it as the source. For follow-ups such as adding an object or changing colors, use action=prompt with the previous tool result's image_id and the edit instructions. This sends the actual image plus prompt to the configured image model and saves a new copy. Also supports upscale and rembg. Report a missing optional dependency or unavailable editing directly; do not install packages or substitute a new text-only generation or shell commands.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "image_id": {"type": "string", "description": "Gallery image ID or supplied odysseus://attachment/ID reference for an owned upload"},
+                    "action": {"type": "string", "enum": ["prompt", "upscale", "rembg"], "description": "Edit action"},
+                    "prompt": {"type": "string", "description": "For action=prompt: requested changes, preserving the rest of the source image"},
+                    "scale": {"type": "number", "description": "For upscale: scale factor (default 2)"},
+                },
+                "required": ["image_id", "action"]
             }
         }
     },
@@ -1990,6 +2000,15 @@ FUNCTION_TOOL_SCHEMAS = [
     },
 ]
 
+if os.getenv("ODYSSEUS_PRIVATE_BROWSER_LEGACY", "0").strip().lower() not in {"0", "false", "no", "off"}:
+    # Restored pre-Wave-3 private_browser (see src.tool_execution._legacy_private_browser).
+    from src.private_browser_legacy_schema import PRIVATE_BROWSER_SCHEMA as _PB_LEGACY
+
+    FUNCTION_TOOL_SCHEMAS[:] = [
+        _PB_LEGACY if (schema.get("function") or {}).get("name") == "private_browser" else schema
+        for schema in FUNCTION_TOOL_SCHEMAS
+    ]
+
 
 # ---------------------------------------------------------------------------
 # Converter: native function call -> ToolBlock
@@ -2269,7 +2288,13 @@ def function_call_to_tool_block(name: str, arguments: str) -> Optional[ToolBlock
     elif tool_type == "get_workspace":
         content = ""
     elif tool_type == "write_file":
-        content = args.get("path", "") + "\n" + args.get("content", "")
+        body = args.get("content")
+        if isinstance(body, str) and body.strip():
+            content = args.get("path", "") + "\n" + body
+        else:
+            # Preserve missing/empty intent for WriteFileTool instead of folding
+            # all empty shapes into the same path-plus-newline representation.
+            content = json.dumps(args)
     elif tool_type == "edit_file":
         content = json.dumps(args)
     elif tool_type == "apply_patch":

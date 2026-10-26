@@ -15,6 +15,7 @@ import logging
 import os
 import pathlib
 import re
+import stat
 import secrets
 import sys
 import time
@@ -36,6 +37,7 @@ from src.tool_policy import ToolPolicy
 from src.client_tool_contract import TUI_ROUTED_BRIDGE_TOOL_NAMES
 from src.constants import (
     DATA_DIR,
+    AGENT_WORKSPACE_DIR,
     MAX_DIFF_LINES,
     MAX_OUTPUT_CHARS,
     MAX_READ_CHARS,
@@ -69,11 +71,11 @@ _MISSING_TOOL_SECURITY_CONTEXT = _MissingToolSecurityContext()
 NO_TOOL_SECURITY_CONTEXT = _NoToolSecurityContext()
 
 # Persistent working directory for agent subprocesses.
-# Resolves to <repo_root>/data, which is the bind-mounted volume in Docker
-# (/app/data) and the local data directory for manual installs.
-# Using this as cwd and HOME prevents the agent from silently creating files
-# in ephemeral container layers that are lost on the next rebuild.
-_AGENT_WORKDIR = DATA_DIR
+# Resolves to <repo_root>/data/agent_workspace, inside the bind-mounted volume
+# in Docker (/app/data), so files survive a rebuild as before. The subdirectory
+# rather than data/ itself keeps agent scratch files and dotfiles out of the
+# directory holding the session store and the auth database.
+_AGENT_WORKDIR = AGENT_WORKSPACE_DIR
 
 
 ExecutionBridgeHandler = Callable[
@@ -133,6 +135,12 @@ def get_active_execution_bridge() -> AgentExecutionBridge | None:
     return _active_execution_bridge.get()
 
 
+def _tui_host_bridge_endpoint_url(url: str, path: str) -> str:
+    """Replace a validated bridge URL's path without changing its authority."""
+    from src.agent_tools.subprocess_tools import host_shell_bridge_endpoint_url
+    return host_shell_bridge_endpoint_url(url, path)
+
+
 def _tui_host_bridge_patch_url(
     client_runtime_context: Optional[Dict[str, Any]],
 ) -> tuple[str, str] | None:
@@ -153,11 +161,7 @@ def _tui_host_bridge_patch_url(
     from src.agent_tools.subprocess_tools import is_host_shell_bridge_url_allowed
     if not is_host_shell_bridge_url_allowed(url):
         return None
-    if url.endswith("/run"):
-        url = url[:-4] + "/patch"
-    elif not url.endswith("/patch"):
-        url += "/patch"
-    return url, token
+    return _tui_host_bridge_endpoint_url(url, "/patch"), token
 
 
 async def _apply_patch_via_tui_host_bridge(
@@ -173,7 +177,7 @@ async def _apply_patch_via_tui_host_bridge(
         import httpx
 
         timeout = httpx.Timeout(125.0, connect=5.0, write=10.0, pool=5.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(
                 url,
                 headers={"x-odysseus-tui-bridge-token": token},
@@ -233,7 +237,7 @@ async def _bridge_post(bridge: Dict, path: str, payload: Dict, *, timeout_s: flo
             "error": f"{err_prefix}: invalid TUI host bridge",
             "exit_code": 1,
         }
-    base = url.rsplit("/", 1)[0] if url.endswith(("/run", "/read", "/write")) else url.rstrip("/")
+    target = _tui_host_bridge_endpoint_url(url, path)
     try:
         import httpx
         timeout = httpx.Timeout(
@@ -242,9 +246,9 @@ async def _bridge_post(bridge: Dict, path: str, payload: Dict, *, timeout_s: flo
             write=10.0,
             pool=5.0,
         )
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             response = await client.post(
-                f"{base}{path}",
+                target,
                 headers={"x-odysseus-tui-bridge-token": token},
                 json=payload,
             )
@@ -300,13 +304,13 @@ async def _cancel_bridge_request(bridge: Dict, request_id: str) -> None:
     from src.agent_tools.subprocess_tools import is_host_shell_bridge_url_allowed
     if not token or not is_host_shell_bridge_url_allowed(url):
         return
-    base = url.rsplit("/", 1)[0]
+    target = _tui_host_bridge_endpoint_url(url, "/cancel")
     try:
         import httpx
         timeout = httpx.Timeout(5.0, connect=2.0, write=2.0, pool=2.0)
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
             await client.post(
-                f"{base}/cancel",
+                target,
                 headers={"x-odysseus-tui-bridge-token": token},
                 json={"request_id": request_id},
             )
@@ -729,7 +733,7 @@ async def _route_tool_via_bridge(tool: str, content: str, session_id: Optional[s
         path = path_value.strip() if isinstance(path_value, str) else ""
         if "\n" in path or "\r" in path:
             path = ""
-        body_value = args.get("content", "")
+        body_value = args.get("content")
         if not isinstance(body_value, str):
             return "write_file: invalid arguments", {
                 "error": "write_file: content must be a string",
@@ -739,7 +743,7 @@ async def _route_tool_via_bridge(tool: str, content: str, session_id: Optional[s
     else:
         path, _, body = content.partition("\n")
         path = path.strip()
-    if not path:
+    if not path or path.endswith(("/", "\\")):
         return "write_file: invalid arguments", {
             "error": "write_file: path is required",
             "exit_code": 1,
@@ -747,6 +751,17 @@ async def _route_tool_via_bridge(tool: str, content: str, session_id: Optional[s
     rejected = _text_write_to_binary_artifact_result(content)
     if rejected is not None:
         return rejected
+    from src.agent_tools.filesystem_tools import _parse_write_intent, _unwrap_fenced_source_body
+    try:
+        _, original_body, section, explicit_clear = _parse_write_intent(content)
+    except ValueError as error:
+        return "write_file: invalid arguments", {"error": str(error), "exit_code": 1}
+    body = _unwrap_fenced_source_body(body, path)
+    if not section or (not body.strip() and not explicit_clear):
+        return "write_file: ambiguous content", {
+            "error": "write_file: bridge cannot safely enforce implicit empty content; use explicit JSON string content",
+            "exit_code": 1,
+        }
     return f"write_file: {path[:80]}", await _bridge_post(
         bridge,
         "/write",
@@ -773,10 +788,15 @@ async def _route_tool_via_bridge(tool: str, content: str, session_id: Optional[s
 #   1. Sensitive-subpath deny list — checked FIRST. Blocks .ssh,
 #      .gnupg, shell rc files, token/env files even if the root above
 #      them is on the allowlist.
-#   2. Allowlist — only the directories the agent legitimately needs
-#      (project data/, system tmp). $HOME is NOT on the default list.
-#   3. Opt-in extra roots — admin can add broader roots via the
-#      "tool_path_extra_roots" setting (list of path strings).
+#   2. Application-state deny (_is_app_state_path) - DATA_DIR holds the
+#      session store, auth database, app key and settings, so only
+#      _agent_readable_data_subdirs() is readable inside it.
+#   3. Allowlist - only the directories the agent legitimately needs
+#      (its data/ workspace, user content, system tmp). $HOME is NOT on
+#      the default list.
+#   4. Opt-in extra roots - admin can add broader roots via the
+#      "tool_path_extra_roots" setting. These cannot re-open DATA_DIR;
+#      rule 2 is independent of which root a path arrived through.
 # ---------------------------------------------------------------------------
 
 # Compatibility exports: the same deny predicate protects tool access and
@@ -787,6 +807,191 @@ from src.agent_runtime.path_policy import (
 )
 
 
+def _path_within(resolved: str, root: str) -> bool:
+    """True when *resolved* is *root* itself or sits underneath it.
+
+    Use the platform's path-case rules.  This helper participates in allow
+    decisions, so unconditional case-folding would let a distinct ``/DATA``
+    tree masquerade as a descendant of ``/data`` on case-sensitive systems.
+    """
+    resolved, root = os.path.normcase(resolved), os.path.normcase(root)
+    if resolved == root:
+        return True
+    try:
+        if os.path.commonpath([resolved, root]) == root:
+            return True
+    except ValueError:
+        return False
+    # normcase is intentionally conservative about assumptions (notably on
+    # POSIX), so consult the filesystem when paths exist.  This recognizes a
+    # case alias on a case-insensitive volume without treating distinct
+    # case-sensitive paths as the same allow root.
+    if os.path.exists(root):
+        candidate = resolved
+        while True:
+            try:
+                if os.path.exists(candidate) and os.path.samefile(candidate, root):
+                    return True
+            except OSError:
+                pass
+            parent = os.path.dirname(candidate)
+            if parent == candidate:
+                break
+            candidate = parent
+    return False
+
+
+def _path_within_conservative(resolved: str, root: str) -> bool:
+    """Containment for deny decisions, folding case to fail closed."""
+    resolved, root = resolved.casefold(), root.casefold()
+    if resolved == root:
+        return True
+    try:
+        return os.path.commonpath([resolved, root]) == root
+    except ValueError:
+        return False
+
+
+def _agent_readable_data_subdirs() -> tuple[str, ...]:
+    """The only parts of DATA_DIR the agent's file tools may reach.
+
+    The agent's own scratch folder, plus the directories of user content whose
+    paths the application itself gives to the model, which it would then be
+    unable to open.  These normally live under DATA_DIR; the documented mail
+    attachment override may instead name a disjoint external directory:
+
+      UPLOAD_DIR            the chat upload manifest renders "path=<p>" and
+                            says to read it with read_file (agent_loop.py)
+      MAIL_ATTACHMENTS_DIR  download_attachment returns the path and its own
+                            description tells the model to read it
+      PERSONAL_DIR          GET /api/personal returns a path per file and is
+                            reachable through the app_api tool; RUNBOOK_DIR
+                            nests under it
+      PERSONAL_UPLOADS_DIR  indexed as a personal-docs directory, which
+                            manage_rag lists as an absolute path
+
+    Order matters: the first entry is roots[0], which _resolve_search_root uses
+    when grep/glob/ls are called with no path.
+    """
+    from src.constants import (
+        DATA_DIR,
+        MAIL_ATTACHMENTS_DIR,
+        PERSONAL_DIR,
+        PERSONAL_UPLOADS_DIR,
+        UPLOAD_DIR,
+    )
+    configured = (
+        (AGENT_WORKSPACE_DIR, "agent_workspace", False),
+        (UPLOAD_DIR, "uploads", False),
+        # This has a documented environment override and may legitimately
+        # live outside DATA_DIR, but it must never equal/contain DATA_DIR.
+        (MAIL_ATTACHMENTS_DIR, "mail-attachments", True),
+        (PERSONAL_DIR, "personal_docs", False),
+        (PERSONAL_UPLOADS_DIR, "personal_uploads", False),
+    )
+    configured_data_dir = os.path.abspath(os.path.expanduser(str(DATA_DIR)))
+    data_dir = os.path.realpath(configured_data_dir)
+    safe: list[str] = []
+    for raw, internal_name, external_ok in configured:
+        value = str(raw or "").strip()
+        # These paths are security-policy roots, not ordinary allowlist
+        # entries. Internal roles may inherit a relative DATA_DIR, but must
+        # still resolve to their exact canonical child below. External mail
+        # overrides require an absolute, disjoint directory.
+        if not value:
+            continue
+        expanded = os.path.abspath(os.path.expanduser(value))
+        # A policy root must not acquire an exemption by redirecting its final
+        # path component to protected state or to an unrelated external tree.
+        if os.path.islink(expanded):
+            continue
+        resolved = os.path.realpath(expanded)
+        if os.path.exists(resolved) and not os.path.isdir(resolved):
+            continue
+        expected_internal = os.path.join(data_dir, internal_name)
+        expected_configured = os.path.join(configured_data_dir, internal_name)
+        inside_data = (
+            os.path.normcase(expanded)
+            in {
+                os.path.normcase(expected_configured),
+                os.path.normcase(expected_internal),
+            }
+            and resolved == expected_internal
+        )
+        external_safe = (
+            external_ok
+            and os.path.isabs(os.path.expanduser(value))
+            and resolved != data_dir
+            and os.path.dirname(resolved) != resolved
+            and not _path_within(data_dir, resolved)
+            and not _path_within(resolved, data_dir)
+        )
+        if not (inside_data or external_safe) or _is_sensitive_path(resolved):
+            continue
+        safe.append(resolved)
+    return tuple(safe)
+
+
+def _is_app_state_path(resolved: str) -> bool:
+    """True for anything under DATA_DIR that is not agent-readable.
+
+    DATA_DIR holds the session store, the auth database, the app encryption key
+    and the settings file. A model-supplied path must not reach those through
+    any root, so this is checked in both resolvers rather than expressed as an
+    absence from the allowlist: a workspace bound at or above the data
+    directory, or an opt-in tool_path_extra_roots entry covering it, would
+    otherwise put them back in reach.
+
+    A containment rule rather than a filename deny list, so state files added
+    later are covered without anyone remembering to list them. The composed
+    sensitive-name policy also denies settings.json and app.db in workspaces.
+    """
+    from src.constants import DATA_DIR
+    if not _path_within_conservative(resolved, os.path.realpath(DATA_DIR)):
+        return False
+    return not any(
+        _path_within(resolved, d)
+        for d in _agent_readable_data_subdirs()
+    )
+
+
+def _is_hardlinked_regular_file(resolved: str) -> bool:
+    """Reject inode aliases that can smuggle DATA_DIR state into an allow root."""
+    try:
+        target = os.stat(resolved, follow_symlinks=False)
+    except OSError:
+        return False
+    return stat.S_ISREG(target.st_mode) and getattr(target, "st_nlink", 1) > 1
+
+
+def _is_denied_tool_path(resolved: str, *, snapshot=None) -> bool:
+    """Apply every path deny to a canonical traversal result.
+
+    Directory scans pass one ``_control_plane_snapshot()`` for the whole walk;
+    rebuilding it per entry made grep/ls/glob linear in protected-state stats.
+    """
+    from src.agent_runtime.resources import _control_plane_path
+    return (
+        _is_sensitive_path(resolved)
+        or _is_app_state_path(resolved)
+        or _is_hardlinked_regular_file(resolved)
+        or _control_plane_path(resolved, snapshot=snapshot)
+    )
+
+
+def _can_traverse_tool_path(resolved: str, *, snapshot=None) -> bool:
+    """Allow walking a denied state parent only to reach safe carve-outs."""
+    if _is_sensitive_path(resolved):
+        return False
+    if not _is_app_state_path(resolved):
+        from src.agent_runtime.resources import _control_plane_path
+        return not _control_plane_path(resolved, snapshot=snapshot)
+    return any(
+        _path_within(readable, resolved)
+        for readable in _agent_readable_data_subdirs()
+    )
+
+
 def _tool_path_roots() -> list[str]:
     """Return the list of directory roots that read_file / write_file
     may touch. Default: project data/ + system temp dirs. Extra roots
@@ -794,9 +999,9 @@ def _tool_path_roots() -> list[str]:
     """
     roots: list[str] = []
 
-    # Project data directory — the agent's primary workspace.
-    from src.constants import DATA_DIR
-    roots.append(DATA_DIR)
+    # The agent's workspace plus the user-content directories inside data/.
+    # The rest of DATA_DIR is denied by _is_app_state_path.
+    roots.extend(_agent_readable_data_subdirs())
 
     # /tmp (and its macOS realpath /private/tmp).
     roots.append("/tmp")
@@ -853,20 +1058,36 @@ def _resolve_tool_path(raw_path: str) -> str:
     """
     resource_operation = active_resource_operation()
     if resource_operation is not None:
-        return resource_operation.resolve_path(raw_path)
+        resolved = resource_operation.resolve_path(raw_path)
+        if _is_denied_tool_path(resolved):
+            raise ValueError("bound path is sensitive, application state or a hard-linked file")
+        return resolved
     ws = get_active_workspace()
     if ws:
         return _resolve_tool_path_in_workspace(ws, raw_path)
     if raw_path is None or not str(raw_path).strip():
         raise ValueError("path is required")
     expanded = os.path.expanduser(str(raw_path).strip())
+    # Relative paths resolve where bash/python run (agent_cwd), not against
+    # the server's cwd, which is outside the allowed roots (#6679).
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(_AGENT_WORKDIR, expanded)
     resolved = os.path.realpath(expanded)
 
+    if _is_app_state_path(resolved):
+        raise ValueError(
+            f"path '{raw_path}' is inside the application state directory"
+        )
     if _is_sensitive_path(resolved):
         raise ValueError(
             f"path '{raw_path}' is inside a sensitive directory "
             f"(e.g. .ssh, .gnupg) or matches a sensitive filename"
         )
+    if _is_hardlinked_regular_file(resolved):
+        raise ValueError(f"path '{raw_path}' is a hard-linked file")
+
+    if _is_denied_tool_path(resolved):
+        raise ValueError("path addresses sensitive execution control-plane state")
 
     for root in _tool_path_roots():
         if is_inside(root, resolved):
@@ -903,11 +1124,19 @@ def _resolve_tool_path_in_workspace(workspace: str, raw_path: str) -> str:
     # Confinement says "inside the root"; the deny list says "allowed". They
     # are separate questions and this one stays here, with the policy that
     # owns it.
+    if _is_app_state_path(resolved):
+        raise ValueError(
+            f"path '{raw_path}' is inside the application state directory"
+        )
     if _is_sensitive_path(resolved):
         raise ValueError(
             f"path '{raw_path}' is inside a sensitive directory "
             f"(e.g. .ssh, .gnupg) or matches a sensitive filename"
         )
+    if _is_hardlinked_regular_file(resolved):
+        raise ValueError(f"path '{raw_path}' is a hard-linked file")
+    if _is_denied_tool_path(resolved):
+        raise ValueError("path addresses sensitive execution control-plane state")
     return resolved
 
 
@@ -966,6 +1195,10 @@ def vet_workspace(raw: str) -> Optional[str]:
     resolved = os.path.realpath(os.path.expanduser(raw))
     if not os.path.isdir(resolved) or _is_sensitive_path(resolved):
         return None
+    # Refuse the bind rather than binding a workspace where every subsequent
+    # tool call would fail on the same deny list.
+    if _is_denied_tool_path(resolved):
+        return None
     # Reject filesystem roots: binding / (or a Windows drive/UNC root) as the
     # workspace would make every absolute path "inside" it, collapsing the
     # confinement into host-wide file access. A root is its own dirname, which
@@ -977,11 +1210,31 @@ def vet_workspace(raw: str) -> Optional[str]:
 
 def agent_cwd() -> str:
     """Working directory for agent subprocesses (bash/python/background jobs):
-    the active workspace when set, else the persistent data dir."""
+    a validated sealed launch root, active workspace, or agent workspace."""
     from src.agent_runtime.process_resources import active_process_operation
     bound = active_process_operation()
-    return (bound.launch.scope.root.path if bound is not None and bound.launch is not None
-            else get_active_workspace() or _AGENT_WORKDIR)
+    if bound is not None and bound.launch is not None:
+        bound.launch.scope.validate()
+        root = bound.launch.scope.root.path
+        if vet_workspace(root) != root:
+            raise RuntimeError("sealed process root is not a safe real directory")
+        return root
+    workspace = get_active_workspace()
+    if workspace:
+        vetted = vet_workspace(workspace)
+        if vetted is None:
+            raise RuntimeError("active workspace is not a safe real directory")
+        return vetted
+    return default_agent_workspace()
+
+
+def default_agent_workspace() -> str:
+    """The agent workspace under the data dir, where subprocesses run when no
+    workspace is bound."""
+    resolved = os.path.realpath(_AGENT_WORKDIR)
+    if resolved not in _agent_readable_data_subdirs() or vet_workspace(resolved) != resolved:
+        raise RuntimeError("agent workspace is not a safe real directory")
+    return resolved
 
 
 def get_mcp_manager():
@@ -996,19 +1249,28 @@ def _resolve_search_root(raw_path: str) -> str:
 
     With a workspace active, the workspace folder is the root and a supplied
     path is confined inside it. Otherwise an empty path defaults to the agent's
-    primary root (project data dir) and a supplied path is confined by the
-    global allowlist + sensitive-file policy.
+    primary root (its workspace under the project data dir) and a supplied path
+    is confined by the global allowlist + sensitive-file policy.
     """
     resource_operation = active_resource_operation()
     if resource_operation is not None:
-        return resource_operation.resolve_path(raw_path, search=True)
+        resolved = resource_operation.resolve_path(raw_path, search=True)
+        if _is_denied_tool_path(resolved):
+            raise ValueError("bound search root is sensitive, application state or a hard-linked file")
+        return resolved
     raw = (raw_path or "").strip()
     ws = get_active_workspace()
     if ws:
-        return os.path.realpath(ws) if not raw else _resolve_tool_path_in_workspace(ws, raw)
+        # Resolve the empty case as the workspace path rather than returning
+        # it directly: returned unchecked it skipped both deny lists, so a
+        # bare ls listed whatever the workspace was bound to.
+        return _resolve_tool_path_in_workspace(ws, raw or ws)
     if not raw:
         roots = _tool_path_roots()
-        return roots[0] if roots else os.path.realpath(".")
+        default_root = os.path.realpath(AGENT_WORKSPACE_DIR)
+        if default_root in roots and not _is_denied_tool_path(default_root):
+            return default_root
+        raise ValueError("default agent workspace is not a safe readable data subdirectory")
     return _resolve_tool_path(raw)
 
 logger = logging.getLogger(__name__)
@@ -1026,6 +1288,16 @@ _ADMIN_TOOLS = {
     "serve_preset",
     "stop_served_model",
     "cancel_download",
+    # Read-only Cookbook tools reach require_admin routes over the internal
+    # loopback without an owner check (see NON_ADMIN_BLOCKED_TOOLS in
+    # src/tool_security.py), so they are admin-only at dispatch as well.
+    "list_served_models",
+    "tail_serve_output",
+    "list_downloads",
+    "search_hf_models",
+    "list_cached_models",
+    "list_serve_presets",
+    "list_cookbook_servers",
 }
 
 
@@ -1065,7 +1337,8 @@ def _parse_qualified_mcp_args(tool: str, content: str) -> tuple[Dict, Optional[s
         if tool.startswith("mcp__email__"):
             return {}, "Email MCP tool arguments must be a JSON object."
         return {}, None
-    return parsed, None
+    sanitized = {k: v for k, v in parsed.items() if not k.startswith("_odysseus_")}
+    return sanitized, None
 
 
 def _parse_generate_image(content: str) -> Dict:
@@ -1150,9 +1423,12 @@ def _build_mcp_args(tool: str, content: str) -> Dict:
         except (json.JSONDecodeError, TypeError):
             decoded = None
         if isinstance(decoded, dict) and any(k in decoded for k in primaries):
-            return decoded
+            return {k: v for k, v in decoded.items() if not k.startswith("_odysseus_")}
     parser = _MCP_ARG_PARSERS.get(tool)
-    return parser(content) if parser else {}
+    res = parser(content) if parser else {}
+    if isinstance(res, dict):
+        return {k: v for k, v in res.items() if not k.startswith("_odysseus_")}
+    return res
 
 
 def _normalize_mcp_text_error(result: Dict) -> Dict:
@@ -1169,20 +1445,25 @@ async def _call_mcp_tool(
     tool: str,
     content: str,
     progress_cb: Optional[Callable[[Dict], Awaitable[None]]] = None,
+    owner: Optional[str] = None,
 ) -> Dict:
     """Route a legacy tool call through the MCP manager, with direct fallbacks."""
     bound = active_backend_operation()
     if bound is not None and isinstance(bound.resource, NativeBackendResource):
-        return await _direct_fallback(tool, content, progress_cb=progress_cb) or {"error": f"Native tool '{tool}' unavailable", "exit_code": 1}
+        return await _direct_fallback(tool, content, progress_cb=progress_cb, owner=owner) or {"error": f"Native tool '{tool}' unavailable", "exit_code": 1}
     mcp = get_mcp_manager()
     if not mcp:
         if bound is not None:
             raise ResourceIdentityError("Pinned MCP backend is unavailable")
-        return await _direct_fallback(tool, content, progress_cb=progress_cb) or {"error": f"MCP manager not available for tool '{tool}'", "exit_code": 1}
+        return await _direct_fallback(tool, content, progress_cb=progress_cb, owner=owner) or {"error": f"MCP manager not available for tool '{tool}'", "exit_code": 1}
 
     server_id, tool_name = _MCP_TOOL_MAP[tool]
     qualified = f"mcp__{server_id}__{tool_name}"
     args = _build_mcp_args(tool, content)
+    if tool == "generate_image":
+        args.pop("_odysseus_owner", None)
+        if owner:
+            args["_odysseus_owner"] = owner
     result = await mcp.call_tool(qualified, args)
 
     # Stdio MCP servers can only return TextContent, so an explicit
@@ -1192,7 +1473,7 @@ async def _call_mcp_tool(
 
     # If MCP server not connected, try direct fallback
     if bound is None and isinstance(result, dict) and result.get("exit_code") == 1 and "not connected" in result.get("error", ""):
-        fallback = await _direct_fallback(tool, content, progress_cb=progress_cb)
+        fallback = await _direct_fallback(tool, content, progress_cb=progress_cb, owner=owner)
         if fallback:
             return fallback
 
@@ -1275,6 +1556,31 @@ def _agent_subprocess_env() -> dict:
     base.setdefault("LANG", "C.UTF-8")
     base.update({"TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40", "HOME": _AGENT_WORKDIR})
     return base
+
+
+def _legacy_private_browser_enabled() -> bool:
+    return os.getenv("ODYSSEUS_PRIVATE_BROWSER_LEGACY", "0").strip().lower() not in {"0", "false", "no", "off"}
+
+
+async def _legacy_private_browser(operation, transport, *, progress_cb=None, session_id=None, owner=None):
+    from src.agent_tools.web_tools_prewave3 import PrivateBrowserTool
+    ctx = {
+        "progress_cb": progress_cb,
+        "subproc_env": _agent_subprocess_env(),
+        "session_id": session_id,
+        "owner": owner,
+    }
+    try:
+        result = await PrivateBrowserTool().execute(operation.input, ctx)
+    except asyncio.CancelledError:
+        raise
+    except Exception as error:
+        logger.warning("legacy private_browser failed: %s", error)
+        return f"{transport}: ERROR", {"error": f"private_browser: {error}", "exit_code": 1}
+    if not isinstance(result, dict):
+        result = {"output": str(result), "exit_code": 0}
+    label = "ERROR" if result.get("error") or result.get("exit_code") not in (None, 0) else "EXECUTED"
+    return f"{transport}: {label}", result
 
 
 async def _direct_fallback(
@@ -1399,6 +1705,14 @@ async def execute_tool_block(
             "NO_TOOL_SECURITY_CONTEXT"
         )
 
+    # Credential denial precedes authority, exact approval claim and bridges.
+    if (isinstance(security_context, ToolRunSecurityContext)
+            and security_context.delegated_credential):
+        from src.tool_capabilities import delegated_tool_is_blocked
+        if delegated_tool_is_blocked(getattr(block, "tool_type", None), getattr(block, "content", None)):
+            decision = security_context.decision_for(block.tool_type, block.content)
+            return blocked_tool_result(block.tool_type, decision.reason)
+
     authority = active_request_authority() if request_authority is MISSING_AUTHORITY else request_authority
     parent = active_request_authority()
     if isinstance(authority, RequestAuthority) and parent is not None and authority is not parent:
@@ -1442,6 +1756,12 @@ async def execute_tool_block(
         }
 
     transport = operation.transport_tool
+    if operation.tool == "private_browser" and _legacy_private_browser_enabled():
+        # Restored pre-Wave-3 private_browser (agent-browser CLI). The Wave 3
+        # producer in src.browser_identity refuses every page action in this
+        # build. This compatibility transport requires an explicit opt-in.
+        return await _legacy_private_browser(
+            operation, transport, progress_cb=progress_cb, session_id=session_id, owner=owner)
     if operation.tool == "private_browser":
         try:
             _, browser_args = parse_browser_operation(operation.input)
@@ -1822,6 +2142,17 @@ async def _execute_tool_block_impl(
 
     mark_authorized()
     if bridge_owns_tool:
+        if tool == "write_file":
+            from src.agent_tools.filesystem_tools import _parse_write_intent, _unwrap_fenced_source_body
+            try:
+                path, body, section, explicit_clear = _parse_write_intent(content)
+                if not path or path.endswith(("/", "\\")) or "\n" in path or "\r" in path:
+                    raise ValueError("write_file: valid file path required")
+                body = _unwrap_fenced_source_body(body, path)
+                if not section or (not body.strip() and not explicit_clear):
+                    raise ValueError("write_file: bridge cannot safely enforce implicit empty content; use explicit JSON string content")
+            except ValueError as error:
+                return "write_file: invalid arguments", {"error": str(error), "exit_code": 1}
         try:
             return await dispatched(execution_bridge.route_tool(
                 tool,
@@ -1923,7 +2254,7 @@ async def _execute_tool_block_impl(
     elif tool in _MCP_TOOL_MAP:
         first_line = content.split(chr(10))[0][:80]
         desc = f"{tool}: {first_line}"
-        result = await dispatched(_call_mcp_tool(tool, content, progress_cb=progress_cb))
+        result = await dispatched(_call_mcp_tool(tool, content, progress_cb=progress_cb, owner=owner))
     elif tool in ("grep", "glob", "ls", "get_workspace", "host_shell"):
         # Code-navigation tools — no MCP server; run the direct implementation.
         first_line = content.split(chr(10))[0][:80]
@@ -2110,7 +2441,7 @@ async def _execute_tool_block_impl(
                     )
                 else:
                     if isinstance(parsed, dict):
-                        args = parsed
+                        args = {k: v for k, v in parsed.items() if not k.startswith("_odysseus_")}
                     else:
                         _args_error = (
                             f"'{tool}' arguments must be a JSON object, "
@@ -2119,11 +2450,12 @@ async def _execute_tool_block_impl(
             if _args_error is not None:
                 result = {"error": _args_error, "exit_code": 1}
             else:
+                args = dict(args)
+                args.pop(_EMAIL_MCP_OWNER_ARG, None)
+                args.pop(_EMAIL_MCP_SESSION_ARG, None)
                 if owner:
-                    args = dict(args)
                     args[_EMAIL_MCP_OWNER_ARG] = owner
                 if session_id:
-                    args = dict(args)
                     args[_EMAIL_MCP_SESSION_ARG] = session_id
                 result = await dispatched(mcp.call_tool(qualified, args))
         else:
@@ -2137,14 +2469,20 @@ async def _execute_tool_block_impl(
             if parse_error:
                 result = {"error": parse_error, "exit_code": 1}
             else:
+                args = dict(args)
+                args.pop("_odysseus_owner", None)
+                args.pop("_odysseus_session_id", None)
                 if tool.startswith("mcp__email__"):
                     if owner:
-                        args = dict(args)
                         args[_EMAIL_MCP_OWNER_ARG] = owner
                     if session_id:
-                        args = dict(args)
                         args[_EMAIL_MCP_SESSION_ARG] = session_id
+                elif tool == "mcp__image_gen__generate_image" or tool.startswith("mcp__image_gen__"):
+                    if owner:
+                        args["_odysseus_owner"] = owner
                 result = _normalize_mcp_text_error(await dispatched(mcp.call_tool(tool, args)))
+                if tool == "mcp__image_gen__generate_image" or tool.startswith("mcp__image_gen__"):
+                    _promote_image_fields(result)
         else:
             desc = f"mcp: {tool}"
             result = {"error": "MCP manager not available", "exit_code": 1}

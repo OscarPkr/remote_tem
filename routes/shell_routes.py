@@ -26,8 +26,8 @@ from src.host_docker_access import (
 )
 from src.optional_deps import prepare_optional_dependency_import
 from src.auth_helpers import _auth_disabled
-from src import shutdown as _shutdown
 from src import process_lifecycle
+from src import shutdown as _shutdown
 
 # POSIX-only: `pty`/`fcntl` transitively import `termios`, which does NOT exist
 # on Windows, so importing them unconditionally crashed app startup there

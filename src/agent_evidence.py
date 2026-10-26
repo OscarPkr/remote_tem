@@ -54,7 +54,6 @@ def workspace_artifact_is_usable(path: Path) -> bool:
 class EvidenceKind(str, Enum):
     TOOL_RESULT = "tool_result"
     ARTIFACT_MUTATION = "artifact_mutation"
-    DOCUMENT_MUTATION = "document_mutation"
     ARTIFACT_VALIDATION = "artifact_validation"
     VERIFIER_RESULT = "verifier_result"
     MEDIA_INGRESS = "media_ingress"
@@ -132,20 +131,6 @@ class CompletionDecision:
 
 
 _ARTIFACT_PATH = r"(?:/|\./|\.\./)?[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.[A-Za-z0-9]{1,12}"
-# Document-editor tools mutate a server-side document rather than a filesystem
-# path, so their successful results are recorded as a distinct evidence kind.
-_DOCUMENT_MUTATION_TOOLS = frozenset({"create_document", "update_document", "edit_document"})
-# Owned private-action writes (calendar, tasks, notes, memory, contacts) mutate
-# server-side state that carries no filesystem path, so a successful
-# authoritative result is their mutation evidence. Without this, a verified
-# calendar/task create is discarded as an "unsupported execution claim".
-_PRIVATE_WRITE_ACTIONS: Mapping[str, frozenset[str]] = {
-    "manage_calendar": frozenset({"create_event", "update_event", "delete_event"}),
-    "manage_contact": frozenset({"add", "update", "edit", "delete"}),
-    "manage_memory": frozenset({"add", "edit", "delete"}),
-    "manage_notes": frozenset({"add", "update", "delete", "toggle_item"}),
-    "manage_tasks": frozenset({"create", "edit", "delete", "pause", "resume", "run"}),
-}
 _ARTIFACT_REQUEST_RE = re.compile(
     rf"\b(?:writ(?:e|ten)|creat(?:e|ed)|make|made|sav(?:e|ed)|produc(?:e|ed)|"
     rf"generat(?:e|ed)|export(?:ed)?|edit(?:ed)?|modif(?:y|ied)|updat(?:e|ed)|"
@@ -656,9 +641,6 @@ class EvidenceLedger:
         # order of actions so receipt evidence and effects share one ordering.
         self.effects: list[dict[str, Any]] = []
         self._action_order: dict[str, int] = {}
-        # Successful authoritative owned-state writes (calendar/tasks/notes/
-        # memory/contacts) that an unnamed mutation claim may cite.
-        self._private_action_mutations: list[str] = []
 
     def record_effects(self, entries: Iterable[Mapping[str, Any]], action_order: Mapping[str, int],
                        partial_reads: Iterable[str] = ()) -> None:
@@ -918,29 +900,6 @@ class EvidenceLedger:
                     detail="post-write artifact inspection",
                 )
 
-        if tool in _DOCUMENT_MUTATION_TOOLS:
-            # A successful, authoritative document write is evidence of a
-            # document mutation even though it has no filesystem path.
-            self._append(
-                kind=EvidenceKind.DOCUMENT_MUTATION,
-                success=success,
-                authoritative=authoritative,
-                source=event,
-                detail=tool,
-            )
-
-        if tool in _PRIVATE_WRITE_ACTIONS:
-            try:
-                write_args = json.loads(command or "{}")
-            except (TypeError, json.JSONDecodeError):
-                write_args = None
-            action = (
-                str(write_args.get("action") or "").strip().lower()
-                if isinstance(write_args, Mapping) else ""
-            )
-            if action in _PRIVATE_WRITE_ACTIONS[tool] and authoritative and success:
-                self._private_action_mutations.append(f"{tool}:{action}")
-
         if tool in {"bash", "host_shell"} and (command_is_test(_command_text(command)) or _matches_declared_verifier(
             command,
             self.requirements.verifier_commands,
@@ -1011,22 +970,6 @@ class EvidenceLedger:
             if self.effects and (self._effect_unsettled(path) or self._effect_contradicted(path)):
                 return False
         return True
-
-    def _supports_document_mutation(self) -> bool:
-        """A successful authoritative document write supports an unnamed
-        document-mutation claim, which carries no filesystem path to match."""
-        return any(event.kind == EvidenceKind.DOCUMENT_MUTATION
-                   and event.authoritative and event.success
-                   for event in self.events)
-
-    def _supports_mutation_claim(self, paths: Sequence[str]) -> bool:
-        """Match a mutation claim to a file edit, a document write, or a
-        successful owned-state action when the claim names no file path."""
-        if self._supports_artifact_claim(EvidenceKind.ARTIFACT_MUTATION, paths):
-            return True
-        if paths:
-            return False
-        return self._supports_document_mutation() or bool(self._private_action_mutations)
 
     def record_media_ingress(self, metadata: Mapping[str, Any]) -> None:
         for artifact in metadata.get("artifacts") or []:

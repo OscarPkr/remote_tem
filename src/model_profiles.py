@@ -56,7 +56,7 @@ def supports_user_thinking_toggle(value: object) -> bool:
         return False
     return any(pattern in leaf for pattern in (
         "kimi-k2.5", "kimi-k2.6", "kimi-k3",
-        "qwen3", "qwq", "deepseek-r1", "deepseek-reasoner", "deepseek-v4",
+        "qwen3", "qwq", "deepseek-r1", "deepseek-reasoner",
         "minimax", "m2-reap", "gemma", "stepfun", "step-3", "step3",
         "magistral", "mistral-small", "mistral-medium",
     ))

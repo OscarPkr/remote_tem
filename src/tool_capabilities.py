@@ -17,7 +17,7 @@ from types import MappingProxyType
 from typing import Any, Iterable, Mapping
 
 from src.tool_approval_scopes import CHAT_SESSION_APPROVAL_CONTEXT_MARKER
-from src.tool_security import BUILTIN_EMAIL_TOOLS
+from src.tool_security import BUILTIN_EMAIL_TOOLS, is_public_blocked_tool
 
 
 class ToolEffect(str, Enum):
@@ -515,6 +515,43 @@ def capabilities_for_action(tool_name: Any, content: Any) -> ToolCapabilities:
     if not isinstance(tool_name, str):
         return base
 
+    if tool_name in {"web_fetch", "pdf_extract"}:
+        payload = content
+        raw = content.strip() if isinstance(content, str) else ""
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(raw) if raw.startswith("{") else {}
+            except (TypeError, ValueError):
+                payload = {}
+        if not isinstance(payload, Mapping):
+            payload = {}
+        if tool_name == "web_fetch" and "urls" in payload:
+            urls = payload["urls"]
+            sources = []
+            if isinstance(urls, list):
+                for item in urls:
+                    source = item.get("url") if isinstance(item, Mapping) else item
+                    sources.append(str(source or "").strip())
+        else:
+            source = payload.get("url") or (payload.get("path") if tool_name == "pdf_extract" else "")
+            sources = [str(source or "").strip() or raw.split("\n", 1)[0].strip()]
+        # Match the native readers' local selectors without resolving or
+        # opening files. A mixed batch retains its network effects as well.
+        if tool_name == "web_fetch":
+            local = [source.startswith("/workspace/") or source.lower().startswith("file:///workspace/")
+                     for source in sources]
+        else:
+            local = [os.path.isabs(source) or source.lower().startswith("file://") for source in sources]
+        if any(local):
+            effects = {ToolEffect.READ_WORKSPACE}
+            if not all(local):
+                effects.update(base.effects)
+            return ToolCapabilities(
+                frozenset(effects),
+                ResultIntegrity.WORKSPACE_UNTRUSTED if all(local) else base.result_integrity,
+                known=base.known,
+            )
+
     if tool_name == "extract_text":
         payload = content
         if isinstance(payload, str):
@@ -655,9 +692,13 @@ POST_EXTERNAL_BLOCKED_EFFECTS = frozenset(
 )
 
 
+# On by default: until agent processes run without network and side-effecting
+# non-process tools have their own exact-approval boundary, this gate is the
+# only check between injected external content and those tools. Set it to a
+# falsy value to opt out.
 TOOL_APPROVAL_GATE_ENABLED = (
-    str(os.getenv("ODYSSEUS_TOOL_APPROVAL_GATE", "0")).strip().lower()
-    in {"1", "true", "yes", "on"}
+    str(os.getenv("ODYSSEUS_TOOL_APPROVAL_GATE", "1")).strip().lower()
+    not in {"0", "false", "no", "off"}
 )
 
 
@@ -724,6 +765,18 @@ def messages_contain_external_untrusted_context(messages: Iterable[dict]) -> boo
     return False
 
 
+def delegated_tool_is_blocked(tool_name: Any, content: Any = None) -> bool:
+    """Filter tool names for discovery and concrete workspace reads at dispatch."""
+    # The bridge exposes these spellings for the same filesystem surfaces.
+    if isinstance(tool_name, str):
+        tool_name = tool_name.strip()
+        tool_name = {"list_dir": "ls", "find_files": "glob"}.get(tool_name, tool_name)
+    return is_public_blocked_tool(tool_name) or (
+        content is not None
+        and ToolEffect.READ_WORKSPACE in capabilities_for_action(tool_name, content).effects
+    )
+
+
 @dataclass
 class ToolRunSecurityContext:
     """Server-owned integrity state for one agent run."""
@@ -740,11 +793,19 @@ class ToolRunSecurityContext:
     # The bypass affects only this automatic gate; current tool policy, ownership,
     # workspace confinement, and execution/sandbox restrictions still apply.
     approval_gate_bypassed: bool = False
+    # Driven by a bearer API token, not a person at a browser. Privileged
+    # tools are refused outright and no approval can lift that.
+    delegated_credential: bool = False
 
     def observe_messages(self, messages: Iterable[dict]) -> None:
         """Apply server-owned chat scope and promote untrusted prompt context."""
         message_list = list(messages or ())
-        if any(
+        if self.delegated_credential:
+            # A delegated run has no human to grant chat-session scope, so a
+            # grant sitting in this chat's history (left by the owner's own
+            # browser) must not be picked up by a token driving the same chat.
+            self.approval_gate_bypassed = False
+        elif any(
             isinstance(message, dict)
             and isinstance(message.get("metadata"), dict)
             and message["metadata"].get(
@@ -769,6 +830,17 @@ class ToolRunSecurityContext:
             self.external_untrusted_context_seen = True
 
     def decision_for(self, tool_name: Any, content: Any = None) -> ToolGateDecision:
+        # Checked before the bypasses below, because neither may lift it, and
+        # kept independent of external_untrusted_context_seen so it holds on a
+        # run where that gate never arms and raises no prompt to bypass.
+        if self.delegated_credential and delegated_tool_is_blocked(tool_name, content):
+            return ToolGateDecision(
+                False,
+                (
+                    f"Tool '{tool_name}' is not available to API-token callers. "
+                    "It requires an interactive session."
+                ),
+            )
         if not TOOL_APPROVAL_GATE_ENABLED:
             return ToolGateDecision(True)
         if self.approval_gate_bypassed:

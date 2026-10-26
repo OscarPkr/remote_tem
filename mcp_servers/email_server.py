@@ -1201,7 +1201,7 @@ def _fixture_email_record(row: dict, uid_num: int, owner: str) -> dict:
         "folder": folder,
         "is_read": bool(row.get("read")),
         "is_done": bool(row.get("done") or row.get("answered")),
-        "is_favorite": bool(row.get("favorite", row.get("flagged") or row.get("starred"))),
+        "is_favorite": bool(row.get("favorite") or row.get("flagged") or row.get("starred")),
         "spam_label": str(row.get("spam_label") or ""),
         "spam_score": int(row.get("spam_score") or 0),
         "list_unsubscribe": str(row.get("list_unsubscribe") or headers.get("List-Unsubscribe") or ""),
@@ -1525,17 +1525,15 @@ def _fixture_read_email(uid=None, message_id=None, folder="INBOX", account=None)
         return None
     if not _fixture_owner_has_rows(_current_owner()):
         return None
-    if not uid and not message_id:
-        return {"error": "Email UID or Message-ID is required"}
-    matches = [item for item in _fixture_email_rows(_current_owner())
-               if _fixture_row_matches_account(item, account)
-               and _fixture_folder_matches(item.get("folder"), folder)
-               and (not uid or str(item.get("uid")) == str(uid))
-               and (not message_id or str(item.get("message_id")) == str(message_id))]
-    if len(matches) > 1:
-        return {"error": "Email identity is ambiguous; specify its account and folder"}
-    if matches:
-        return matches[0]
+    for item in _fixture_email_rows(_current_owner()):
+        if not _fixture_row_matches_account(item, account):
+            continue
+        if not _fixture_folder_matches(item.get("folder"), folder):
+            continue
+        if uid and str(item.get("uid")) == str(uid):
+            return item
+        if message_id and str(item.get("message_id")) == str(message_id):
+            return item
     return {"error": f"Email not found with UID/Message-ID: {uid or message_id}"}
 
 
@@ -3519,6 +3517,21 @@ def _block_sender(sender=None, uids=None, folder="INBOX", account=None, reason="
     }
 
 
+def _attachment_dir(folder, uid, account_id) -> Path:
+    """Owner/account-scoped extraction directory (see src.mail_attachment_paths).
+
+    `folder` comes from tool arguments and the IMAP server's own mailbox names
+    (`/` hierarchies, absolute or `..` segments), so it must not become a path;
+    the old `MAIL_ATTACHMENTS_DIR/{folder}_{uid}` wrote outside the root and
+    shared one directory between every owner's "INBOX 42".
+    """
+    from src.mail_attachment_paths import attachment_scope_dir
+
+    return attachment_scope_dir(
+        MAIL_ATTACHMENTS_DIR, folder, uid, owner=_current_owner(), account_id=account_id,
+    )
+
+
 def _download_attachment(uid, index, folder="INBOX", account=None):
     """Extract a specific attachment to disk and return its local path."""
     fixture = _fixture_attachment_source(uid, index, folder=folder, account=account)
@@ -3527,7 +3540,7 @@ def _download_attachment(uid, index, folder="INBOX", account=None):
         filename = str(att.get("filename") or f"attachment-{index}.txt")
         safe_name = re.sub(r"[^\w\s\-.]", "_", filename).strip() or f"attachment-{index}.txt"
         content = str(att.get("content") or "")
-        target_dir = Path(MAIL_ATTACHMENTS_DIR) / re.sub(r"[^A-Za-z0-9._-]", "_", f"{folder}_{uid}")
+        target_dir = _attachment_dir(folder, uid, _row.get("account_id") or account)
         path = target_dir / safe_name
         size = len(content.encode("utf-8"))
         try:
@@ -3560,7 +3573,7 @@ def _download_attachment(uid, index, folder="INBOX", account=None):
     raw = msg_data[0][1]
     msg = email.message_from_bytes(raw)
 
-    target_dir = Path(MAIL_ATTACHMENTS_DIR) / f"{folder}_{uid}"
+    target_dir = _attachment_dir(folder, uid, _load_config(account).get("account_id") or account)
     filepath = _extract_attachment_to_disk(msg, index, target_dir)
     if not filepath:
         return {"error": f"Attachment index {index} not found"}

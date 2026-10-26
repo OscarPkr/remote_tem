@@ -496,7 +496,6 @@ def _create_pdf_text_derivative(db, *, source_doc, content: str, owner: Optional
         "content": clean,
         "version": 1,
         "source_doc_id": getattr(source_doc, "id", None),
-        "exit_code": 0,
     }
 
 
@@ -619,7 +618,6 @@ class CreateDocumentTool:
                 "language": language,
                 "content": content,
                 "version": 1,
-                "exit_code": 0,
             }
         except Exception as e:
             db.rollback()
@@ -710,7 +708,6 @@ class UpdateDocumentTool:
                 "language": doc.language,
                 "content": new_content,
                 "version": new_ver,
-                "exit_code": 0,
             }
         except Exception as e:
             db.rollback()
@@ -866,7 +863,6 @@ class EditDocumentTool:
                         "version": new_ver,
                         "applied": applied,
                         "skipped": skipped,
-                        "exit_code": 0,
                     }
                 return {"error": "No edits applied — FIND text cannot be blank"}
 
@@ -972,7 +968,6 @@ class EditDocumentTool:
                 "version": new_ver,
                 "applied": applied,
                 "skipped": skipped,
-                "exit_code": 0,
             }
             if partial_edits:
                 result.update({
@@ -1064,7 +1059,6 @@ class SuggestDocumentTool:
                 "partial": bool(invalid),
                 "rejected": len(invalid),
                 "invalid_suggestions": invalid,
-                "exit_code": 0,
             }
         finally:
             db.close()
