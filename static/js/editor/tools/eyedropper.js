@@ -1,6 +1,10 @@
 import { state } from '../state.js';
 import { canvasCoords } from '../canvas-coords.js';
 
+// Holding Alt over these tools borrows the eyedropper (Photoshop parity).
+// Clone/Heal are excluded: Alt already sets their clone source.
+export const ALT_EYEDROPPER_TOOLS = new Set(['brush', 'pixel', 'eraser', 'smudge', 'dodge', 'burn', 'gradient', 'bucket']);
+
 function hexByte(value) {
   return Math.max(0, Math.min(255, value)).toString(16).padStart(2, '0');
 }
@@ -60,11 +64,11 @@ export function createEyedropperTool({ activeLayer, composite, syncColor, syncPr
   return {
     preview(e) {
       const result = sample(e);
-      syncPreview?.(result?.color || null, result);
+      syncPreview?.(result?.color || null, result, e);
       return result?.color || null;
     },
     clearPreview() {
-      syncPreview?.(null, null);
+      syncPreview?.(null, null, null);
     },
     pick(e) {
       const result = sample(e, true);
@@ -75,7 +79,7 @@ export function createEyedropperTool({ activeLayer, composite, syncColor, syncPr
       }
       state.color = color;
       syncColor?.(state.color);
-      syncPreview?.(state.color, result);
+      syncPreview?.(state.color, result, e);
     },
   };
 }

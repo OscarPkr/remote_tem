@@ -19,6 +19,12 @@ def test_topbar_has_file_edit_help_menus():
         'data-file-action="import"',
         'data-file-action="save"',
         'data-file-action="save-project"',
+        'data-submenu="file-new"',
+        'data-file-action="new-default"',
+        'data-file-action="new-square"',
+        'data-file-action="new-portrait"',
+        'data-file-action="new-story"',
+        'data-file-action="new-custom"',
         'data-edit-action="undo"',
         'data-edit-action="redo"',
         'data-edit-action="history"',
@@ -54,8 +60,20 @@ def test_extra_menus_wire_file_edit_help():
         "bind('ge-edit-menu-btn', 'ge-edit-menu'",
         "bind('ge-help-menu-btn', 'ge-help-menu'",
         "uiModule",
+        "newDocument?.(1920, 1080)",
+        "promptNewDocument?.()",
     ]:
         assert token in src
+
+
+def test_new_document_is_wired_to_the_editor():
+    src = read("static/js/galleryEditor.js")
+    wire = src[src.index("wireExtraMenus({"):]
+    wire = wire[:wire.index("});")]
+    assert "newDocument: (w, h) => {" in wire
+    assert "openEditor(null, null, { w: Math.round(w), h: Math.round(h) }, 'Untitled');" in wire
+    assert "promptNewDocument: () => _promptCanvasSize({" in wire
+    assert "showPresets: true," in wire
 
 
 def test_topbar_menu_ids_include_file_edit_help():

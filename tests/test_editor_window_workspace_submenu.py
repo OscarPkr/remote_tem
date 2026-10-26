@@ -1,7 +1,7 @@
-"""Window > Workspace submenu: a nested flyout with 4 window setups.
+"""Window > Workspace submenu: a nested flyout with the window setups.
 
-The Window dropdown used to list the 4 workspace presets as flat rows. They are
-now a `.ge-menu-parent` flyout ("Workspace") whose 4 children set up the editor
+The Window dropdown used to list the workspace presets as flat rows. They are
+now a `.ge-menu-parent` flyout ("Workspace") whose children set up the editor
 windows (dock panels + tab + right-panel width). The submenu open/close toggle
 is the shared `wireSubmenuToggles` helper (also used by Image/Filter/Selection).
 """
@@ -23,8 +23,8 @@ SW = (ROOT / "static/sw.js").read_text(encoding="utf-8")
 def test_window_menu_has_a_workspace_flyout_parent():
     assert 'class="dropdown-item-compact ge-menu-parent" data-submenu="window-workspace"' in TOPBAR
     assert '<div class="ge-submenu" data-submenu-panel="window-workspace">' in TOPBAR
-    # the 4 variants still carry their window-action ids
-    for name in ("essentials", "photography", "painting", "graphic"):
+    # the variants still carry their window-action ids
+    for name in ("essentials", "photography", "painting", "graphic", "minimal"):
         assert f'data-window-action="workspace-{name}"' in TOPBAR
 
 
@@ -39,11 +39,22 @@ def test_submenu_toggle_helper_is_shared():
 
 def test_workspaces_set_up_the_windows():
     # every preset declares the panels it shows
-    assert WORKSPACES.count("panels:") == 4
+    assert WORKSPACES.count("panels:") == 5
     assert "setPanelVisible" in WORKSPACES
     assert "PANEL_IDS" in WORKSPACES
+    # the "minimal" preset is just layers + history
+    assert "minimal: Object.freeze({ label: 'Minimal'" in WORKSPACES
+    assert "panels: Object.freeze(['layers', 'history'])" in WORKSPACES
     # composer hands the panel-visibility setter into applyWorkspace
     assert "setPanelVisible: (id, visible) => panelVisibility.setVisible(id, visible)" in GALLERY
+
+
+def test_active_workspace_is_remembered_and_restored_on_open():
+    # the chosen workspace is restored from localStorage when the editor opens
+    assert "localStorage.getItem('ge-active-workspace')" in GALLERY
+    restore = GALLERY[GALLERY.index("Remember the workspace/window layout"):]
+    assert "_applyWorkspace(savedWorkspace" in restore
+    assert "rightPanel: window.innerWidth > 700 ? rightPanel : null" in restore
 
 
 def test_workspace_flyout_releases_the_menu_clip():

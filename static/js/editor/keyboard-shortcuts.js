@@ -101,9 +101,12 @@ export function wireKeyboardShortcuts(deps) {
     if (e.target?.closest?.('#styled-confirm-overlay')) return;
     // Fields and text layers own native editing, including undo and clipboard.
     // Let Delete/Backspace out of non-text widgets (range/checkbox/button) so
-    // they still delete the selected layer.
+    // they still delete the selected layer. Enter still confirms an active
+    // transform even from a transform field, so typing a value then hitting
+    // Enter accepts the transform instead of doing nothing.
     if (isTypingTarget(e.target) &&
-        !(isNonTextInput(e.target) && (e.key === 'Delete' || e.key === 'Backspace'))) return;
+        !(isNonTextInput(e.target) && (e.key === 'Delete' || e.key === 'Backspace')) &&
+        !(state.transformActive && e.key === 'Enter')) return;
     if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.key === 'Backspace') {
       e.preventDefault();
       e.stopPropagation();
@@ -185,6 +188,12 @@ export function wireKeyboardShortcuts(deps) {
         return;
       }
       if (e.shiftKey && e.key === 'T') { e.preventDefault(); e.stopPropagation(); resizeCustomPrompt(); return; }
+      // Ctrl/Cmd+N — new document. The File menu owns the size dialog, so
+      // click its row rather than duplicating the prompt here.
+      if (!e.shiftKey && !e.altKey && e.code === 'KeyN') {
+        const row = document.querySelector('[data-file-action="new-custom"]');
+        if (row) { e.preventDefault(); e.stopPropagation(); row.click(); return; }
+      }
       // Ctrl/Cmd+T — free transform (Photoshop). Ctrl+Shift+T stays the canvas
       // resize prompt and Ctrl+Alt+T remains a legacy alias.
       if (!e.shiftKey && e.code === 'KeyT') { e.preventDefault(); e.stopPropagation(); startTransform(); return; }
@@ -198,12 +207,25 @@ export function wireKeyboardShortcuts(deps) {
         }
         return;
       }
+      // Ctrl+Alt+Shift+E — stamp visible: merge every visible layer into a new
+      // layer on top of the stack while keeping the originals (Photoshop).
+      // Flatten Copy in the layer footer already does exactly that, so click it.
+      if (e.altKey && e.shiftKey && e.code === 'KeyE') {
+        const stamp = document.getElementById('ge-flatten');
+        if (stamp) { e.preventDefault(); e.stopPropagation(); stamp.click(); return; }
+      }
       // Ctrl+Alt+J — new empty layer.
       if (e.altKey && e.code === 'KeyJ') {
         e.preventDefault();
         e.stopPropagation();
         addEmptyLayer();
         return;
+      }
+      // Ctrl+Alt+L — Levels adjustment. The Image menu owns the row and its
+      // dialog, so click it instead of duplicating the adjustment here.
+      if (e.altKey && e.code === 'KeyL') {
+        const row = document.querySelector('[data-image-action="adj-levels"]');
+        if (row) { e.preventDefault(); e.stopPropagation(); row.click(); return; }
       }
       // Ctrl/Cmd+J duplicates the active layer through the layer panel's
       // existing implementation, which preserves masks and effects.
@@ -335,7 +357,20 @@ export function wireKeyboardShortcuts(deps) {
     if (toolId) {
       e.preventDefault();
       e.stopPropagation();
-      const toolBtn = toolbar.querySelector(`[data-tool="${toolId}"]`) || toolbar.querySelector(`[data-tool-option="${toolId}"]`);
+      // A slot can host several tools (gradient + paint bucket, brush + eraser
+      // + pixel). The main key re-activates whatever member the slot is
+      // currently showing, so picking Paint Bucket and then tapping G keeps
+      // Paint Bucket instead of snapping back to the default. A key for a
+      // secondary member (e.g. E for eraser) still picks that exact tool.
+      const flyoutItem = toolbar.querySelector(`[data-tool-option="${toolId}"]`);
+      const slotEl = flyoutItem ? flyoutItem.closest('.ge-tool-slot') : null;
+      let toolBtn = null;
+      if (slotEl) {
+        const firstMember = slotEl.querySelector('.ge-tool-flyout-item[data-tool-option]');
+        const defaultTool = firstMember ? firstMember.dataset.toolOption : null;
+        if (toolId === defaultTool) toolBtn = slotEl.querySelector('.ge-tool-slot-face');
+      }
+      toolBtn = toolBtn || toolbar.querySelector(`[data-tool="${toolId}"]`) || flyoutItem;
       if (toolBtn) toolBtn.click();
       return;
     }

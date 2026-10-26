@@ -81,6 +81,8 @@ def test_selection_tool_menu_has_selection_ops():
     assert "Feather…" in ls
     assert "Expand" in ls
     assert "Contract" in ls
+    assert "Fill Selection" in ls
+    assert "Delete Selection" in ls
 
 
 def test_selection_items_disabled_without_selection():

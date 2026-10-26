@@ -145,12 +145,13 @@ def test_stroke_pipeline_has_pixel_stamping():
     assert "brushPixel: false" in state
 
 
-def test_pixel_brush_shows_a_size_grid():
+def test_pixel_brush_does_not_force_a_grid_overlay():
     guides = (ROOT / "static/js/editor/precision-guides.js").read_text()
-    assert "const pixelBrush = !!state.brushPixel && (state.tool === 'brush' || state.tool === 'eraser');" in guides
-    assert "if (state.gridVisible || pixelBrush) {" in guides
-    assert "Math.max(1, Math.round(Number(state.brushSize) || 1))" in guides
-    assert "const multiplier = pixelBrush ? 1 :" in guides
+    # The Pixel tool must not paint a blue grid over the whole document (it
+    # read as an unwanted blue tint); the grid follows View > Grid only.
+    assert "state.gridVisible || pixelBrush" not in guides
+    assert "122, 208, 255" not in guides
+    assert "if (state.gridVisible) {" in guides
 
 
 def test_pixel_brush_snaps_only_while_shift_is_held():

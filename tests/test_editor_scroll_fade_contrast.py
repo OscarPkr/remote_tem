@@ -30,4 +30,4 @@ def test_scroll_fade_only_applies_to_marked_rails():
     # scoped to the two mobile rails, not every toolbar.
     css = _css()
     assert ".ge-topbar-left.ge-scroll-fade," in css
-    assert ".ge-toolbar.ge-scroll-fade {" in css
+    assert ".ge-toolbar-scroll.ge-scroll-fade {" in css

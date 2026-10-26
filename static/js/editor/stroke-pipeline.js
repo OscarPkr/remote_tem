@@ -3,7 +3,7 @@ import { state } from './state.js';
 import { createBrushSampler, pressureValue } from './brush-engine.js';
 import { isLayerTransparencyLocked } from './layer-groups.js';
 
-const PAINT_TOOLS = new Set(['brush', 'eraser', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'inpaint']);
+const PAINT_TOOLS = new Set(['brush', 'pixel', 'eraser', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'inpaint']);
 
 function toolSettings(tool) {
   if (tool === 'eraser') return { opacity: state.eraserOpacity, flow: state.eraserFlow, softness: state.eraserSoftness };
@@ -295,11 +295,26 @@ export function createStrokePipeline({ activeLayer, getActiveMaskLayer, composit
       color = 'rgba(255,255,255,1)';
       alpha = 1;
       softness = 0;
-    } else if (tool === 'dodge') { operation = 'screen'; color = 'rgba(255,255,255,1)'; }
-    else if (tool === 'burn') { operation = 'multiply'; color = 'rgba(0,0,0,1)'; }
+    } else if (tool === 'dodge') {
+      // Lighten the pixels already there rather than stamping flat white.
+      // Intensity scales the per-dab strength so a stroke can be gentle or
+      // punchy; the cap keeps it building up gradually like Photoshop.
+      const intensity = Number.isFinite(state.dodgeBurnIntensity) ? state.dodgeBurnIntensity / 100 : 0.25;
+      operation = 'screen';
+      color = 'rgba(255,255,255,1)';
+      alpha = Math.max(0.004, Math.min(0.6, alpha * intensity * 0.5));
+    } else if (tool === 'burn') {
+      // Darken the pixels already there rather than stamping flat black.
+      const intensity = Number.isFinite(state.dodgeBurnIntensity) ? state.dodgeBurnIntensity / 100 : 0.25;
+      operation = 'multiply';
+      color = 'rgba(0,0,0,1)';
+      alpha = Math.max(0.004, Math.min(0.6, alpha * intensity * 0.5));
+    }
     else if (target.paintingMask) { color = 'rgba(255,255,255,1)'; alpha = 1; softness = 0; }
     else operation = isLayerTransparencyLocked(state, layer) ? 'source-atop' : state.brushBlendMode;
-    if (state.brushPixel && (tool === 'brush' || tool === 'eraser') && !target.paintingMask) {
+    // The Pixel tool always stamps hard squares; the bundle flag makes a
+    // regular Brush/Eraser do the same when the (legacy) pixel preset is on.
+    if ((tool === 'pixel' || (state.brushPixel && (tool === 'brush' || tool === 'eraser'))) && !target.paintingMask) {
       // Square pixel brush: hard integer-aligned dabs at the chosen size.
       // Freehand by default; hold Shift to constrain the stroke to the
       // nearest of 8 directions (a straight line anchored at the stroke

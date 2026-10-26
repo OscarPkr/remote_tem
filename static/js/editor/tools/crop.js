@@ -12,6 +12,8 @@
  * @param {{
  *   composite: () => void,
  *   showCropApply: () => void,
+ *   syncCropFrame?: () => void,
+ *   snapFrame?: (frame: object, center: object) => object,
  * }} deps
  */
 import { state } from '../state.js';
@@ -19,7 +21,7 @@ import { canvasCoords } from '../canvas-coords.js';
 import { drawCheckerboard } from '../checkerboard.js';
 import { createDirectManipulationSession } from '../direct-manipulation-session.js';
 
-export function createCropTool({ composite, showCropApply, snapFrame }) {
+export function createCropTool({ composite, showCropApply, snapFrame, syncCropFrame }) {
   const gesture = createDirectManipulationSession({
     name: 'crop',
     getContext: () => ({ canvas: state.mainCanvas, tool: state.tool }),
@@ -96,22 +98,26 @@ export function createCropTool({ composite, showCropApply, snapFrame }) {
         } else {
           state.activeSnapGuides = null;
         }
-        // Clamp to canvas bounds so the rect stays fully visible.
-        nx = Math.max(0, Math.min(nx, state.mainCanvas.width - state.cropRect.w));
-        ny = Math.max(0, Math.min(ny, state.mainCanvas.height - state.cropRect.h));
+        // Allow the rect to be dragged beyond the image edge as well (that
+        // expands the canvas on Apply). Only guard against absurd coords.
+        const MAX = 20000;
+        nx = Math.max(-MAX, Math.min(nx, MAX));
+        ny = Math.max(-MAX, Math.min(ny, MAX));
         state.cropRect = { ...state.cropRect, x: nx, y: ny };
         composite();
+        syncCropFrame?.();
         return;
       }
       if (!state.cropping) return;
       e.preventDefault();
-      // Clamp the dragged corner to the document so a pointer that
-      // overshoots onto a panel (or past the canvas edge) still yields a
-      // rect inside the image rather than negative/off-canvas coords.
+      // The dragged corner may go OUTSIDE the image: a rect that reaches
+      // past an edge expands the canvas there (transparent fill) on Apply.
+      // Only clamp against absurd coordinates (pointer flung off-screen).
       const end = canvasCoords(e, state.mainCanvas);
+      const MAX = 20000;
       state.cropEnd = {
-        x: Math.max(0, Math.min(state.mainCanvas.width, end.x)),
-        y: Math.max(0, Math.min(state.mainCanvas.height, end.y)),
+        x: Math.max(-MAX, Math.min(MAX, end.x)),
+        y: Math.max(-MAX, Math.min(MAX, end.y)),
       };
       // Aspect lock. Shift-held snapshots the current aspect on first press
       // and stays locked until released. Otherwise a chosen crop preset
@@ -187,6 +193,7 @@ export function createCropTool({ composite, showCropApply, snapFrame }) {
       state.mainCtx.strokeRect(x, y, w, h);
       state.mainCtx.setLineDash([]);
       state.cropRect = { x, y, w, h };
+      syncCropFrame?.();
     },
 
     end(e) {

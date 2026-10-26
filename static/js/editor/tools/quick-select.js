@@ -3,6 +3,7 @@
 // stroke; intermediate samples skip the undo snapshot (retune mode) so a
 // whole drag collapses to one history entry (taken on begin).
 
+import { state } from '../state.js';
 import { selectionModeForEvent } from '../selection-modifiers.js';
 
 export function createQuickSelectTool({
@@ -16,13 +17,16 @@ export function createQuickSelectTool({
 }) {
   let painting = false;
   let last = null;
+  let strokeMode = 'replace';
 
-  const modeFor = (event) => selectionModeForEvent(event, 'add');
+  // Honour the New / Add / Subtract mode toggle (the wand's segmented
+  // control); Shift/Alt still override for the duration of the dab.
+  const modeFor = (event) => selectionModeForEvent(event, state.wandMode || 'replace');
 
-  const sample = (event) => {
+  const sample = (event, mode) => {
     const coords = canvasCoords(event);
     if (!coords) return;
-    runMagicWand(coords.x, coords.y, modeFor(event), { retune: true });
+    runMagicWand(coords.x, coords.y, mode || modeFor(event), { retune: true });
   };
 
   const begin = (event) => {
@@ -31,7 +35,8 @@ export function createQuickSelectTool({
     saveState();
     painting = true;
     last = null;
-    sample(event);
+    strokeMode = modeFor(event);
+    sample(event, strokeMode);
     const coords = canvasCoords(event);
     if (coords) last = coords;
   };
@@ -42,7 +47,9 @@ export function createQuickSelectTool({
     if (!coords) return;
     const gap = Math.max(3, (brushSize?.() || 24) / 4);
     if (last && Math.hypot(coords.x - last.x, coords.y - last.y) < gap) return;
-    sample(event);
+    // Once the stroke has replaced the old selection, later dabs must
+    // accumulate onto it instead of wiping the stroke's progress.
+    sample(event, strokeMode === 'replace' ? 'add' : selectionModeForEvent(event, strokeMode));
     last = coords;
   };
 

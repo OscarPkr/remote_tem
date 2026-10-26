@@ -127,9 +127,27 @@ export function createBucketTool({ activeLayer, saveState, composite, renderLaye
     return count;
   }
 
+  // The active layer can be an adjustment layer (no raster canvas) or a
+  // hidden/locked one; in that case fall back to the topmost visible raster
+  // layer so a click still fills something instead of silently doing nothing.
+  function paintableLayer() {
+    const direct = activeLayer();
+    if (direct?.canvas && direct.ctx && direct.kind !== 'adjustment') return direct;
+    for (let i = state.layers.length - 1; i >= 0; i--) {
+      const l = state.layers[i];
+      if (l?.canvas && l.ctx && l.kind !== 'adjustment' && l.visible !== false) return l;
+    }
+    return null;
+  }
+
   function fill(e) {
-    const layer = activeLayer();
-    if (!layer?.canvas || !layer.ctx) return 0;
+    const layer = paintableLayer();
+    if (!layer) { showToast?.('Select a pixel layer to fill'); return 0; }
+    if (state.activeLayerId !== layer.id) {
+      state.activeLayerId = layer.id;
+      state.selectedLayerIds = [layer.id];
+      renderLayerPanel?.();
+    }
     const point = canvasCoords(e, state.mainCanvas);
     const off = state.layerOffsets.get(layer.id) || { x: 0, y: 0 };
     const count = fillAtPoint(layer, point.x - off.x, point.y - off.y);

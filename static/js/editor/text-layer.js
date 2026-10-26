@@ -35,6 +35,7 @@ export const WARP_STYLES = Object.freeze([
    system extras but are filtered out at runtime when unavailable. */
 export const EDITOR_TEXT_FONTS = Object.freeze([
   'Inter', 'Roboto', 'Playfair Display', 'Lobster', 'Bebas Neue', 'Roboto Mono',
+  'Space Grotesk', 'Fraunces', 'Syne', 'Bungee', 'Instrument Serif',
   'Georgia', 'Courier New',
 ]);
 
@@ -42,9 +43,9 @@ export const EDITOR_TEXT_FONTS = Object.freeze([
    re-render can pick up faces that were not yet loaded on first paint. */
 export function loadEditorFonts() {
   if (typeof document === 'undefined' || !document.fonts || !document.fonts.load) return Promise.resolve([]);
-  return Promise.all(EDITOR_TEXT_FONTS.map((family) => {
-    try { return document.fonts.load(`400 48px "${family}"`).catch(() => []); } catch (_) { return Promise.resolve([]); }
-  })).catch(() => []);
+  return Promise.all(EDITOR_TEXT_FONTS.flatMap((family) => ['400', '700'].map((weight) => {
+    try { return document.fonts.load(`${weight} 48px "${family}"`).catch(() => []); } catch (_) { return Promise.resolve([]); }
+  }))).catch(() => []);
 }
 
 /* Only offer families the browser can actually render distinctly. */

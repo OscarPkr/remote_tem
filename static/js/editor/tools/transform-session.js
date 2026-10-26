@@ -169,6 +169,7 @@ export function createTransformSession({
     state.transformPendingSkewY = 0;
     state.transformPendingPerspX = 0;
     state.transformPendingPerspY = 0;
+    state.transformPendingDistort = null;
     // Snapshot the layer so live preview can re-derive from the
     // original pixels on every keystroke instead of stacking
     // destructive edits.
@@ -239,7 +240,10 @@ export function createTransformSession({
       mobileBoundsHandler = null;
     }
     if (state.transformPopup) {
-      try { state.transformPopup.remove(); } catch {}
+      try {
+        state.transformPopup.innerHTML = '';
+        state.transformPopup.style.display = 'none';
+      } catch {}
       state.transformPopup = null;
     }
   }
@@ -277,15 +281,16 @@ export function createTransformSession({
     // signal than those transient messages, so clear them first.
     document.querySelector('.tour-hint .tour-hint-dismiss')?.click();
     document.querySelector('#toast.show .toast-close-btn')?.click();
-    const pop = document.createElement('div');
-    pop.className = 'ge-transform-popup';
-    pop.innerHTML = transformPopupHTML();
+    // The transform controls live inline in the editor options strip (header
+    // bar) instead of a floating popup over the canvas.
+    const pop = document.getElementById('ge-transform-section');
+    if (!pop) return;
+    pop.innerHTML = `<div class="ge-transform-popup">${transformPopupHTML()}</div>`;
     const title = pop.querySelector('.ge-adj-title');
     if (title && state.transformTarget === 'selection') title.textContent = 'Transform Selection';
     else if (title && state.transformLayers.length > 1) title.textContent = `Transform ${state.transformLayers.length} layers`;
-    state.container.appendChild(pop);
+    pop.style.display = '';
     state.transformPopup = pop;
-    wireTransformDrag(pop);
     const wInput = pop.querySelector('#ge-transform-w');
     const hInput = pop.querySelector('#ge-transform-h');
     const rotInput = pop.querySelector('#ge-transform-rot');
@@ -438,9 +443,6 @@ export function createTransformSession({
       });
     });
     attachSpinRepeat(pop);
-    applyMobileTransformBounds(pop);
-    mobileBoundsHandler = () => applyMobileTransformBounds(pop);
-    window.addEventListener('resize', mobileBoundsHandler);
   }
 
   // Header-drag for the Transform popup. Default position: over the
@@ -551,6 +553,19 @@ export function createTransformSession({
     ctx.save();
     ctx.translate(canvas.width / 2, canvas.height / 2);
     if (geometry.rotation) ctx.rotate(geometry.radians);
+    if (geometry.distort && geometry.quad) {
+      // Free distort: map the quad into the output bounds and warp.
+      const { points, minX, minY, quadW, quadH } = geometry.quad;
+      const normalized = points.map(point => ({
+        x: (point.x - minX) / quadW,
+        y: (point.y - minY) / quadH,
+      }));
+      const warped = perspectiveWarpCanvas(source, normalized, canvas.width, canvas.height);
+      ctx.scale(Math.sign(geometry.signedScaleX) || 1, Math.sign(geometry.signedScaleY) || 1);
+      ctx.drawImage(warped, -warped.width / 2, -warped.height / 2);
+      ctx.restore();
+      return canvas;
+    }
     if (isPerspectiveActive(geometry.perspectiveX, geometry.perspectiveY)) {
       const warped = perspectiveWarpCanvas(source, keystoneCorners(geometry.perspectiveX, geometry.perspectiveY), canvas.width, canvas.height);
       ctx.scale(Math.sign(geometry.signedScaleX) || 1, Math.sign(geometry.signedScaleY) || 1);
@@ -576,6 +591,7 @@ export function createTransformSession({
       skewY: state.transformPendingSkewY,
       perspectiveX: state.transformPendingPerspX,
       perspectiveY: state.transformPendingPerspY,
+      distort: state.transformPendingDistort,
       centerX: state.transformCenter?.x,
       centerY: state.transformCenter?.y,
     };
@@ -592,6 +608,7 @@ export function createTransformSession({
     state.transformPendingSkewY = target.skewY || 0;
     state.transformPendingPerspX = target.perspectiveX || 0;
     state.transformPendingPerspY = target.perspectiveY || 0;
+    state.transformPendingDistort = target.distort || null;
     state.transformCenter = { x: target.centerX, y: target.centerY };
   }
 
@@ -654,7 +671,12 @@ export function createTransformSession({
     for (const { snapshot, geometry: plannedGeometry } of plan.items) {
       const layer = snapshot.layer;
       let geometry = plannedGeometry;
-      if (snapshot.placed && (snapshot.wasPlaced || state.transformPreserveSource !== false)) {
+      // A free-distort quad is a non-affine warp that placed-layer data cannot
+      // express, so bake it into the raster instead of the placed source.
+      const usePlaced = snapshot.placed
+        && (snapshot.wasPlaced || state.transformPreserveSource !== false)
+        && !plannedGeometry.distort;
+      if (usePlaced) {
         layer.placed = transformPlacedData(snapshot.placed, documentTransform);
         const rendered = renderPlacedLayer(layer);
         geometry = {
@@ -664,7 +686,7 @@ export function createTransformSession({
           offset: rendered.offset,
         };
       } else {
-        if (snapshot.kind === 'raster') {
+        if (snapshot.kind === 'raster' || plannedGeometry.distort) {
           layer.kind = 'raster';
           layer.placed = null;
         }
@@ -791,6 +813,7 @@ export function createTransformSession({
     state.transformPendingSkewY = 0;
     state.transformPendingPerspX = 0;
     state.transformPendingPerspY = 0;
+    state.transformPendingDistort = null;
     state.transformActive = false;
     state.transformTarget = null;
     state.transformLayer = null;

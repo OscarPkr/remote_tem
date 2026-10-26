@@ -54,6 +54,10 @@ export const state = {
   transformPendingSkewY: 0,
   transformPendingPerspX: 0,
   transformPendingPerspY: 0,
+  // Free distort (Ctrl/Cmd+drag a handle): per-corner offsets in frame-normal
+  // units (each component is a fraction of the frame width/height; ±0.5 is
+  // the frame half-size). null when no handle has been distorted.
+  transformPendingDistort: null,
   transformAspectLock: true,
   // Keep raster transforms source-backed unless the user explicitly opts out
   // in the Transform popup.
@@ -108,6 +112,11 @@ export const state = {
   brushFlow: 100,
   brushSoftness: 100,
   smudgeStrength: 65,
+  dodgeBurnIntensity: 25,
+  // Liquify warp brush — mode plus the dab radius (image px) and strength.
+  liquifyMode: 'push',
+  liquifySize: 120,
+  liquifyStrength: 50,
   eraserOpacity: 100,
   eraserFlow: 100,
   eraserSoftness: 100,

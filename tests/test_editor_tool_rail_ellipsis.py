@@ -1,7 +1,7 @@
-"""Marker test: the mobile tool-rail overflow control shows an ellipsis.
+"""Marker test: the mobile tool-rail overflow control shows a '>' chevron.
 
-EVAL flagged the '<' '>' chevron; it should match the dock overflow control
-(an ellipsis '...').
+Superseded 2026-10-14: the maintainer asked for a '>' chevron instead of the
+ellipsis, so it clearly reads as "more tools" rather than a menu.
 """
 
 from pathlib import Path
@@ -12,9 +12,9 @@ EDITOR = (ROOT / "static/js/galleryEditor.js").read_text()
 SW = (ROOT / "static/sw.js").read_text()
 
 
-def test_tool_rail_more_is_an_ellipsis():
-    assert "toolbarMore.textContent = '\\u2026';" in EDITOR
-    assert "toolbarMore.textContent = '\\u203A';" not in EDITOR
+def test_tool_rail_more_is_a_chevron():
+    assert "toolbarMore.textContent = '\\u203A';" in EDITOR
+    assert "toolbarMore.textContent = '\\u2026';" not in EDITOR
 
 
 def test_sw_version_is_current():

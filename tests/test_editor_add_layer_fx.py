@@ -26,6 +26,15 @@ def test_plus_button_adds_a_pixel_layer_directly():
     assert "Pixel Layer" not in AI_MISC
 
 
+def test_new_layer_is_inserted_above_the_selected_layer():
+    block = AI_MISC[AI_MISC.index("function addEmptyLayer()"):AI_MISC.index("const buildFxMenu")]
+    assert "const activeIndex = state.layers.findIndex(item => item.id === state.activeLayerId);" in block
+    assert "const insertIndex = activeIndex >= 0 ? activeIndex + 1 : state.layers.length;" in block
+    assert "state.layers.splice(insertIndex, 0, layer);" in block
+    # it must not jump to the very top of the stack
+    assert "state.layers.push(layer);" not in block
+
+
 def test_fx_button_opens_the_adjustment_menu():
     assert "const buildFxMenu = (anchor) => {" in AI_MISC
     assert "const addFxButton = document.getElementById('ge-add-fx');" in AI_MISC

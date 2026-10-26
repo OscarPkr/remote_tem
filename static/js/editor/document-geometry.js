@@ -198,10 +198,17 @@ function normalizeCropRect(editorState, rect) {
   // Accept either {w,h} (internal) or {width,height} (control-op params).
   const rawW = Number.isFinite(rect.w) ? rect.w : rect.width;
   const rawH = Number.isFinite(rect.h) ? rect.h : rect.height;
-  const x = Math.max(0, Math.min(editorState.imgWidth - 1, Math.round(rect.x)));
-  const y = Math.max(0, Math.min(editorState.imgHeight - 1, Math.round(rect.y)));
-  const width = Math.max(1, Math.min(editorState.imgWidth - x, Math.round(Number.isFinite(rawW) ? rawW : editorState.imgWidth)));
-  const height = Math.max(1, Math.min(editorState.imgHeight - y, Math.round(Number.isFinite(rawH) ? rawH : editorState.imgHeight)));
+  // The rect may reach BEYOND the current image on any side: a crop that
+  // overshoots an edge EXPANDS the canvas there (the new region is
+  // transparent) instead of being clamped back inside. renderWindow() already
+  // places the source at (-x,-y) in an output of any size, so allowing
+  // negative x/y and out-of-bounds width/height is all that is needed.
+  // Only guard against absurd values.
+  const MAX = 20000;
+  const x = Math.max(-MAX, Math.min(MAX, Math.round(rect.x)));
+  const y = Math.max(-MAX, Math.min(MAX, Math.round(rect.y)));
+  const width = Math.max(1, Math.min(MAX, Math.round(Number.isFinite(rawW) ? rawW : editorState.imgWidth)));
+  const height = Math.max(1, Math.min(MAX, Math.round(Number.isFinite(rawH) ? rawH : editorState.imgHeight)));
   return { x, y, width, height };
 }
 

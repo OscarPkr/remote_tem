@@ -10,19 +10,22 @@ async function canvasPoint(page, xRatio, yRatio) {
 test('brush presets and shared stroke controls remain reusable', async ({ page }) => {
   await openBlankEditor(page);
   await selectTool(page, 'brush');
+  // Spacing / Smoothing / Blend and the pen-pressure toggles now live behind
+  // the brush caret ("v") in the options strip instead of the retired "...".
+  await page.locator('#ge-brush-more').click();
   await expect(page.locator('#ge-brush-spacing')).toBeVisible();
   await page.locator('#ge-brush-spacing').fill('28');
   await page.locator('#ge-brush-smoothing').fill('52');
   await page.locator('#ge-brush-blend').selectOption('multiply');
-  // The pen-pressure and preset rows live behind the options-bar overflow ('...').
-  await page.locator('#ge-options-more').click();
-  await page.locator('.ge-pressure-option').filter({ hasText: 'Opacity' }).locator('.toggle-slider').click();
-  await expect(page.locator('#ge-pressure-opacity')).toBeChecked();
+  await page.locator('.ge-pressure-option').filter({ hasText: 'Flow' }).locator('.toggle-slider').click();
+  await expect(page.locator('#ge-pressure-flow')).not.toBeChecked();
+  await page.keyboard.press('Escape');
 
   page.once('dialog', dialog => dialog.accept('My Detail Brush'));
   await page.locator('#ge-brush-preset-save').click();
   await expect(page.locator('#ge-brush-preset option', { hasText: 'My Detail Brush' })).toHaveCount(1);
 
+  await page.locator('#ge-brush-more').click();
   await page.locator('#ge-brush-spacing').fill('5');
   await page.locator('#ge-brush-preset').selectOption({ label: 'My Detail Brush' });
   await expect(page.locator('#ge-brush-spacing')).toHaveValue('28');
@@ -36,8 +39,10 @@ test('long sampled strokes stay responsive and undo atomically', async ({ page }
   await openBlankEditor(page);
   await selectTool(page, 'brush');
   await page.locator('.ge-size-slider').fill('700');
+  await page.locator('#ge-brush-more').click();
   await page.locator('#ge-brush-spacing').fill('8');
   await page.locator('#ge-brush-smoothing').fill('65');
+  await page.keyboard.press('Escape');
   const activeLayerId = (await editorState(page)).activeLayerId;
   const thumb = page.locator(`.ge-layer-item[data-layer-id="${activeLayerId}"] .ge-layer-inline-thumb`);
   const thumbBefore = await thumb.evaluate(canvas => canvas.toDataURL());

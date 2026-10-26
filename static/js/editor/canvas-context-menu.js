@@ -93,6 +93,12 @@ export function buildCanvasMenuItems(tool) {
       { label: 'Expand', disabled: !sel, onSelect: () => invoke('selection.expand', { amount: 4 }) },
       { label: 'Contract', disabled: !sel, onSelect: () => invoke('selection.contract', { amount: 4 }) },
     );
+    if (sel) {
+      push(
+        { label: 'Fill Selection', onSelect: () => invoke('selection.fill', { color: state.color }) },
+        { label: 'Delete Selection', hint: 'Del', onSelect: () => invoke('selection.delete') },
+      );
+    }
     sep();
   } else if (tool === 'crop' || state.cropRect) {
     const cropping = !!(state.cropRect || state.cropping || state.cropMoving);

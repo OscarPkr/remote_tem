@@ -19,6 +19,16 @@ export function buildTopbar() {
           <span class="ge-stacked-label">File</span>
         </button>
         <div class="ge-file-menu dropdown" id="ge-file-menu" hidden>
+          <div class="ge-menu-label">New</div>
+          <button type="button" class="dropdown-item-compact ge-menu-parent" data-submenu="file-new" aria-haspopup="true" aria-expanded="false"><span>New Image</span><span class="ge-submenu-caret">›</span></button>
+          <div class="ge-submenu" data-submenu-panel="file-new">
+            <button class="dropdown-item-compact" data-file-action="new-default"><span>Default</span><span class="dropdown-shortcut">1920 × 1080</span></button>
+            <button class="dropdown-item-compact" data-file-action="new-square"><span>Square</span><span class="dropdown-shortcut">1080 × 1080</span></button>
+            <button class="dropdown-item-compact" data-file-action="new-portrait"><span>Portrait</span><span class="dropdown-shortcut">1080 × 1350</span></button>
+            <button class="dropdown-item-compact" data-file-action="new-story"><span>Story</span><span class="dropdown-shortcut">1080 × 1920</span></button>
+            <button class="dropdown-item-compact" data-file-action="new-clipboard"><span>From Clipboard</span></button>
+            <button class="dropdown-item-compact" data-file-action="new-custom"><span>Custom Size…</span><span class="dropdown-shortcut">Ctrl+N</span></button>
+          </div>
           <div class="ge-menu-label">Open</div>
           <button class="dropdown-item-compact" data-file-action="import"><span>Import Image…</span></button>
           <button class="dropdown-item-compact" data-file-action="load-project"><span>Load Project…</span></button>
@@ -464,7 +474,19 @@ export function buildTopbar() {
           <span class="ge-stacked-label">Window</span>
         </button>
         <div class="ge-window-menu dropdown" id="ge-window-menu" hidden>
+          <button type="button" class="dropdown-item-compact ge-menu-parent" data-submenu="window-workspace" aria-haspopup="true" aria-expanded="false"><span>Workspace</span><span class="ge-submenu-caret">›</span></button>
+          <div class="ge-submenu" data-submenu-panel="window-workspace">
+            <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="workspace-essentials"><span class="dropdown-icon ge-window-check">●</span><span>Essentials</span></button>
+            <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="workspace-photography"><span class="dropdown-icon ge-window-check">●</span><span>Photography</span></button>
+            <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="workspace-painting"><span class="dropdown-icon ge-window-check">●</span><span>Painting</span></button>
+            <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="workspace-graphic"><span class="dropdown-icon ge-window-check">●</span><span>Graphic &amp; Web</span></button>
+            <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="workspace-minimal"><span class="dropdown-icon ge-window-check">●</span><span>Minimal</span></button>
+            <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="workspace-custom"><span class="dropdown-icon ge-window-check">●</span><span>Custom</span></button>
+            <div class="ge-submenu-sep"></div>
+            <button type="button" class="dropdown-item-compact ge-window-save" data-window-action="workspace-save"><span class="dropdown-icon">＋</span><span>Save Current</span></button>
+          </div>
           <div class="ge-menu-label">Panels</div>
+          <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="quick-edit"><span class="dropdown-icon ge-window-check">●</span><span>Quick Edit</span></button>
           <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="options"><span class="dropdown-icon ge-window-check">●</span><span>Tool Options</span></button>
           <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="layers"><span class="dropdown-icon ge-window-check">●</span><span>Layers</span></button>
           <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="properties"><span class="dropdown-icon ge-window-check">●</span><span>Properties</span></button>
@@ -480,13 +502,6 @@ export function buildTopbar() {
           <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="navigator"><span class="dropdown-icon ge-window-check">●</span><span>Navigator</span></button>
           <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="history"><span class="dropdown-icon ge-window-check">●</span><span>History</span></button>
           <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="actions"><span class="dropdown-icon ge-window-check">●</span><span>Actions</span></button>
-          <button type="button" class="dropdown-item-compact ge-menu-parent" data-submenu="window-workspace" aria-haspopup="true" aria-expanded="false"><span>Workspace</span><span class="ge-submenu-caret">›</span></button>
-          <div class="ge-submenu" data-submenu-panel="window-workspace">
-            <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="workspace-essentials"><span class="dropdown-icon ge-window-check">●</span><span>Essentials</span></button>
-            <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="workspace-photography"><span class="dropdown-icon ge-window-check">●</span><span>Photography</span></button>
-            <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="workspace-painting"><span class="dropdown-icon ge-window-check">●</span><span>Painting</span></button>
-            <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="workspace-graphic"><span class="dropdown-icon ge-window-check">●</span><span>Graphic &amp; Web</span></button>
-          </div>
           <div class="ge-menu-label">Help</div>
           <button class="dropdown-item-compact ge-window-toggle" role="menuitemcheckbox" aria-checked="false" data-window-action="shortcuts"><span class="dropdown-icon ge-window-check">●</span><span>Keyboard Shortcuts</span></button>
         </div>
@@ -509,7 +524,7 @@ export function buildTopbar() {
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="position:relative;top:2px;"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M6 10h.01M10 10h.01M14 10h.01M18 10h.01M7 14h10"/></svg>
       </button>
       <button class="ge-btn ge-btn-sm" id="ge-maximize-toggle" title="Maximize editor" aria-label="Maximize editor" aria-pressed="false">
-        <svg class="ge-max-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="position:relative;top:2px;"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
+        <svg class="ge-max-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>
       </button>
       <button class="ge-btn ge-btn-sm ge-stacked-btn" id="ge-import-topbar" title="Import image as layer">
         <span class="ge-stacked-glyph"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12"/><polyline points="7 8 12 3 17 8"/><path d="M5 14v5h14v-5"/></svg></span>

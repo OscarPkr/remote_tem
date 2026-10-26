@@ -99,6 +99,7 @@ export function createColorPanels({
   zoomIn = null,
   zoomOut = null,
   zoomFit = null,
+  applyGradient = null,
 } = {}) {
   if (!state) throw new Error('createColorPanels requires editor state');
 
@@ -119,10 +120,24 @@ export function createColorPanels({
   const swatchCol = el('div', 'ge-swatch-col');
   const suggestRow = el('div', 'ge-swatch-row ge-swatch-suggest');
   const recentRow = el('div', 'ge-swatch-row ge-swatch-recent');
+  const favRow = el('div', 'ge-swatch-row ge-swatch-fav');
   const sugLabel = el('div', 'ge-swatch-row-label'); sugLabel.textContent = 'Suggestions';
   const recLabel = el('div', 'ge-swatch-row-label'); recLabel.textContent = 'Recent';
-  swatchCol.append(sugLabel, suggestRow, recLabel, recentRow);
+  const favLabel = el('div', 'ge-swatch-row-label'); favLabel.textContent = 'Favorites';
+  swatchCol.append(sugLabel, suggestRow, recLabel, recentRow, favLabel, favRow);
   swatchBody.appendChild(swatchCol);
+  const FAV_KEY = 'ge-color-favorites';
+  const getFavoriteColors = () => {
+    try {
+      const v = JSON.parse(localStorage.getItem(FAV_KEY) || '[]');
+      return Array.isArray(v) ? v.filter((h) => /^#[0-9a-f]{6}$/i.test(h)) : [];
+    } catch { return []; }
+  };
+  const setFavoriteColors = (list) => {
+    try { localStorage.setItem(FAV_KEY, JSON.stringify(list.slice(0, 24))); } catch { /* storage unavailable */ }
+  };
+  const isFavorite = (hex) => getFavoriteColors().some((h) => h.toLowerCase() === String(hex || '').toLowerCase());
+  let hexFav = null;
   const _syncForeground = (hex) => {
     setColor(hex);
     // Mirror the pick into the rail's foreground swatch so the whole editor
@@ -141,6 +156,11 @@ export function createColorPanels({
     recentRow.innerHTML = recs.length
       ? recs.map(h => `<button type="button" class="ge-mini-swatch" title="${h}" data-hex="${h}" style="background:${h}"></button>`).join('')
       : '<span class="ge-mini-empty">none yet</span>';
+    const favs = getFavoriteColors();
+    favRow.innerHTML = favs.length
+      ? favs.map(h => `<button type="button" class="ge-mini-swatch" title="${h}" data-hex="${h}" style="background:${h}"></button>`).join('')
+      : '<span class="ge-mini-empty">star a colour to save it</span>';
+    if (typeof hexFav !== 'undefined' && hexFav) hexFav.classList.toggle('active', isFavorite(cur));
   };
 
   // Inline picker: an always-visible SV square + hue strip so the panel reads
@@ -163,7 +183,46 @@ export function createColorPanels({
   hexInput.autocomplete = 'off';
   hexInput.setAttribute('aria-label', 'Hex colour code');
   hexInput.value = String(state.color || '#000000').replace(/^#/, '');
-  hexRow.append(hexHash, hexInput);
+  const hexCopy = el('button', 'ge-hex-copy');
+  hexCopy.type = 'button';
+  hexCopy.title = 'Copy hex colour';
+  hexCopy.setAttribute('aria-label', 'Copy hex colour');
+  hexCopy.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h9"/></svg>';
+  hexCopy.addEventListener('click', async () => {
+    const hex = '#' + String(hexInput.value || state.color || '').replace(/^#/, '');
+    try {
+      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(hex);
+      else throw new Error('clipboard unavailable');
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = hex;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); } catch { /* ignore */ }
+      ta.remove();
+    }
+    hexCopy.classList.add('copied');
+    clearTimeout(hexCopy._copiedTimer);
+    hexCopy._copiedTimer = setTimeout(() => hexCopy.classList.remove('copied'), 900);
+  });
+  hexFav = el('button', 'ge-hex-copy ge-hex-fav');
+  hexFav.type = 'button';
+  hexFav.title = 'Save to favorites';
+  hexFav.setAttribute('aria-label', 'Save colour to favorites');
+  hexFav.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5l2.6 5.3 5.9.86-4.25 4.14 1 5.86L12 17l-5.25 2.72 1-5.86L3.5 9.66l5.9-.86z"/></svg>';
+  hexFav.addEventListener('click', () => {
+    const hex = '#' + String(hexInput.value || state.color || '').replace(/^#/, '');
+    const h = hex.toLowerCase();
+    if (!/^#[0-9a-f]{6}$/.test(h)) return;
+    const list = getFavoriteColors().map((x) => x.toLowerCase());
+    const i = list.indexOf(h);
+    if (i >= 0) list.splice(i, 1); else list.unshift(h);
+    setFavoriteColors(list);
+    renderInlineSwatches();
+  });
+  hexRow.append(hexHash, hexInput, hexCopy, hexFav);
   swatchBody.appendChild(hexRow);
   const _setHex = (hex) => {
     if (hexInput && document.activeElement !== hexInput) hexInput.value = String(hex || '').replace(/^#/, '');
@@ -262,6 +321,10 @@ export function createColorPanels({
     btn.title = name;
     btn.style.background = css;
     btn.addEventListener('click', () => {
+      // Pick up the gradient tool first (so the colors land in its controls),
+      // then load the preset's stops and paint it across the layer — clicking a
+      // preset should actually apply the gradient, not just stage the colors.
+      document.querySelector('[data-tool="gradient"]')?.click();
       const start = document.getElementById('ge-gradient-start');
       const end = document.getElementById('ge-gradient-end');
       const type = document.getElementById('ge-gradient-type');
@@ -270,9 +333,10 @@ export function createColorPanels({
         end.value = stops[stops.length - 1];
         start.dispatchEvent(new Event('input', { bubbles: true }));
         end.dispatchEvent(new Event('input', { bubbles: true }));
-        if (type) { type.value = 'linear'; type.dispatchEvent(new Event('change', { bubbles: true })); }
+        if (type) { type.value = 'linear-gradient'; type.dispatchEvent(new Event('change', { bubbles: true })); }
         requestRender();
       }
+      applyGradient?.();
     });
     gradientGrid.appendChild(btn);
   });
@@ -321,8 +385,27 @@ export function createColorPanels({
   const histBody = el('div', 'ge-histogram-body');
   histBody.appendChild(histCanvas);
   const histogram = panel('histogram', '', histBody);
+  // Pick a layer that actually has raster pixels. The active layer can be a
+  // group/adjustment/text layer without a `canvas`, which used to make
+  // drawHistogram throw (and the panel stay blank); fall back to the topmost
+  // visible raster layer.
+  const histogramLayer = () => {
+    const layers = Array.isArray(state?.layers) ? state.layers : [];
+    const active = layers.find((l) => l.id === state.activeLayerId);
+    if (active && active.canvas && active.visible !== false) return active;
+    for (let i = layers.length - 1; i >= 0; i--) {
+      const l = layers[i];
+      if (l.canvas && l.visible !== false && l.kind !== 'adjustment') return l;
+    }
+    return active || layers[layers.length - 1] || null;
+  };
   const redrawHistogram = () => {
-    try { drawHistogram(histCanvas, activeLayer(state)); } catch { /* not ready */ }
+    const layer = histogramLayer();
+    if (!layer || !layer.canvas) {
+      histCanvas.getContext('2d')?.clearRect(0, 0, histCanvas.width, histCanvas.height);
+      return;
+    }
+    try { drawHistogram(histCanvas, layer); } catch { /* not ready */ }
   };
 
   // ---- Info -------------------------------------------------------------

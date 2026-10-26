@@ -2,11 +2,12 @@
  * Paste + drag-and-drop import handlers. Both add an image to the
  * editor as a new layer:
  *
- *   - Paste (Ctrl+V): checks `state.internalClipboard` first (set by
- *     lasso copy/cut), then falls back to the system clipboard's
- *     `image/*` items. Layer is named "Pasted Selection" or "Pasted"
- *     and becomes active; the tool snaps to Move so the user can
- *     reposition it immediately.
+ *   - Paste (Ctrl+V): uses the system clipboard's `image/*` items first
+ *     (so an external screenshot always wins), then falls back to
+ *     `state.internalClipboard` (set by lasso copy/cut) when the OS
+ *     clipboard has no image. Layer is named "Pasted Selection" or
+ *     "Pasted" and becomes active; the tool snaps to Move so the user
+ *     can reposition it immediately.
  *   - Drop: any `image/*` file dragged from the OS / another tab.
  *     Shows a "Drop image to add as new layer" overlay mid-drag. Each
  *     dropped image is routed through `handleImportedImage` so canvas-
@@ -62,6 +63,7 @@ export function wireClipboardAndDrop({
   };
 
   // ── Paste ──
+  let pasteKeyPending = false;
   window.addEventListener('paste', (e) => {
     if (!state.editorOpen || state.container !== container) return;
     // Editable fields INSIDE the editor keep native paste (the Clipboard button
@@ -80,6 +82,7 @@ export function wireClipboardAndDrop({
 
     const imageItem = Array.from(e.clipboardData?.items || []).find(item => item.type.startsWith('image/'));
     if (imageItem) {
+      pasteKeyPending = false;
       e.preventDefault();
       e.stopImmediatePropagation();
       const blob = imageItem.getAsFile();
@@ -95,6 +98,7 @@ export function wireClipboardAndDrop({
       return;
     }
     if (state.internalClipboard && !e.defaultPrevented && !e.clipboardData?.types?.includes?.('text/plain')) {
+      pasteKeyPending = false;
       e.preventDefault();
       e.stopImmediatePropagation();
       pasteAsLayer(state.internalClipboard, 'Pasted Selection', state.internalClipboardOffset || { x: 0, y: 0 });
@@ -102,13 +106,13 @@ export function wireClipboardAndDrop({
   }, { capture: true, signal });
 
   // ── Ctrl/Cmd+V ──
-  // Paste the internal selection clipboard directly. On an insecure origin
-  // (the editor is served over http on a LAN IP) `navigator.clipboard` is
-  // unavailable, so copying a selection never reaches the OS clipboard and the
-  // native `paste` event above either carries stale `text/plain` or nothing —
-  // leaving Ctrl+V a silent no-op. Handling the keystroke here makes
-  // copy→paste work regardless of the platform clipboard (the toolbar buttons
-  // already did, which is why they worked).
+  // Do NOT intercept the keystroke: preventing the default here bypasses the
+  // browser's own `paste` event and always re-pasted `state.internalClipboard`,
+  // so a screenshot taken outside the gallery could never be pasted. The paste
+  // listener above always prefers real `image/*` clipboard items; this key
+  // handler only covers the insecure-origin case where copying a selection
+  // never reached the OS clipboard, so the paste event delivers no image (and
+  // possibly stale text) and nothing usable arrives.
   window.addEventListener('keydown', (e) => {
     if (!(state.editorOpen && state.container === container)) return;
     if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey) return;
@@ -116,9 +120,15 @@ export function wireClipboardAndDrop({
     if (!state.internalClipboard) return;
     const target = e.target;
     if (target && (target.isContentEditable || target.closest?.('input, textarea, select'))) return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    pasteAsLayer(state.internalClipboard, 'Pasted Selection', state.internalClipboardOffset || { x: 0, y: 0 });
+    pasteKeyPending = true;
+    setTimeout(() => {
+      // The paste event runs before this timer and clears the flag whenever it
+      // received a real clipboard image (or already pasted the internal copy).
+      if (!pasteKeyPending) return;
+      pasteKeyPending = false;
+      if (!state.internalClipboard) return;
+      pasteAsLayer(state.internalClipboard, 'Pasted Selection', state.internalClipboardOffset || { x: 0, y: 0 });
+    }, 0);
   }, { capture: true, signal });
 
   // ── Drag-and-drop ──

@@ -10,7 +10,7 @@ SW = (ROOT / "static" / "sw.js").read_text()
 def test_toolbar_is_wrapped_for_an_overlay_chevron():
     assert "toolbarWrap.className = 'ge-toolbar-wrap';" in JS
     assert "toolbarMore.className = 'ge-tool-more';" in JS
-    assert "toolbarMore.textContent = '\\u2026';" in JS
+    assert "toolbarMore.textContent = '\\u203A';" in JS
     assert "toolbarWrap.appendChild(toolbar);" in JS
     assert "toolbarWrap.appendChild(toolbarMore);" in JS
     assert "toolbar.scrollBy(" in JS

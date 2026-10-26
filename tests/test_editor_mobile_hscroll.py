@@ -15,7 +15,7 @@ def test_menu_row_and_toolbar_contain_sideways_scroll():
     # Asserted against the whole stylesheet: several `@media (max-width: 700px)`
     # blocks now exist, so "the last one" is not the one that holds these rules.
     assert "overscroll-behavior-x: contain;" in CSS
-    assert ".ge-toolbar," in CSS
+    assert ".ge-toolbar-scroll," in CSS
     assert ".ge-dock-tabs {" in CSS
 
 

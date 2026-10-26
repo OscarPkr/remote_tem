@@ -111,8 +111,8 @@ export function transformPopupHTML() {
       <button type="button" class="ge-btn ge-btn-sm" id="ge-transform-cancel-btn">Cancel</button>
       <button type="button" class="ge-btn ge-btn-sm ge-btn-primary" id="ge-transform-apply">Apply</button>
     </div>
-    <label class="ge-transform-preserve-field">
-      <input type="checkbox" id="ge-transform-preserve-source" />
+    <label class="ge-transform-preserve-field" title="Preserve source pixels (applies the transform non-destructively)">
+      <input type="checkbox" id="ge-transform-preserve-source" aria-label="Preserve source pixels" />
       <span>Preserve source pixels</span>
     </label>
     <p class="ge-transform-popup-hint">Type <strong>-</strong> before W / H to flip.</p>

@@ -36,16 +36,18 @@ export const TOOLS = {
   text: { label: 'Text', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7V4h16v3"/><path d="M9 20h6"/><path d="M12 4v16"/></svg>' },
   shape: { label: 'Shape', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="12" height="12" rx="1"/><circle cx="17" cy="15" r="4"/></svg>' },
   brush: { label: 'Brush', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.06 11.9l8.07-8.06a2.85 2.85 0 1 1 4.03 4.03l-8.06 8.08"/><path d="M7.07 14.94c-1.66 0-3 1.35-3 3.02 0 1.33-2.5 1.52-2 2.02 1.08 1.1 2.49 2.02 4 2.02 2.2 0 4-1.8 4-4.04a3.01 3.01 0 0 0-3-3.02z"/></svg>' },
-  gradient: { label: 'Gradient', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20 20 4"/><path d="M6 18 18 6" opacity=".45"/><path d="M8 16 16 8" opacity=".2"/></svg>' },
+  gradient: { label: 'Gradient', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M6 18 18 6" opacity=".2"/><path d="M9 18 18 9" opacity=".5"/><path d="M12 18 18 12"/></svg>' },
   bucket: { label: 'Paint Bucket', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m19 11-8-8-8.6 8.6a2 2 0 0 0 0 2.8l5.2 5.2c.8.8 2 .8 2.8 0L19 11Z"/><path d="m5 2 5 5"/><path d="M2 13h15"/><path d="M22 20a2 2 0 1 1-4 0c0-1.6 1.7-2.4 2-4 .3 1.6 2 2.4 2 4Z"/></svg>' },
   eraser: { label: 'Eraser', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19.4 14.6 14.6 19.4a2 2 0 0 1-2.83 0L4.6 12.23a2 2 0 0 1 0-2.83l7.17-7.17a2 2 0 0 1 2.83 0l4.8 4.8a2 2 0 0 1 0 2.83Z"/><line x1="22" y1="21" x2="7" y2="21"/><line x1="14" y1="3" x2="9" y2="8"/></svg>' },
-  eyedropper: { label: 'Eyedropper', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 22 1-1h3l9-9"/><path d="M3 21v-3l9-9"/><path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.9.9a2.1 2.1 0 1 1-3 3l-2.1-2.1a2.1 2.1 0 0 1 0-3l-.9-.9Z"/></svg>' },
-  smudge: { label: 'Smudge', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 19c2-3 4-5 6-6 2-1 4-3 4-6 0-2-1-4-3-4s-3 2-3 4v5"/><path d="M9 13c-2 0-4 1-5 3-.7 1.2-.1 3 1.4 3H18c1.7 0 3-1.3 3-3 0-1.1-.9-2-2-2h-4"/></svg>' },
+  pixel: { label: 'Pixel', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><rect x="4" y="4" width="7" height="7"/><rect x="13" y="13" width="7" height="7"/><rect x="13" y="4" width="7" height="7" opacity="0.35"/><rect x="4" y="13" width="7" height="7" opacity="0.35"/></svg>' },
+  eyedropper: { label: 'Eyedropper', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 22 1-1h3l9-9"/><path d="M3 21v-3l9-9"/><path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.9.9a1 1 0 0 1 0 1.4l-1.6 1.6a1 1 0 0 1-1.4 0L12 8.4a1 1 0 0 1 0-1.4l1.6-1.6a1 1 0 0 1 1.4 0l.9.9Z"/></svg>' },
+  smudge: { label: 'Smudge', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 12V5.5a1.75 1.75 0 1 1 3.5 0V12"/><path d="M16 12v-1.5a1.5 1.5 0 0 1 3 0V16a5 5 0 0 1-5 5h-2.2a4.5 4.5 0 0 1-3.5-1.7l-3.2-4a1.6 1.6 0 0 1 2.4-2.1l1.8 1.9"/></svg>' },
   clone: { label: 'Clone', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="9" r="3"/><path d="M9 12l-3 4h12l-3-4"/><path d="M4 20h16"/></svg>' },
   heal: { label: 'Healing', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m5 19 14-14"/><path d="M7 5h4M9 3v4M13 17h4M15 15v4"/></svg>' },
   patch: { label: 'Patch', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="10" height="10" rx="1" stroke-dasharray="3 2"/><path d="M13 13h8v8h-8z"/></svg>' },
-  dodge: { label: 'Dodge', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="10" cy="10" r="6"/><path d="m14.5 14.5 6 6"/></svg>' },
+  dodge: { label: 'Dodge', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m9.5 14.5-6 6"/><circle cx="14" cy="10" r="6" fill="currentColor"/></svg>' },
   burn: { label: 'Burn', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 22c4 0 7-3 7-7 0-5-4-8-7-13-3 5-7 8-7 13 0 4 3 7 7 7Z"/><path d="M9 16c1.5 1 4.5 1 6 0"/></svg>' },
+  liquify: { label: 'Liquify', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 8c2.5-3 5-3 7.5 0s5 3 7.5 0"/><path d="M3 14c2.5-3 5-3 7.5 0s5 3 7.5 0"/><circle cx="17.5" cy="19" r="2"/></svg>' },
   marquee: { label: 'Marquee', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="1" stroke-dasharray="3 3"/></svg>' },
   lasso: { label: 'Lasso', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 22a5 5 0 0 1-2-4"/><path d="M3.3 13.9A6.9 6.9 0 0 1 2 9c0-4 4-7 10-7s10 3 10 7-4 7-10 7"/><path d="M5 18a4.6 4.6 0 0 1-1.5-3.5"/><circle cx="5" cy="19" r="2"/></svg>' },
   pen: { label: 'Pen selection', icon: '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 19 7-7 3 3-7 7-3-3zM18 13l-1.5-7.5L2 2l3.5 14.5L13 18M2 2l7.5 7.5"/><circle cx="10" cy="10" r="2"/></svg>' },
@@ -64,7 +66,7 @@ export const TOOLS = {
 const SECTIONS = [
   ['move'],
   [['marquee', 'lasso'], ['wand', 'quickselect', 'objectselect', 'sam']],
-  [['crop', 'transform'], ['brush', 'eraser'], ['clone', 'heal', 'patch'], ['smudge', 'dodge', 'burn'], ['gradient', 'bucket'], 'eyedropper'],
+  [['crop', 'transform'], ['brush', 'eraser', 'pixel'], ['clone', 'heal', 'patch'], ['smudge', 'dodge', 'burn', 'liquify'], ['gradient', 'bucket'], 'eyedropper'],
   [['pen', 'path'], ['text', 'shape'], ['inpaint', 'rembg', 'sharpen']],
   [['hand', 'zoom']],
 ];
@@ -72,6 +74,12 @@ const SECTIONS = [
 export function buildToolbar({ currentTool, onSelectTool, onClearSelection }) {
   const toolbar = document.createElement('div');
   toolbar.className = 'ge-toolbar';
+  // The tool slots live in their own scroller so the colour swatches can sit
+  // in a fixed footer below it. With the swatches inside the scroller they
+  // were sticky over the last slots and swallowed their clicks.
+  const scroller = document.createElement('div');
+  scroller.className = 'ge-toolbar-scroll';
+  toolbar.appendChild(scroller);
   const toolKeyMap = {};
   const slots = [];
 
@@ -126,6 +134,17 @@ export function buildToolbar({ currentTool, onSelectTool, onClearSelection }) {
       flyout.style.left = (r.right + 4 - cbX) + 'px';
       flyout.style.top = (Math.max(r.top, 4) - cbY) + 'px';
     }
+    // Keep the list inside the window. The rail's lower slots (brush with its
+    // presets, clone, smudge) open a tall menu that would otherwise spill past
+    // the bottom edge, leaving the lower rows impossible to click.
+    const fw = flyout.offsetWidth;
+    const fh = flyout.offsetHeight;
+    const viewLeft = (parseFloat(flyout.style.left) || 0) + cbX;
+    const viewTop = (parseFloat(flyout.style.top) || 0) + cbY;
+    const maxLeft = Math.max(4, window.innerWidth - fw - 4);
+    const maxTop = Math.max(4, window.innerHeight - fh - 4);
+    if (viewLeft > maxLeft) flyout.style.left = (maxLeft - cbX) + 'px';
+    if (viewTop > maxTop) flyout.style.top = (maxTop - cbY) + 'px';
   };
 
   document.addEventListener('click', (ev) => {
@@ -137,7 +156,7 @@ export function buildToolbar({ currentTool, onSelectTool, onClearSelection }) {
     if (!first) {
       const sep = document.createElement('div');
       sep.className = 'ge-tool-sep';
-      toolbar.appendChild(sep);
+      scroller.appendChild(sep);
     }
     first = false;
     for (const entry of section) {
@@ -158,9 +177,11 @@ export function buildToolbar({ currentTool, onSelectTool, onClearSelection }) {
       const slot = { el: slotEl, face, members, current: faceId, items: [] };
       if (members.length > 1) {
         // Photoshop-style corner triangle marks a slot whose family has
-        // more tools behind it.
-        face.insertAdjacentHTML('beforeend', '<span class="ge-tool-flyout-tri" aria-hidden="true"></span>');
-        const tri = face.querySelector('.ge-tool-flyout-tri');
+        // more tools behind it. It lives on the slot (not on the face) so
+        // re-rendering the face icon when a flyout member is picked never
+        // wipes the hint away.
+        slotEl.insertAdjacentHTML('beforeend', '<span class="ge-tool-flyout-tri" aria-hidden="true"></span>');
+        const tri = slotEl.querySelector('.ge-tool-flyout-tri');
         tri?.addEventListener('click', (ev) => {
           ev.stopPropagation();
           openFlyout(slotEl, face);
@@ -189,12 +210,13 @@ export function buildToolbar({ currentTool, onSelectTool, onClearSelection }) {
           slot.items.push(item);
         }
         // Photoshop-style: the Brush slot's flyout also lists the brush
-        // presets, so the Pixel brush (and any saved presets) are reachable
-        // straight from the tool button. Picking one switches to the Brush
-        // and applies the preset through the options-bar picker so the size
-        // and stroke controls stay in sync.
+        // presets, so any saved presets are reachable straight from the tool
+        // button. Picking one switches to the Brush and applies the preset
+        // through the options-bar picker so the size and stroke controls stay
+        // in sync. Pixel is its own tool (above), so it is NOT listed here as a
+        // brush type.
         if (members.includes('brush')) {
-          const brushPresets = loadBrushPresets();
+          const brushPresets = loadBrushPresets().filter((preset) => !preset.pixel);
           if (brushPresets.length) {
             const sep = document.createElement('div');
             sep.className = 'ge-tool-flyout-sep';
@@ -208,7 +230,19 @@ export function buildToolbar({ currentTool, onSelectTool, onClearSelection }) {
               presetItem.type = 'button';
               presetItem.className = 'ge-tool-btn ge-tool-flyout-item ge-tool-flyout-preset';
               presetItem.dataset.brushPreset = preset.id;
-              presetItem.insertAdjacentHTML('beforeend', `<span class="ge-tool-flyout-label">${preset.name}</span>`);
+              // Each preset row shows a glyph that reflects the preset's tip:
+              // a 1px checker square for the pixel brush, a solid disc for a
+              // hard round, a soft-edged disc for a soft round, and a mid disc
+              // in between — so a row is recognisable at a glance.
+              const soft = typeof preset.softness === 'number' ? preset.softness : 100;
+              const presetIcon = preset.pixel
+                ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><rect x="6" y="6" width="5" height="5"/><rect x="13" y="13" width="5" height="5"/><rect x="13" y="6" width="5" height="5" opacity="0.35"/><rect x="6" y="13" width="5" height="5" opacity="0.35"/></svg>'
+                : soft <= 20
+                  ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true"><circle cx="12" cy="12" r="6.5"/></svg>'
+                  : soft >= 70
+                    ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="6.5" fill="currentColor" opacity="0.3"/><circle cx="12" cy="12" r="6.5"/></svg>'
+                    : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="6.5" fill="currentColor" opacity="0.65"/><circle cx="12" cy="12" r="6.5"/></svg>';
+              presetItem.insertAdjacentHTML('beforeend', `<span class="ge-tool-icon">${presetIcon}</span><span class="ge-tool-flyout-label">${preset.name}</span>`);
               presetItem.addEventListener('click', (ev) => {
                 ev.stopPropagation();
                 setInner(face, 'brush');
@@ -232,7 +266,7 @@ export function buildToolbar({ currentTool, onSelectTool, onClearSelection }) {
         });
       }
       slots.push(slot);
-      toolbar.appendChild(slotEl);
+      scroller.appendChild(slotEl);
     }
   }
 

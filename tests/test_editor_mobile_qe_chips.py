@@ -30,6 +30,16 @@ def test_mobile_quick_edit_chip_hides_columns():
     assert ".ge-ai-command-suggestion-main {" in CSS
 
 
+def test_quick_edit_collapsed_bar_stays_translucent_over_the_canvas():
+    # Hovering anywhere over the canvas must not drag the collapsed Quick Edit
+    # bar fully in front of the image (annoying when zoomed in); only pointing
+    # at the bar itself, or focusing it, brings it to full strength.
+    assert ".ge-canvas-area:hover .ge-ai-command-collapsed {" in CSS
+    assert "opacity: 0.55;" in CSS
+    assert ".ge-canvas-area .ge-ai-command-collapsed:hover,\n.ge-canvas-area .ge-ai-command-collapsed:focus-within {" in CSS
+    assert "opacity: 0.94;" in CSS
+
+
 def test_sw_version_is_current():
     m = re.search(r"CACHE_NAME = '(odysseus-v\d+-pr40-editor-precache)'", SW)
     assert m, "CACHE_NAME not found"

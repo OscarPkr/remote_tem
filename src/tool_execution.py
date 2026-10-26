@@ -1068,6 +1068,10 @@ def _resolve_tool_path(raw_path: str) -> str:
     if raw_path is None or not str(raw_path).strip():
         raise ValueError("path is required")
     expanded = os.path.expanduser(str(raw_path).strip())
+    # Relative paths resolve where bash/python run (agent_cwd), not against
+    # the server's cwd, which is outside the allowed roots (#6679).
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(_AGENT_WORKDIR, expanded)
     resolved = os.path.realpath(expanded)
 
     if _is_app_state_path(resolved):
@@ -1221,6 +1225,12 @@ def agent_cwd() -> str:
         if vetted is None:
             raise RuntimeError("active workspace is not a safe real directory")
         return vetted
+    return default_agent_workspace()
+
+
+def default_agent_workspace() -> str:
+    """The agent workspace under the data dir, where subprocesses run when no
+    workspace is bound."""
     resolved = os.path.realpath(_AGENT_WORKDIR)
     if resolved not in _agent_readable_data_subdirs() or vet_workspace(resolved) != resolved:
         raise RuntimeError("agent workspace is not a safe real directory")
@@ -1278,6 +1288,16 @@ _ADMIN_TOOLS = {
     "serve_preset",
     "stop_served_model",
     "cancel_download",
+    # Read-only Cookbook tools reach require_admin routes over the internal
+    # loopback without an owner check (see NON_ADMIN_BLOCKED_TOOLS in
+    # src/tool_security.py), so they are admin-only at dispatch as well.
+    "list_served_models",
+    "tail_serve_output",
+    "list_downloads",
+    "search_hf_models",
+    "list_cached_models",
+    "list_serve_presets",
+    "list_cookbook_servers",
 }
 
 
@@ -1536,6 +1556,10 @@ def _agent_subprocess_env() -> dict:
     base.setdefault("LANG", "C.UTF-8")
     base.update({"TERM": "xterm-256color", "COLUMNS": "120", "LINES": "40", "HOME": _AGENT_WORKDIR})
     return base
+
+
+
+
 
 
 async def _direct_fallback(
@@ -2173,7 +2197,8 @@ async def _execute_tool_block_impl(
     if tool == "generate_image":
         from src.ai_interaction import do_generate_image
         desc = "generate_image"
-        result = await dispatched(do_generate_image(content, session_id=session_id, owner=owner))
+        image_privacy = (client_runtime_context or {}).get('web_ui_state', {}).get('incognito') is True
+        result = await dispatched(do_generate_image(content, session_id=session_id, owner=owner, **({'incognito': True} if image_privacy else {})))
     elif (tool in NATIVE_FILESYSTEM_TOOLS
           and (active_resource_operation() is not None or tool != "apply_patch"
                or not _tui_host_bridge_patch_url(client_runtime_context))):
@@ -2333,7 +2358,8 @@ async def _execute_tool_block_impl(
         result = await dispatched(do_list_cookbook_servers(content, owner=owner))
     elif tool == "edit_image":
         desc = "edit_image"
-        result = await dispatched(do_edit_image(content, owner=owner))
+        image_privacy = (client_runtime_context or {}).get('web_ui_state', {}).get('incognito') is True
+        result = await dispatched(do_edit_image(content, owner=owner, **({'incognito': True} if image_privacy else {})))
     elif tool == "edit_file":
         result = await dispatched(_direct_fallback(tool, content)) or {"error": "edit failed", "exit_code": 1}
         desc = result.get("output") or result.get("error") or "edit_file"

@@ -168,6 +168,33 @@ export function wireSelectionControls({
   });
   document.getElementById('ge-lasso-invert')?.addEventListener('click', invertSelection);
 
+  // Lasso "More" dropdown holding the secondary controls (feather, edge
+  // stroke, magnetic + its width/contrast) so the lasso strip stays short.
+  const lassoMore = document.getElementById('ge-lasso-more');
+  const lassoMoreMenu = document.getElementById('ge-lasso-more-menu');
+  const closeLassoMore = () => {
+    if (!lassoMoreMenu || lassoMoreMenu.hidden) return;
+    lassoMoreMenu.hidden = true;
+    lassoMore?.setAttribute('aria-expanded', 'false');
+    lassoMore?.classList.remove('active');
+  };
+  lassoMore?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (!lassoMoreMenu) return;
+    const open = lassoMoreMenu.hidden;
+    lassoMoreMenu.hidden = !open;
+    lassoMore.setAttribute('aria-expanded', open ? 'true' : 'false');
+    lassoMore.classList.toggle('active', open);
+  });
+  document.addEventListener('click', (e) => {
+    if (!lassoMoreMenu || lassoMoreMenu.hidden) return;
+    if (lassoMoreMenu.contains(e.target) || e.target === lassoMore) return;
+    closeLassoMore();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeLassoMore();
+  });
+
   // ── Wand section ──
   document.getElementById('ge-wand-feather')?.addEventListener('input', (e) => {
     const v = parseInt(e.target.value, 10) || 0;
@@ -226,10 +253,10 @@ export function wireSelectionControls({
     });
   });
 
-  // Toggle the translucent red overlay for the wand selection.
+  // Toggle the translucent red overlay for the active selection.
   const toggleSelectionOverlay = () => {
     state.wandMaskVisible = !state.wandMaskVisible;
-    ['ge-wand-vis', 'ge-marquee-vis', 'ge-sam-vis'].forEach(id => {
+    ['ge-wand-vis', 'ge-marquee-vis', 'ge-lasso-vis', 'ge-sam-vis', 'ge-quickselect-vis', 'ge-objectselect-vis'].forEach(id => {
       const btn = document.getElementById(id);
       if (!btn) return;
       btn.innerHTML = state.wandMaskVisible ? EYE_OPEN : EYE_OFF;
@@ -240,12 +267,66 @@ export function wireSelectionControls({
   };
   document.getElementById('ge-wand-vis')?.addEventListener('click', toggleSelectionOverlay);
   document.getElementById('ge-marquee-vis')?.addEventListener('click', toggleSelectionOverlay);
+  document.getElementById('ge-lasso-vis')?.addEventListener('click', toggleSelectionOverlay);
 
   document.getElementById('ge-wand-clear')?.addEventListener('click', wandClear);
+  document.getElementById('ge-lasso-clear')?.addEventListener('click', wandClear);
   document.getElementById('ge-wand-invert')?.addEventListener('click', invertSelection);
   document.getElementById('ge-wand-delete')?.addEventListener('click', wandDeleteSelection);
   document.getElementById('ge-wand-copy')?.addEventListener('click', wandCopyToNewLayer);
   document.getElementById('ge-wand-mask')?.addEventListener('click', wandToMask);
+
+  // SAM / Quick Select / Object Select share the wand's selection model, so
+  // they get the identical action row and the same caret "More" menu pattern
+  // (the shared CSS lives on the ge-wand-more-* classes).
+  const wireSelectionCaret = (prefix) => {
+    const btn = document.getElementById(`${prefix}-more`);
+    const menu = document.getElementById(`${prefix}-more-menu`);
+    if (!btn || !menu) return;
+    const closeMenu = () => {
+      if (menu.hidden) return;
+      menu.hidden = true;
+      btn.setAttribute('aria-expanded', 'false');
+      btn.classList.remove('active');
+    };
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const open = menu.hidden;
+      menu.hidden = !open;
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      btn.classList.toggle('active', open);
+    });
+    document.addEventListener('click', (e) => {
+      if (menu.hidden) return;
+      if (menu.contains(e.target) || e.target === btn) return;
+      closeMenu();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeMenu();
+    });
+  };
+  ['ge-sam', 'ge-quickselect', 'ge-objectselect'].forEach((prefix) => {
+    document.getElementById(`${prefix}-vis`)?.addEventListener('click', toggleSelectionOverlay);
+    document.getElementById(`${prefix}-clear`)?.addEventListener('click', wandClear);
+    document.getElementById(`${prefix}-invert`)?.addEventListener('click', invertSelection);
+    document.getElementById(`${prefix}-delete`)?.addEventListener('click', wandDeleteSelection);
+    document.getElementById(`${prefix}-copy`)?.addEventListener('click', wandCopyToNewLayer);
+    document.getElementById(`${prefix}-mask`)?.addEventListener('click', wandToMask);
+    wireSelectionCaret(prefix);
+  });
+
+  // Quick Select brush size was an inert slider; wire it to the tool's brush
+  // size so the control actually changes the selection brush.
+  const quickSize = document.getElementById('ge-quickselect-size');
+  if (quickSize) {
+    const quickSizeValue = document.getElementById('ge-quickselect-size-label');
+    const syncQuickSize = () => {
+      state.quickSelectBrushSize = Math.max(4, Math.min(200, parseInt(quickSize.value, 10) || 24));
+      if (quickSizeValue) quickSizeValue.textContent = String(state.quickSelectBrushSize);
+    };
+    quickSize.addEventListener('input', syncQuickSize);
+    syncQuickSize();
+  }
   // Selection-constrained Bg Remove — reuses the same path the toolbar
   // Bg Remove button does. buildSelectionHintMask picks the active
   // wand/lasso selection, so this just kicks off the existing flow.

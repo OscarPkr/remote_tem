@@ -45,20 +45,10 @@ test('selection boundary animates, moves independently, and supports Quick Mask'
   expect((await editorState(page)).quickMaskActive).toBe(false);
 });
 
-test('marquee supports exact fixed-size and fixed-ratio geometry', async ({ page }) => {
+test('marquee supports exact fixed-ratio geometry', async ({ page }) => {
   await openBlankEditor(page, { width: 320, height: 240 }, 'Precise marquee');
   await selectTool(page, 'marquee');
 
-  await page.locator('#ge-marquee-constraint').selectOption('size');
-  await page.locator('#ge-marquee-width').fill('80');
-  await page.locator('#ge-marquee-width').blur();
-  await page.locator('#ge-marquee-height').fill('60');
-  await page.locator('#ge-marquee-height').blur();
-  const box = await page.locator('.ge-main-canvas').boundingBox();
-  await page.mouse.click(Math.round(box.x + box.width * 0.8), Math.round(box.y + box.height * 0.75));
-  await expect.poll(async () => (await editorState(page)).selection?.bounds).toEqual({ x: 240, y: 180, width: 80, height: 60 });
-
-  await page.locator('#ge-marquee-clear').click();
   await page.locator('#ge-marquee-constraint').selectOption('ratio');
   await page.locator('#ge-marquee-width').fill('4');
   await page.locator('#ge-marquee-width').blur();
@@ -80,7 +70,7 @@ test('transform selection moves, scales, rotates, cancels, and preserves layer p
 
   await page.locator('#ge-selection-menu-btn').click();
   await page.locator('[data-selection-action="transform"]').click();
-  await expect(page.locator('.ge-transform-popup')).toBeVisible();
+  await expect(page.locator('#ge-transform-section')).toBeVisible();
   await expect(page.locator('.ge-transform-popup .ge-adj-title')).toHaveText('Transform Selection');
   await dragOnCanvas(page, { x: 0.35, y: 0.4 }, { x: 0.45, y: 0.47 });
   const moved = await editorState(page);
@@ -116,14 +106,11 @@ test('transform selection moves, scales, rotates, cancels, and preserves layer p
   await page.waitForTimeout(250);
   await page.locator('#ge-selection-menu-btn').click();
   await page.locator('[data-selection-action="transform"]').click();
-  const mobilePopup = await page.locator('.ge-transform-popup').boundingBox();
-  const mobileTitle = await page.locator('.ge-transform-popup .ge-adj-title').boundingBox();
-  expect(mobilePopup.x).toBeGreaterThanOrEqual(0);
-  expect(mobilePopup.y).toBeGreaterThanOrEqual(0);
-  expect(mobilePopup.x + mobilePopup.width).toBeLessThanOrEqual(390);
-  expect(mobilePopup.y + mobilePopup.height).toBeLessThanOrEqual(844);
-  expect(mobileTitle.x).toBeGreaterThanOrEqual(mobilePopup.x);
-  expect(mobileTitle.x + mobileTitle.width).toBeLessThanOrEqual(mobilePopup.x + mobilePopup.width);
+  const mobileSection = await page.locator('#ge-transform-section').boundingBox();
+  expect(mobileSection.x).toBeGreaterThanOrEqual(0);
+  expect(mobileSection.y).toBeGreaterThanOrEqual(0);
+  expect(mobileSection.x + mobileSection.width).toBeLessThanOrEqual(390);
+  expect(mobileSection.y + mobileSection.height).toBeLessThanOrEqual(844);
   await page.locator('#ge-transform-cancel-btn').click();
 });
 

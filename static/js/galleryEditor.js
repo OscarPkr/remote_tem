@@ -212,6 +212,7 @@ import { normalizeLayerClipping as _normalizeLayerClipping } from './editor/laye
 import { createCropTool } from './editor/tools/crop.js';
 import { createLassoTool } from './editor/tools/lasso.js';
 import { createPenSelectionTool } from './editor/tools/pen-selection.js';
+import { createLiquifyTool } from './editor/tools/liquify.js';
 import { createPenPathTool } from './editor/tools/pen-path.js';
 import { LAYER_STYLES, styleParams } from './editor/layer-styles.js';
 import { openLayerStyleMenu } from './editor/layer-style-menu.js';
@@ -232,13 +233,13 @@ import {
   mergeSelectionMasks as _mergeSelectionMasks,
   paintSelectionBoundary as _paintSelectionBoundary,
   refineSelectionMask as _refineSelectionMask,
-  selectionBoundaryPixels as _selectionBoundaryPixels,
+  selectionBoundary as _selectionBoundary,
   selectionMaskForLayer as _selectionMaskForLayer,
   selectionMaskToDocument as _selectionMaskToDocument,
   translateSelectionMask as _translateSelectionMask,
 } from './editor/selection-mask.js';
 import { createCloneTool } from './editor/tools/clone.js';
-import { createEyedropperTool } from './editor/tools/eyedropper.js';
+import { createEyedropperTool, ALT_EYEDROPPER_TOOLS as _altEyedropperTools } from './editor/tools/eyedropper.js';
 import { createBucketTool } from './editor/tools/bucket.js';
 import { createGradientTool } from './editor/tools/gradient.js';
 import { createTransformDragTool } from './editor/tools/transform-drag.js';
@@ -625,15 +626,19 @@ function _getSelectedQuickEditAgentModel() {
 
 /**
  * Quick Edit routing mode (from the box's mode selector):
- *   'auto'  – deterministic local ops first, else send to the image model
- *   'quick' – deterministic local ops only (never a model)
- *   'agent' – always the editor agent (planner)
- *   'image' – always the image edit model
+ *   'auto' – deterministic local ops first, else send to the image model
+ *   'gen'  – generate a brand-new image (text-to-image) on a new layer
+ *   'edit' – always the image edit model, skipping the local fast path
+ * Older builds stored 'quick' / 'agent' / 'image'; those map onto the
+ * three-way selector so an existing preference keeps working.
  */
 function _getQuickEditMode() {
   const sel = document.getElementById('ge-ai-command-mode');
   const v = sel && sel.value;
-  return (v === 'quick' || v === 'agent' || v === 'image') ? v : 'auto';
+  if (v === 'image') return 'gen';
+  if (v === 'quick') return 'auto';
+  if (v === 'agent') return 'edit';
+  return (v === 'gen' || v === 'edit') ? v : 'auto';
 }
 
 /** Shared helper: flatten layers → POST to API → add result as new layer. */
@@ -675,6 +680,9 @@ const _applyImageTool = createApplyImageTool({
 });
 
 let _quickEditActiveJob = null;
+// The in-flight image-model request (if any) so Cancel can abort the
+// network call itself, not just drop the row from the job list.
+let _aiEditAbort = null;
 
 // Screen-space rect (relative to .ge-canvas-area) of the region the busy glow
 // covers while an AI edit runs. We cover the WHOLE canvas area edge-to-edge
@@ -981,11 +989,14 @@ function _buildAiCommandBox() {
     <div class="ge-ai-command-head">
       <span class="ge-btn-ai-mark" aria-hidden="true">✦</span>
       <span class="ge-ai-command-title">Quick Edit</span>
-      <select class="ge-ai-command-mode ge-ctl-select" id="ge-ai-command-mode" title="Where your prompt is sent" aria-label="Quick Edit routing">
+      <select class="ge-ai-command-mode ge-ctl-select" id="ge-ai-command-mode" title="How your prompt is handled" aria-label="Quick Edit routing">
         <option value="auto">Auto</option>
-        <option value="quick">Quick</option>
-        <option value="agent">Agent</option>
-        <option value="image">Image</option>
+        <option value="gen">Img Gen</option>
+        <option value="edit">Img Edit</option>
+      </select>
+      <select class="ge-ai-command-scope ge-ctl-select" id="ge-ai-command-scope" title="What the edit model sees" aria-label="Edit input">
+        <option value="all">All layers</option>
+        <option value="layer">This layer</option>
       </select>
       <button type="button" class="ge-ai-command-close" id="ge-ai-command-close" title="Collapse Quick Edit" aria-label="Collapse Quick Edit">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -1125,16 +1136,42 @@ function _wireAiCommandBox() {
       try { localStorage.setItem('ge-ai-self-check', selfCheckToggle.checked ? '1' : '0'); } catch (_) {}
     });
   }
-  // Routing mode: Auto (deterministic → image model), Quick, Agent, Image.
+  // Routing mode: Auto (deterministic → image model), Gen, Edit.
   const modeSelect = document.getElementById('ge-ai-command-mode');
   if (modeSelect) {
     try {
       const saved = localStorage.getItem('ge-ai-command-mode');
-      if (saved === 'quick' || saved === 'agent' || saved === 'image' || saved === 'auto') modeSelect.value = saved;
+      const migrated = saved === 'image' ? 'gen'
+        : saved === 'agent' ? 'edit'
+          : saved === 'quick' ? 'auto'
+            : saved;
+      if (migrated === 'auto' || migrated === 'gen' || migrated === 'edit') {
+        modeSelect.value = migrated;
+        if (migrated !== saved) localStorage.setItem('ge-ai-command-mode', migrated);
+      }
     } catch (_) {}
     modeSelect.addEventListener('change', () => {
       try { localStorage.setItem('ge-ai-command-mode', modeSelect.value); } catch (_) {}
+      syncEditScope();
     });
+  }
+  // Edit scope: send the flattened document (all visible layers) or only the
+  // selected layer to the image edit model. Gen always uses the flattened
+  // canvas, so the scope control is hidden in that mode.
+  const scopeSelect = document.getElementById('ge-ai-command-scope');
+  const syncEditScope = () => {
+    if (!scopeSelect) return;
+    if (modeSelect) scopeSelect.hidden = modeSelect.value === 'gen';
+  };
+  if (scopeSelect) {
+    try {
+      const savedScope = localStorage.getItem('ge-ai-command-edit-scope');
+      if (savedScope === 'layer' || savedScope === 'all') scopeSelect.value = savedScope;
+    } catch (_) {}
+    scopeSelect.addEventListener('change', () => {
+      try { localStorage.setItem('ge-ai-command-edit-scope', scopeSelect.value); } catch (_) {}
+    });
+    syncEditScope();
   }
   let suggestionItems = [];
   let suggestionIndex = 0;
@@ -1227,6 +1264,7 @@ function _wireAiCommandBox() {
     else hideSuggestions();
   };
   wrap.addEventListener('ge-ai-command-close', () => setOpen(false));
+  wrap.addEventListener('ge-ai-command-open', () => setOpen(true));
   toggle?.addEventListener('click', () => setOpen(wrap.classList.contains('ge-ai-command-collapsed')));
   closeBtn?.addEventListener('click', () => setOpen(false));
   clearBtn?.addEventListener('click', () => {
@@ -1257,7 +1295,7 @@ function _wireAiCommandBox() {
       return;
     }
     if (e.key === 'Tab' && !e.shiftKey) {
-      // Tab cycles the routing mode (Auto → Quick → Agent → Image) so you can
+      // Tab cycles the routing mode (Auto → Gen → Edit) so you can
       // re-route the prompt without submitting it. It no longer sends.
       const ms = document.getElementById('ge-ai-command-mode');
       if (!ms) return;
@@ -1885,14 +1923,9 @@ function _wireAiCommandBox() {
           return;
         }
       }
-      // Background-removal intent. Broad on purpose: the old regex only
-      // matched the exact word "remove", so "removal", "bg remov", "cutout",
-      // "no background", "isolate the subject" etc. missed it and fell
-      // through to the AI agent (which then applied a tone instead).
-      const _bgRemove = /\b(?:remov\w*|erase|delete|drop|get\s*rid\s*of|cut\s*out|cutout|knock\s*out|isolate|strip|clear|transparent|no|without|rm)\b[^.]*\b(?:bg|background|backdrop|back\s*ground)\b/.test(p)
-        || /\b(?:bg|background|backdrop|back\s*ground)\b[^.]*\b(?:remov\w*|erase|delete|drop|cut\s*out|cutout|transparent|gone|less|out)\b/.test(p)
-        || /\b(?:cutout|cut\s*out|knock\s*out|isolate)\b[^.]*\b(?:subject|foreground|person|them|him|her|object|it)\b/.test(p);
-      if (_bgRemove) {
+      // Background-removal intent (shared with the routing guard so the regex
+      // can never drift between the two call sites).
+      if (_looksBackgroundRemoval(p)) {
         await _runQuickControlOp('ai.removeBackground', {});
         // Chain a tone step when the prompt also asks for one
         // ("remove the background and make it brighter", "...and warm it up").
@@ -2477,6 +2510,18 @@ function _wireAiCommandBox() {
     return false;
   };
 
+  // Explicit background-removal intent. Broad on purpose: the old regex only
+  // matched the exact word "remove", so "removal", "bg remov", "cutout",
+  // "no background", "isolate the subject" etc. missed it. Shared by the
+  // deterministic fast path and the routing guard that keeps these prompts
+  // away from the generative model.
+  const _looksBackgroundRemoval = (text) => {
+    const p = String(text || '').toLowerCase();
+    return /\b(?:remov\w*|erase|delete|drop|get\s*rid\s*of|cut\s*out|cutout|knock\s*out|isolate|strip|clear|transparent|no|without|rm)\b[^.]*\b(?:bg|background|backdrop|back\s*ground)\b/.test(p)
+      || /\b(?:bg|background|backdrop|back\s*ground)\b[^.]*\b(?:remov\w*|erase|delete|drop|cut\s*out|cutout|transparent|gone|less|out)\b/.test(p)
+      || /\b(?:cutout|cut\s*out|knock\s*out|isolate)\b[^.]*\b(?:subject|foreground|person|them|him|her|object|it)\b/.test(p);
+  };
+
   // Style/"look" edits: the whole feel changes (often generative or a heavy
   // grade). Used to decide when the VL self-check should run.
   const _looksLook = (text) => /\b(?:look|style|vintage|retro|cinematic|dramatic|moody|film|polaroid|glamou?r|glossy|editorial|headshot|poster|noir|neon|sepia|faded|washed|instagram|wes\s+anderson|ghibli|blade\s+runner|national\s+geographic)\b/i.test(String(text || ''));
@@ -2661,7 +2706,7 @@ function _wireAiCommandBox() {
 
   const _runImageModelEdit = async (prompt, { signal = null } = {}) => {
     if (signal && signal.aborted) return { ok: false, cancelled: true };
-    _setAiCommandStatus('Generating…', 'running');
+    _setAiCommandStatus('Editing the image…', 'running');
     try {
       // One undo group for the whole generative edit (select → fill → deselect).
       let mark = null;
@@ -2719,15 +2764,14 @@ function _wireAiCommandBox() {
     if (signal && signal.aborted) return { ok: false, cancelled: true };
     // Routing mode (chosen in the Quick Edit box):
     //   auto  – deterministic ops first, else the IMAGE MODEL (never a filter planner)
-    //   quick – deterministic ops only
-    //   agent – the editor agent (planner)
-    //   image – the image model
+    //   gen   – generate a brand-new image on a new layer
+    //   edit  – always the image edit model (skips the deterministic fast path)
     // forceAi (Tab) skips the deterministic fast path and goes to the model.
     const mode = _getQuickEditMode();
     const forceAgent = !forceAi && mode === 'agent';
     const quickOnly = !forceAi && mode === 'quick';
-    // Auto/quick/image try the deterministic client ops first; agent and Tab skip them.
-    const tryLocal = !forceAi && !forceAgent && mode !== 'image';
+    // Only Auto tries the deterministic client ops first; Gen/Edit and Tab skip them.
+    const tryLocal = !forceAi && mode === 'auto';
     // Deterministic crop: a bare "crop"/"trim" with no target ratio means
     // "remove the empty/uniform borders", which we can do exactly on the
     // client — never send it to the AI model.
@@ -2751,6 +2795,23 @@ function _wireAiCommandBox() {
         return { ok: false, error: err && err.message ? err.message : String(err) };
       }
     }
+    // Explicit background removal is a deterministic rembg op — never let it
+    // reach the generative model, whatever the routing mode. Previously an
+    // Image/AI-mode prompt ("remove background") went to the model, so a rembg
+    // outage turned into an AI repaint (often a blank canvas) instead of a
+    // clear "rembg is unavailable" error.
+    if (_looksBackgroundRemoval(prompt)) {
+      _setAiCommandStatus('Removing the background…', 'running');
+      try {
+        const done = await _executeQuickEditLocal(prompt);
+        if (done !== false) return { ok: true };
+      } catch (err) {
+        if (signal && signal.aborted) { _setAiCommandStatus('', ''); return { ok: false, cancelled: true }; }
+        const msg = err && err.message ? err.message : String(err);
+        _setAiCommandStatus(`Could not remove the background: ${msg}`, 'error');
+        return { ok: false, error: msg };
+      }
+    }
     // Explicit "harmonize / blend the layers" → global re-blend with the image
     // model using a purpose-built prompt. It's a named action, so it runs in
     // every routing mode (unlike a free-form prompt, which Quick mode blocks).
@@ -2758,11 +2819,11 @@ function _wireAiCommandBox() {
       _setAiCommandStatus('Harmonizing layers…', 'running');
       return await _runImageModelEdit(_HARMONIZE_PROMPT, { signal });
     }
-    // "Image" routing mode: the user explicitly chose to send this prompt to the
+    // "Gen" routing mode: the user explicitly chose to send this prompt to the
     // image model to GENERATE a brand-new picture (text-to-image), placed as a
     // new layer — not an in-place edit. Run it before any deterministic/local
-    // routing so "Image" always means "generate".
-    if (mode === 'image') {
+    // routing so "Gen" always means "generate".
+    if (mode === 'gen') {
       _setAiCommandStatus('Generating an image…', 'running');
       try {
         const res = await _runQuickControlOp('ai.generateImage', { prompt });
@@ -2773,6 +2834,11 @@ function _wireAiCommandBox() {
         _setAiCommandStatus(_isGenOfflineMsg(msg) ? msg : `Could not generate an image: ${msg}`, 'error');
         return { ok: false, error: msg };
       }
+    }
+    // "Edit" routing mode: always the image edit model, skipping the
+    // deterministic fast path (same as Tab, but sticky).
+    if (mode === 'edit' && !forceAi) {
+      return await _runImageModelEdit(prompt, { signal });
     }
     // 1) Deterministic client ops (rotate/flip/layers/rembg/upscale/selection/
     //    fill/align/text/…) — fast path, no model call. The helper's contract is
@@ -2791,9 +2857,9 @@ function _wireAiCommandBox() {
       const planned = await _runLocalPlan(prompt);
       if (planned) return { ok: true };
     }
-    // Quick mode is deterministic only — never a model.
+    // Legacy "quick" mode (no longer in the selector): deterministic only.
     if (quickOnly) {
-      _setAiCommandStatus('No built-in quick action matched — switch to Auto, Agent or Image.', 'error');
+      _setAiCommandStatus('No built-in quick action matched — switch to Auto, Gen or Edit.', 'error');
       return { ok: false, blocked: true, message: 'No quick action matched' };
     }
     // Unrecognised / short prompts are handed to the image model rather than
@@ -2974,6 +3040,7 @@ function _wireAiCommandBox() {
     if (!job || job.status === 'done' || job.status === 'error') return;
     job.cancelled = true;
     try { job.controller?.abort(); } catch (_) {}
+    try { _aiEditAbort?.abort(); } catch (_) {}
     if (_quickEditActiveJob === job) _quickEditActiveJob = null;
     if (job.spinner) { try { job.spinner.destroy(); } catch (_) {} job.spinner = null; }
     const idx = jobs.indexOf(job);
@@ -3042,7 +3109,11 @@ function _wireAiCommandBox() {
     jobs.push(job);
     while (jobs.length > 12) jobs.shift();
     renderJobStack();
-    input.focus();
+    // Hand focus back to the document once a prompt is sent: single-key tool
+    // shortcuts (V for Move, B for Brush, …) should switch tools instead of
+    // typing into the still-focused prompt box. The bar stays open for the
+    // next click.
+    input.blur();
     pumpQuickEdit();
   };
   form.addEventListener('submit', (e) => {
@@ -3467,6 +3538,10 @@ function _renderLayerOutput(layer, shouldContinue = () => true) {
 const _renderGeneration = _createRenderGeneration();
 let _asyncCompositeInFlight = null;
 let _asyncCompositeQueued = false;
+// Async generations render into this scratch canvas and are copied into
+// state.documentCompositeCanvas only when they complete, so an invalidated
+// (aborted) render can never leave a half-drawn document on screen.
+let _documentBackCanvas = null;
 
 function _drawDocumentLayers(ctx, shouldContinue = () => true) {
   const renderLayer = layer => _renderLayerOutput(layer, shouldContinue);
@@ -3707,10 +3782,12 @@ async function _refineSelection() {
 function _syncSelectionOverlay() {
   const overlay = state.selectionOverlay;
   if (!overlay || !state.mainCanvas) return;
-  if (overlay.width !== state.imgWidth) overlay.width = state.imgWidth;
-  if (overlay.height !== state.imgHeight) overlay.height = state.imgHeight;
-  overlay.style.width = `${state.imgWidth * state.zoom}px`;
-  overlay.style.height = `${state.imgHeight * state.zoom}px`;
+  const dispW = Math.max(1, Math.round(state.imgWidth * state.zoom));
+  const dispH = Math.max(1, Math.round(state.imgHeight * state.zoom));
+  if (overlay.width !== dispW) overlay.width = dispW;
+  if (overlay.height !== dispH) overlay.height = dispH;
+  overlay.style.width = `${dispW}px`;
+  overlay.style.height = `${dispH}px`;
   overlay.style.left = `${state.mainCanvas.offsetLeft}px`;
   overlay.style.top = `${state.mainCanvas.offsetTop}px`;
   overlay.style.transform = state.mainCanvas.style.transform || 'none';
@@ -3745,7 +3822,7 @@ function _paintSelectionOverlay() {
   }
   const cache = _selectionBoundaryCache;
   if (!cache || cache.mask !== mask || cache.width !== mask.width || cache.height !== mask.height) return;
-  _paintSelectionBoundary(ctx, cache.pixels, overlay.width, overlay.height, _selectionAnimationPhase);
+  _paintSelectionBoundary(ctx, cache.pixels, cache.width, cache.height, _selectionAnimationPhase, state.zoom, cache.flags);
 }
 
 function _ensureSelectionAnimation() {
@@ -3779,9 +3856,7 @@ function _refreshSelectionOverlay() {
   }
   _selectionBoundaryCache = {
     mask,
-    width: mask.width,
-    height: mask.height,
-    pixels: _selectionBoundaryPixels(mask),
+    ..._selectionBoundary(mask),
   };
   _paintSelectionOverlay();
   if (state.quickMaskActive) _stopSelectionAnimation();
@@ -3875,6 +3950,7 @@ function _finishComposite(render, documentCanvas) {
   if (state.marqueeActive && state.marqueeRect) _drawMarqueeOverlay();
   _penTool.draw();
   if (state.cropRect && !state.cropping) _drawCropOverlay();
+  _syncCropFrame();
   if (state.activeSnapGuides && state.activeSnapGuides.length) _drawSnapGuides();
   _precisionGuides?.drawDocumentOverlay(state.mainCtx);
   _refreshSelectionOverlay();
@@ -3883,7 +3959,12 @@ function _finishComposite(render, documentCanvas) {
 
 function composite() {
   if (!state.mainCtx) return;
+  // Interactive direct updates (brush/liquify strokes, layer dragging) render
+  // synchronously: every pointer move invalidates the previous worker frame, so
+  // an async composite would only ever paint once the gesture ends.
   const asyncComposite = _hasRetainedEffects()
+    && !state.drawing
+    && !state.moving
     && typeof Worker !== 'undefined'
     && typeof OffscreenCanvas !== 'undefined';
   if (asyncComposite && _asyncCompositeInFlight) {
@@ -3912,12 +3993,28 @@ function composite() {
     state.mainCtx.drawImage(documentCanvas, 0, 0);
   }
   if (asyncComposite) {
-    const renderPromise = _drawDocumentLayersAsync(documentCanvas.getContext('2d'), render.isCurrent)
-      .then(() => _finishComposite(render, documentCanvas))
+    if (!_documentBackCanvas) _documentBackCanvas = document.createElement('canvas');
+    const back = _documentBackCanvas;
+    if (back.width !== documentCanvas.width || back.height !== documentCanvas.height) {
+      back.width = documentCanvas.width;
+      back.height = documentCanvas.height;
+    }
+    const copyBack = () => {
+      const dctx = documentCanvas.getContext('2d');
+      dctx.setTransform(1, 0, 0, 1, 0, 0);
+      dctx.clearRect(0, 0, documentCanvas.width, documentCanvas.height);
+      dctx.drawImage(back, 0, 0);
+      _finishComposite(render, documentCanvas);
+    };
+    const renderPromise = _drawDocumentLayersAsync(back.getContext('2d'), render.isCurrent)
+      .then(() => {
+        if (!render.isCurrent()) return;
+        copyBack();
+      })
       .catch(() => {
         if (!render.isCurrent()) return;
-        _drawDocumentLayers(documentCanvas.getContext('2d'), render.isCurrent);
-        _finishComposite(render, documentCanvas);
+        _drawDocumentLayers(back.getContext('2d'), render.isCurrent);
+        copyBack();
       });
     const job = {};
     job.promise = renderPromise.then(() => {
@@ -3995,17 +4092,45 @@ function _drawCropOverlay() {
   state.mainCtx.globalAlpha = 1;
   state.mainCtx.restore();
   state.mainCtx.strokeStyle = '#fff';
-  state.mainCtx.lineWidth = 1;
-  state.mainCtx.setLineDash([4, 4]);
+  state.mainCtx.lineWidth = 1 / state.zoom;
+  state.mainCtx.setLineDash([4 / state.zoom, 4 / state.zoom]);
   state.mainCtx.strokeRect(x, y, w, h);
   state.mainCtx.setLineDash([]);
+}
+
+// Screen-space dashed frame for the current crop rect. The crop overlay
+// above is painted on the image-sized main canvas, so a crop that reaches
+// past the image edge would be clipped there. This DOM frame draws the FULL
+// rect (including the part over the canvas-area padding) so the user can see
+// the region that will be ADDED when the crop expands the canvas.
+function _syncCropFrame() {
+  const area = state.container?.querySelector('.ge-canvas-area');
+  if (!area) return;
+  const existing = area.querySelector('.ge-crop-frame');
+  if (!state.cropRect || !state.mainCanvas) { if (existing) existing.remove(); return; }
+  let el = existing;
+  if (!el) { el = document.createElement('div'); el.className = 'ge-crop-frame'; area.appendChild(el); }
+  const mRect = state.mainCanvas.getBoundingClientRect();
+  const aRect = area.getBoundingClientRect();
+  const scaleX = state.mainCanvas.width ? (mRect.width / state.mainCanvas.width) : 1;
+  const scaleY = state.mainCanvas.height ? (mRect.height / state.mainCanvas.height) : 1;
+  const { x, y, w, h } = state.cropRect;
+  el.style.left = (mRect.left - aRect.left + x * scaleX) + 'px';
+  el.style.top = (mRect.top - aRect.top + y * scaleY) + 'px';
+  el.style.width = Math.max(0, w * scaleX) + 'px';
+  el.style.height = Math.max(0, h * scaleY) + 'px';
 }
 
 // _drawCheckerboard lives in editor/checkerboard.js — see import at top.
 
 // ── History ──
 
-function _snapshotState() {
+function _snapshotState(options = {}) {
+  // Selection-only changes (pen/marquee/wand) do not touch layer pixels, so
+  // reuse the previous snapshot's ImageData instead of re-reading every layer
+  // — getImageData is the dominant cost of a pen close on a large canvas.
+  const reuse = options.selectionOnly ? state.undoStack.at(-1) : null;
+  const prevLayers = new Map((reuse?.layers || []).map(layer => [layer.id, layer]));
   let wand = null;
   if (state.wandMask) {
     try {
@@ -4080,20 +4205,31 @@ function _snapshotState() {
       // getImageData throws on a 0-sized canvas — guard so a single
       // broken layer/mask can't take down the whole snapshot (which
       // would silently break undo/redo for brush strokes etc.).
+      const prevLayer = prevLayers.get(l.id);
       let imageData = null;
-      try {
-        if (l.canvas.width > 0 && l.canvas.height > 0) {
-          imageData = l.ctx.getImageData(0, 0, l.canvas.width, l.canvas.height);
-        }
-      } catch (_) { /* keep imageData=null, restore will skip */ }
+      if (prevLayer && prevLayer.canvasW === l.canvas.width && prevLayer.canvasH === l.canvas.height && prevLayer.imageData) {
+        imageData = prevLayer.imageData;
+      } else {
+        try {
+          if (l.canvas.width > 0 && l.canvas.height > 0) {
+            imageData = l.ctx.getImageData(0, 0, l.canvas.width, l.canvas.height);
+          }
+        } catch (_) { /* keep imageData=null, restore will skip */ }
+      }
       let placed = null;
       if (l.kind === 'placed' && l.placed?.sourceCanvas) {
         let sourceImageData = null;
-        try {
-          sourceImageData = l.placed.sourceCanvas.getContext('2d').getImageData(
-            0, 0, l.placed.sourceCanvas.width, l.placed.sourceCanvas.height,
-          );
-        } catch {}
+        const prevPlaced = prevLayer?.placed;
+        if (prevPlaced && prevPlaced.sourceW === l.placed.sourceCanvas.width
+            && prevPlaced.sourceH === l.placed.sourceCanvas.height && prevPlaced.sourceImageData) {
+          sourceImageData = prevPlaced.sourceImageData;
+        } else {
+          try {
+            sourceImageData = l.placed.sourceCanvas.getContext('2d').getImageData(
+              0, 0, l.placed.sourceCanvas.width, l.placed.sourceCanvas.height,
+            );
+          } catch {}
+        }
         placed = {
           sourceW: l.placed.sourceCanvas.width,
           sourceH: l.placed.sourceCanvas.height,
@@ -4147,11 +4283,16 @@ function _snapshotState() {
         })(),
         masks: (l.masks || []).map(m => {
           let mImageData = null;
-          try {
-            if (m.canvas.width > 0 && m.canvas.height > 0) {
-              mImageData = m.ctx.getImageData(0, 0, m.canvas.width, m.canvas.height);
-            }
-          } catch (_) {}
+          const prevMask = prevLayer?.masks?.find(mask => mask.id === m.id);
+          if (prevMask && prevMask.canvasW === m.canvas.width && prevMask.canvasH === m.canvas.height && prevMask.imageData) {
+            mImageData = prevMask.imageData;
+          } else {
+            try {
+              if (m.canvas.width > 0 && m.canvas.height > 0) {
+                mImageData = m.ctx.getImageData(0, 0, m.canvas.width, m.canvas.height);
+              }
+            } catch (_) {}
+          }
           return {
             id: m.id,
             name: m.name,
@@ -4174,7 +4315,7 @@ function _snapshotState() {
   return snapshot;
 }
 
-function _saveState(label) {
+function _saveState(label, options = {}) {
   // saveState() runs FIRST in every mutating op (import, paste, copy,
   // merge, mask, delete, brush, …). If anything here throws, the whole
   // operation aborts before its real work runs — which silently breaks
@@ -4182,7 +4323,7 @@ function _saveState(label) {
   // isolated: a history-snapshot failure must degrade (lose one undo
   // step) rather than kill the user's action.
   try {
-    const snap = _shareSnapshotPixels(_snapshotState(), state.undoStack.at(-1));
+    const snap = _shareSnapshotPixels(_snapshotState(options), state.undoStack.at(-1));
     snap._label = label || 'Edit';
     snap._ts = Date.now();
     state.undoStack.push(snap);
@@ -4946,6 +5087,13 @@ function _restoreState(snap) {
     layer.adjustments = s.adjustments
       ? JSON.parse(JSON.stringify(s.adjustments))
       : layer.adjustments;
+    // Restore the retained FX list (and drop any live preview) so undoing an
+    // "add effect" step actually removes it. The rebuild path used to leave
+    // layer.effects untouched, so a freshly added gradient survived Ctrl+Z.
+    layer.effects = Array.isArray(s.effects)
+      ? s.effects.map(effect => _normalizeEffect(effect))
+      : [];
+    layer._effectPreview = null;
     if (s.canvasW && s.canvasH) {
       layer.canvas.width = s.canvasW;
       layer.canvas.height = s.canvasH;
@@ -5183,13 +5331,29 @@ const _refreshHistoryPanelIfOpen = _historyPanel.refreshHistoryPanelIfOpen;
 // ── Drawing ──
 
 let _rasterizePromptPending = false;
-const _pixelPaintTools = new Set(['brush', 'eraser', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'gradient', 'bucket']);
+const _pixelPaintTools = new Set(['brush', 'pixel', 'eraser', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'gradient', 'bucket', 'liquify']);
 
 async function _offerRasterizeForTool(tool = state.tool) {
   const layer = activeLayer() || _activeParentLayer();
   if (!_pixelPaintTools.has(tool) || _getActiveMaskLayer() || state.quickMaskActive ||
       !['text', 'shape', 'placed'].includes(layer?.kind)) return false;
   return _confirmRasterizeLayer(layer);
+}
+
+// Rasterize a text/shape/placed layer in place without prompting. The change is
+// recorded in history, so it stays undoable. Used by tools (the bucket) that
+// should paint in a single click instead of bouncing the user through a dialog.
+function _rasterizeLayerNow(layer) {
+  if (!layer || _isLayerPixelLocked(state, layer)) return false;
+  if (!state.layers.includes(layer) || (activeLayer() || _activeParentLayer()) !== layer) return false;
+  _saveState(`Rasterize "${layer.name}"`);
+  _rasterizeTextLayer(layer);
+  _rasterizeShapeLayer(layer);
+  _rasterizePlacedLayer(layer);
+  composite();
+  _renderLayerPanel();
+  _schedulePersist();
+  return true;
 }
 
 async function _confirmRasterizeLayer(layer) {
@@ -5255,10 +5419,22 @@ function _beginDraw(e) {
   // Fall back to the parent resolver so a stale activeLayerId doesn't
   // block strokes when there ARE layers present.
   const layer = activeLayer() || _activeParentLayer();
+  // Photoshop parity: hold Alt with a paint tool to borrow the eyedropper — the
+  // press samples a colour instead of painting.
+  if (e.altKey && _altEyedropperTools.has(state.tool)) {
+    _setCursorLoupe(true, e);
+    _eyedropperTool.pick(e);
+    return;
+  }
   if (_pixelPaintTools.has(state.tool) && !_getActiveMaskLayer() && !state.quickMaskActive &&
       ['text', 'shape', 'placed'].includes(layer?.kind)) {
-    void _offerRasterizeForTool();
-    return;
+    // Paint tools need pixels: rasterize the text/shape/placed layer silently
+    // (it stays undoable) so the very first stroke or pour works, instead of
+    // bouncing the user through a rasterize dialog that can end up behind the
+    // canvas where it cannot be clicked. If rasterizing is not possible, fall
+    // back to the prompt.
+    if (!_rasterizeLayerNow(layer)) { void _offerRasterizeForTool(); return; }
+    // fall through — `layer` is a pixel layer now, so the tool runs below.
   }
   // Transform-tool drag (handle grab or move-fallback) — handler in
   // editor/tools/transform-drag.js.
@@ -5271,7 +5447,7 @@ function _beginDraw(e) {
   if (state.tool === 'sam') return _runSamSelection(e);
   if (state.tool === 'text') return _placeText(e);
   if (state.tool === 'shape') return _beginShape(e);
-  if (state.tool === 'eyedropper') return _eyedropperTool.pick(e);
+  if (state.tool === 'eyedropper') { _setCursorLoupe(true, e); return _eyedropperTool.pick(e); }
   if (state.tool === 'gradient') return _gradientTool.begin(e);
   if (state.tool === 'marquee') return _marqueeTool.begin(e);
   if (state.tool === 'pen') return _penTool.begin(e);
@@ -5297,6 +5473,7 @@ function _beginDraw(e) {
   // editor/tools/clone.js; per-sample stamping continues through the
   // shared `_strokeTo` pipeline below.
   if (state.tool === 'clone' || state.tool === 'heal') return _cloneTool.begin(e);
+  if (state.tool === 'liquify') return _liquifyTool.begin(e);
   // Brush / Eraser / Inpaint share a stroke pipeline — handler in
   // editor/tools/stroke.js. Returns true for those tools, false
   // otherwise (any other tool that reached here is a no-op).
@@ -5306,12 +5483,20 @@ function _beginDraw(e) {
 function _continueDraw(e) {
   if (state.tool === 'pen') return _penTool.drag(e);
   if (state.tool === 'path') return _pathTool.drag(e);
+  if (state.tool === 'liquify') {
+    // Liquify hides the native cursor, so keep the size circle following the
+    // pointer here; the early return below would otherwise skip the hover pass.
+    const overCanvas = state.mainCanvas && e.target === state.mainCanvas;
+    if (overCanvas) _updateBrushCursor(e);
+    else if (state.cursorEl) state.cursorEl.style.display = 'none';
+    return _liquifyTool.drag(e);
+  }
   // _continueDraw is now bound to the window so drags can extend past
   // the canvas. The brush-cursor overlay should only follow the cursor
   // when it's actually over the canvas, otherwise hide it.
   const overCanvas = state.mainCanvas && e.target === state.mainCanvas;
   if (state.tool === 'eyedropper' && overCanvas) _eyedropperTool.preview(e);
-  if (['eraser', 'inpaint', 'lasso', 'brush', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'quickselect', 'objectselect'].includes(state.tool) && state.mainCanvas) {
+  if (['eraser', 'pixel', 'inpaint', 'lasso', 'brush', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'liquify', 'quickselect', 'objectselect'].includes(state.tool) && state.mainCanvas) {
     if (overCanvas) _updateBrushCursor(e);
     else if (state.cursorEl) state.cursorEl.style.display = 'none';
   }
@@ -5340,8 +5525,10 @@ function _continueDraw(e) {
 }
 
 function _endDraw(e) {
+  if (_cursorLoupeVisible) _setCursorLoupe(false);
   if (state.tool === 'pen') return _penTool.end();
   if (state.tool === 'path') return _pathTool.end(e);
+  if (state.tool === 'liquify') return _liquifyTool.end(e);
   // Transform-tool drag end — handler in editor/tools/transform-drag.js.
   if (_transformDragTool.tryEnd(e)) return;
   if (_shapeDraft) return _endShape(e);
@@ -5413,12 +5600,14 @@ function _updateBrushCursor(e) {
   if (state.tool === 'lasso') {
     const f = parseInt(document.getElementById('ge-lasso-feather')?.value || '0');
     basePx = Math.max(10, f * 2);
+  } else if (state.tool === 'liquify') {
+    basePx = Number(state.liquifySize) || 120;
   } else {
     basePx = state.brushSize;
   }
   // The pixel brush draws hard integer squares, so show a square cursor and
   // snap the preview to whole pixels.
-  const pixelBrush = !!state.brushPixel && (state.tool === 'brush' || state.tool === 'eraser');
+  const pixelBrush = state.tool === 'pixel' || (!!state.brushPixel && (state.tool === 'brush' || state.tool === 'eraser'));
   if (pixelBrush) basePx = Math.max(1, Math.round(basePx));
   // Use the canvas's real rendered scale. This stays accurate when fit-to-view
   // or responsive layout changes the canvas independently of nominal zoom.
@@ -5487,13 +5676,17 @@ const _cropTool = createCropTool({
   composite,
   showCropApply: () => _showCropApply(),
   snapFrame: (frame, center) => _computeTransformSnap(frame, center),
+  syncCropFrame: () => _syncCropFrame(),
 });
 const _beginCrop    = _cropTool.begin;
 const _continueCrop = _cropTool.drag;
 const _endCrop      = _cropTool.end;
 function _cancelCrop(reason = 'cancel') {
   if (!state.cropRect && !state.cropping && !state.cropMoving) return false;
-  _cropTool.cancel(reason);
+  // Remove the crop entirely (same as the Apply-panel ×). cancel() only aborts
+  // an in-flight gesture and restores the previous rect, so it is a no-op once
+  // the draw gesture has committed — reset() always clears the rect.
+  _cropTool.reset();
   const panel = state.container?.querySelector('.ge-crop-apply');
   if (panel) panel.remove();
   return true;
@@ -5506,6 +5699,20 @@ function _showCropApply() {
   pop = document.createElement('div');
   pop.className = 'ge-crop-apply';
   pop.innerHTML = `
+    <button type="button" class="ge-crop-close" title="Cancel crop" aria-label="Cancel crop"><span class="ge-crop-close-x" aria-hidden="true">&times;</span></button>
+    <select class="ge-crop-size-preset" title="Standard crop size" aria-label="Standard crop size">
+      <option value="custom">Custom</option>
+      <option value="1080x1080">1080 × 1080</option>
+      <option value="1080x1350">1080 × 1350</option>
+      <option value="1080x1920">1080 × 1920</option>
+      <option value="1200x630">1200 × 630</option>
+      <option value="1280x720">1280 × 720</option>
+      <option value="1920x1080">1920 × 1080</option>
+      <option value="2048x1536">2048 × 1536</option>
+      <option value="3000x2400">3000 × 2400</option>
+      <option value="4000x3000">4000 × 3000</option>
+      <option value="original">Original</option>
+    </select>
     <input type="number" class="ge-crop-w" min="1" max="20000" value="${Math.round(state.cropRect.w)}" title="Width">
     <span class="ge-crop-x">×</span>
     <input type="number" class="ge-crop-h" min="1" max="20000" value="${Math.round(state.cropRect.h)}" title="Height">
@@ -5515,20 +5722,46 @@ function _showCropApply() {
   if (!area || !state.cropRect || !state.mainCanvas) return;
   area.appendChild(pop);
 
+  // Full teardown, not cancel(): the draw gesture already committed in
+  // end(), so gesture.cancel() is a no-op and would leave the rect behind.
+  pop.querySelector('.ge-crop-close').addEventListener('click', () => _cropTool.reset());
   pop.querySelector('.ge-crop-apply-btn').addEventListener('click', () => _applyCrop());
   // Editing W/H updates the crop rect anchored at its top-left so the
   // user sees the dimensions live in the overlay.
   const wInput = pop.querySelector('.ge-crop-w');
   const hInput = pop.querySelector('.ge-crop-h');
+  const sizeSel = pop.querySelector('.ge-crop-size-preset');
   const onSize = () => {
     if (!state.cropRect) return;
     const w = Math.max(1, parseInt(wInput.value, 10) || state.cropRect.w);
     const h = Math.max(1, parseInt(hInput.value, 10) || state.cropRect.h);
     state.cropRect = { ...state.cropRect, w, h };
+    if (sizeSel) sizeSel.value = 'custom';
     composite();
   };
   wInput.addEventListener('input', onSize);
   hInput.addEventListener('input', onSize);
+  // Standard-size dropdown: sets the crop rect to a fixed pixel size (or the
+  // original image size), anchored at the rect's top-left. Choosing a size
+  // that exceeds the image is fine — Apply expands the canvas there.
+  sizeSel?.addEventListener('change', () => {
+    if (!state.cropRect) return;
+    const v = sizeSel.value;
+    let w;
+    let h;
+    if (v === 'original') { w = state.imgWidth; h = state.imgHeight; }
+    else {
+      const m = /^(\d+)x(\d+)$/.exec(v);
+      if (!m) return;
+      w = Number(m[1]); h = Number(m[2]);
+    }
+    state.cropRect = { ...state.cropRect, w, h };
+    state.cropStart = { x: state.cropRect.x, y: state.cropRect.y };
+    state.cropEnd = { x: state.cropRect.x + w, y: state.cropRect.y + h };
+    wInput.value = Math.round(w);
+    hInput.value = Math.round(h);
+    composite();
+  });
   // Enter in either field triggers apply.
   [wInput, hInput].forEach(inp => {
     inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') _applyCrop(); });
@@ -6142,6 +6375,16 @@ window.__galleryEditorHandleEscape = () => {
     sizePrompt._cancelCanvasSize?.();
     return true;
   }
+  // A tool's "More" popover sits above the strip; Escape closes it first.
+  const openMore = document.querySelector('.ge-opt-more:not([hidden])');
+  if (openMore) {
+    openMore.hidden = true;
+    document.querySelectorAll('.ge-more-toggle').forEach((btn) => {
+      btn.setAttribute('aria-expanded', 'false');
+      btn.classList.remove('active');
+    });
+    return true;
+  }
   if (state.transformActive) {
     _cancelTransform();
     return true;
@@ -6188,6 +6431,20 @@ const _penTool = createPenSelectionTool({
   activeLayer, saveState: _saveState, composite,
   commitSelectionMask: _commitSelectionMask,
   syncSelectionUi: () => _syncToolClearIndicators(),
+  // Repaint just the pen overlay while a path is being drawn instead of
+  // re-compositing the whole document on every click/drag.
+  redraw: () => _penTool.draw(),
+  // Closing a path only changes the selection mask; refreshing the ants is
+  // enough and avoids a full document composite on big canvases.
+  refreshSelection: () => _refreshSelectionOverlay(),
+});
+
+// Liquify warp brush — warps the active layer's pixels in place. One undo
+// snapshot per stroke; the whole doc is composited live while dragging.
+const _liquifyTool = createLiquifyTool({
+  activeLayer,
+  saveState: _saveState,
+  composite,
 });
 
 // Vector pen / path tool — creates a shape layer of type 'path' via a
@@ -6520,7 +6777,12 @@ function _syncCloneSourceUi() {
   if (label) label.textContent = hasSource
     ? (state.cloneSampleMode === 'composite' ? 'All visible layers sampled' : 'Active layer sampled')
     : 'No source selected';
-  if (clear) clear.hidden = !hasSource;
+  // Match the wand/marquee Clear ✕: always visible, lit up (accent) while a
+  // sample source is set, so it is obvious the button has something to clear.
+  if (clear) {
+    clear.hidden = false;
+    clear.classList.toggle('has-selection', hasSource);
+  }
 }
 
 // Clone-stamp tool — source-pick + stroke-start handler in
@@ -6538,6 +6800,70 @@ const _cloneTool = createCloneTool({
     : layer?.canvas,
 });
 
+// Floating eyedropper "loupe": a circle that mirrors the panel's live pixel
+// preview next to the pointer while the eyedropper is pressed, so you can see
+// exactly which pixel you are sampling. The panel copy (#ge-eyedropper-loupe)
+// stays put; this one follows the cursor.
+let _cursorLoupeEl = null;
+let _cursorLoupeCanvas = null;
+let _cursorLoupeVisible = false;
+
+function _ensureCursorLoupe() {
+  if (_cursorLoupeCanvas) return _cursorLoupeCanvas;
+  const el = document.createElement('div');
+  el.className = 'ge-eyedropper-cursor-loupe';
+  el.setAttribute('aria-hidden', 'true');
+  const canvas = document.createElement('canvas');
+  canvas.width = 96;
+  canvas.height = 96;
+  el.appendChild(canvas);
+  document.body.appendChild(el);
+  _cursorLoupeEl = el;
+  _cursorLoupeCanvas = canvas;
+  return canvas;
+}
+
+function _positionCursorLoupe(e) {
+  if (!_cursorLoupeEl || !e || !Number.isFinite(e.clientX) || !Number.isFinite(e.clientY)) return;
+  const size = _cursorLoupeEl.offsetWidth || 108;
+  const gap = 18;
+  let left = e.clientX + gap;
+  let top = e.clientY + gap;
+  if (left + size > window.innerWidth - 8) left = e.clientX - gap - size;
+  if (top + size > window.innerHeight - 8) top = e.clientY - gap - size;
+  _cursorLoupeEl.style.left = `${Math.round(Math.max(8, left))}px`;
+  _cursorLoupeEl.style.top = `${Math.round(Math.max(8, top))}px`;
+}
+
+function _setCursorLoupe(visible, e) {
+  _ensureCursorLoupe();
+  _cursorLoupeVisible = !!visible;
+  if (!_cursorLoupeEl) return;
+  _cursorLoupeEl.classList.toggle('is-visible', _cursorLoupeVisible);
+  if (_cursorLoupeVisible) _positionCursorLoupe(e);
+}
+
+// Draw the zoomed pixel block + centre crosshair. Shared by the panel readout
+// and the floating cursor loupe so both show the same preview.
+function _drawEyedropperLoupe(canvas, sample) {
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (!sample?.canvas || !Number.isFinite(sample.x) || !Number.isFinite(sample.y)) return;
+  const radius = 5;
+  const size = radius * 2 + 1;
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(sample.canvas, Math.floor(sample.x) - radius, Math.floor(sample.y) - radius, size, size, 0, 0, canvas.width, canvas.height);
+  ctx.strokeStyle = 'rgba(224, 108, 117, 0.92)';
+  ctx.lineWidth = canvas.width >= 90 ? 3 : 2;
+  ctx.beginPath();
+  ctx.moveTo(canvas.width / 2, 0);
+  ctx.lineTo(canvas.width / 2, canvas.height);
+  ctx.moveTo(0, canvas.height / 2);
+  ctx.lineTo(canvas.width, canvas.height / 2);
+  ctx.stroke();
+}
+
 const _eyedropperTool = createEyedropperTool({
   activeLayer,
   composite,
@@ -6547,7 +6873,7 @@ const _eyedropperTool = createEyedropperTool({
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
   },
-  syncPreview: (color, sample) => {
+  syncPreview: (color, sample, e) => {
     const value = state.container?.querySelector('#ge-eyedropper-live-value');
     const rgbValue = state.container?.querySelector('#ge-eyedropper-live-rgb');
     const hslValue = state.container?.querySelector('#ge-eyedropper-live-hsl');
@@ -6581,22 +6907,13 @@ const _eyedropperTool = createEyedropperTool({
       swatch.style.background = color || 'transparent';
       swatch.classList.toggle('empty', !color);
     }
-    if (loupe) {
-      const ctx = loupe.getContext('2d');
-      ctx.clearRect(0, 0, loupe.width, loupe.height);
-      if (sample?.canvas && Number.isFinite(sample.x) && Number.isFinite(sample.y)) {
-        const radius = 5;
-        const size = radius * 2 + 1;
-        ctx.imageSmoothingEnabled = false;
-        ctx.drawImage(sample.canvas, Math.floor(sample.x) - radius, Math.floor(sample.y) - radius, size, size, 0, 0, loupe.width, loupe.height);
-        ctx.strokeStyle = 'rgba(224, 108, 117, 0.92)';
-        ctx.lineWidth = 2;
-        ctx.beginPath();
-        ctx.moveTo(loupe.width / 2, 0);
-        ctx.lineTo(loupe.width / 2, loupe.height);
-        ctx.moveTo(0, loupe.height / 2);
-        ctx.lineTo(loupe.width, loupe.height / 2);
-        ctx.stroke();
+    if (loupe) _drawEyedropperLoupe(loupe, sample);
+    if (_cursorLoupeVisible) {
+      if (sample) {
+        _drawEyedropperLoupe(_ensureCursorLoupe(), sample);
+        _positionCursorLoupe(e);
+      } else {
+        _setCursorLoupe(false);
       }
     }
   },
@@ -6632,6 +6949,23 @@ const _gradientTool = createGradientTool({
     type: document.getElementById('ge-gradient-type')?.value || state.gradientType,
   }),
 });
+
+// One-click gradient fill used by the Gradients panel: paints the tool's
+// current settings across the whole layer (left → right) so clicking a preset
+// applies the gradient immediately instead of only staging its colors.
+function _applyFullGradient() {
+  const canvas = state.mainCanvas;
+  if (!canvas) return false;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return false;
+  const midY = rect.top + rect.height / 2;
+  const from = { clientX: rect.left + 1, clientY: midY };
+  const to = { clientX: rect.right - 1, clientY: midY };
+  if (!_gradientTool.begin(from)) return false;
+  _gradientTool.drag(to);
+  _gradientTool.end(to);
+  return true;
+}
 
 // Transform-tool drag interactions (handle picking, rotation, resize)
 // in editor/tools/transform-drag.js. The dispatcher calls
@@ -6747,26 +7081,31 @@ function _invalidateWandCache() { state.wandSrcCache = null; }
 
 function _commitSelectionMask(mask, layer, mode = 'replace', source = 'wand', sourceOffset = null) {
   if (!mask || !layer) return;
-  const previousLayer = state.layers.find(candidate => candidate.id === state.wandLayerId);
-  const previousOffset = previousLayer
-    ? (state.layerOffsets.get(previousLayer.id) || { x: 0, y: 0 })
-    : { x: 0, y: 0 };
-  const current = _selectionMaskToDocument(
-    state.wandMask,
-    state.wandMaskSpace || 'layer',
-    previousOffset,
-    state.imgWidth,
-    state.imgHeight,
-  );
   const incomingOffset = sourceOffset || state.layerOffsets.get(layer.id) || { x: 0, y: 0 };
-  const incoming = _selectionMaskToDocument(
-    mask,
-    'layer',
-    incomingOffset,
-    state.imgWidth,
-    state.imgHeight,
-  );
-  state.wandMask = _mergeSelectionMasks(current, incoming, mode);
+  const documentSized = mask.width === state.imgWidth && mask.height === state.imgHeight;
+  // A document-sized mask already sitting at offset 0 (the pen builds exactly
+  // that) needs no copy at all; only layer-space masks with an offset do.
+  const incoming = documentSized && incomingOffset.x === 0 && incomingOffset.y === 0
+    ? mask
+    : _selectionMaskToDocument(mask, 'layer', incomingOffset, state.imgWidth, state.imgHeight);
+  let result = incoming;
+  // Replace mode throws the previous selection away, so converting its mask
+  // into a full-image canvas first was pure waste on every new selection.
+  if (mode !== 'replace' && state.wandMask) {
+    const previousLayer = state.layers.find(candidate => candidate.id === state.wandLayerId);
+    const previousOffset = previousLayer
+      ? (state.layerOffsets.get(previousLayer.id) || { x: 0, y: 0 })
+      : { x: 0, y: 0 };
+    const current = _selectionMaskToDocument(
+      state.wandMask,
+      state.wandMaskSpace || 'layer',
+      previousOffset,
+      state.imgWidth,
+      state.imgHeight,
+    );
+    result = _mergeSelectionMasks(current, incoming, mode);
+  }
+  state.wandMask = result;
   state.wandLayerId = layer.id;
   state.wandMaskSpace = 'document';
   state.selectionSource = source;
@@ -7517,19 +7856,28 @@ function _syncToolClearIndicators() {
   if (wFeather) wFeather.style.display = wandHasSel ? '' : 'none';
   if (wGrow) wGrow.style.display = wandHasSel ? '' : 'none';
   if (!state.container) return;
-  const marqueeBtn = state.container.querySelector('.ge-tool-btn[data-tool="marquee"]');
-  const lassoBtn = state.container.querySelector('.ge-tool-btn[data-tool="lasso"]');
-  const wandBtn  = state.container.querySelector('.ge-tool-btn[data-tool="wand"]');
-  const samBtn   = state.container.querySelector('.ge-tool-btn[data-tool="sam"]');
-  const quickSelectBtn = state.container.querySelector('.ge-tool-btn[data-tool="quickselect"]');
-  const objectSelectBtn = state.container.querySelector('.ge-tool-btn[data-tool="objectselect"]');
-  const inpaintBtn = state.container.querySelector('.ge-tool-btn[data-tool="inpaint"]');
+  // Flyout-only tools (lasso / sam / quickselect / objectselect) carry
+  // data-tool-option instead of data-tool, so match either attribute.
+  const toolBtn = (id) => state.container.querySelector(
+    `.ge-tool-btn[data-tool="${id}"], .ge-tool-btn[data-tool-option="${id}"]`);
+  const marqueeBtn = toolBtn('marquee');
+  const lassoBtn = toolBtn('lasso');
+  const wandBtn  = toolBtn('wand');
+  const samBtn   = toolBtn('sam');
+  const quickSelectBtn = toolBtn('quickselect');
+  const objectSelectBtn = toolBtn('objectselect');
+  const inpaintBtn = toolBtn('inpaint');
   if (marqueeBtn) marqueeBtn.classList.toggle('has-selection', !!state.wandMask && state.selectionSource === 'marquee');
   if (lassoBtn) lassoBtn.classList.toggle('has-selection', lassoHasSel);
   if (wandBtn)  wandBtn.classList.toggle('has-selection', !!state.wandMask && state.selectionSource === 'wand');
   if (samBtn)   samBtn.classList.toggle('has-selection', !!state.wandMask && state.selectionSource === 'sam');
   if (quickSelectBtn) quickSelectBtn.classList.toggle('has-selection', !!state.wandMask && state.selectionSource === 'wand');
   if (objectSelectBtn) objectSelectBtn.classList.toggle('has-selection', !!state.wandMask && state.selectionSource === 'sam');
+  // The Clear ✕ in the marquee / wand action rows lights up (accent) while a
+  // selection is active, matching the tool-button badges above.
+    state.container.querySelectorAll('#ge-marquee-clear, #ge-wand-clear, #ge-lasso-clear, #ge-sam-clear, #ge-quickselect-clear, #ge-objectselect-clear').forEach((btn) => {
+    btn.classList.toggle('has-selection', !!state.wandMask);
+  });
   // Inpaint no longer carries a clear-X badge; masks live as sub-layers
   // in the layer panel and are deleted from there.
   if (inpaintBtn) inpaintBtn.classList.remove('has-selection');
@@ -7965,6 +8313,26 @@ async function _addRetainedGaussianBlur(presetName = null) {
   uiModule?.showToast?.('Retained Gaussian Blur added');
 }
 
+// Drop shadows are stored as x/y offsets, but people describe them with a
+// direction and a distance; convert at the dialog boundary so the renderer
+// keeps its simple offsets.
+function _shadowAngleDistance(params = {}) {
+  const x = Number(params.x) || 0;
+  const y = Number(params.y) || 0;
+  return {
+    distance: Math.round(Math.hypot(x, y)),
+    angle: Math.round((Math.atan2(-y, x) * 180) / Math.PI),
+  };
+}
+function _shadowOffsets(values = {}) {
+  const radians = ((Number(values.angle) || 0) * Math.PI) / 180;
+  const distance = Number(values.distance) || 0;
+  return {
+    x: Math.round(Math.cos(radians) * distance),
+    y: Math.round(-Math.sin(radians) * distance),
+  };
+}
+
 async function _addRetainedEffect(type, presetName = null) {
   if (type === 'gaussian-blur') return _addRetainedGaussianBlur(presetName);
   const layer = state.activeGroupId
@@ -8023,13 +8391,16 @@ async function _addRetainedEffect(type, presetName = null) {
       { key: 'color', label: 'Color', type: 'color', value: '#000000' },
       { key: 'opacity', label: 'Opacity', min: 0, max: 100, step: 1, value: 45, suffix: '%' },
       { key: 'blur', label: 'Blur', min: 0, max: 100, step: 1, value: 12, suffix: 'px' },
-      { key: 'x', label: 'Horizontal', min: -100, max: 100, step: 1, value: 4, suffix: 'px' },
-      { key: 'y', label: 'Vertical', min: -100, max: 100, step: 1, value: 6, suffix: 'px' },
+      { key: 'distance', label: 'Distance', min: 0, max: 200, step: 1, value: _shadowAngleDistance({ x: 4, y: 6 }).distance, suffix: 'px' },
+      { key: 'angle', label: 'Direction', min: -180, max: 180, step: 1, value: _shadowAngleDistance({ x: 4, y: 6 }).angle, suffix: '\u00b0' },
     ];
   const preset = _effectPreset(presetName);
   if (preset?.type === type) {
+    const presetValues = type === 'drop-shadow'
+      ? { ...preset.params, ..._shadowAngleDistance(preset.params) }
+      : preset.params;
     for (const control of initial) {
-      const value = preset.params[control.key];
+      const value = presetValues[control.key];
       if (value == null) continue;
       control.value = control.type === 'color' ? value : Number(value) * (control.suffix === '%' ? 100 : 1);
     }
@@ -8048,7 +8419,7 @@ async function _addRetainedEffect(type, presetName = null) {
           ? { color: values.color, opacity: values.opacity / 100, blendMode: 'source-atop' }
           : type === 'stroke'
             ? { color: values.color, opacity: values.opacity / 100, width: values.width }
-            : { color: values.color, opacity: values.opacity / 100, blur: values.blur, x: values.x, y: values.y },
+            : { color: values.color, opacity: values.opacity / 100, blur: values.blur, ..._shadowOffsets(values) },
       };
       composite();
     },
@@ -8066,7 +8437,7 @@ async function _addRetainedEffect(type, presetName = null) {
       ? { color: result.color, opacity: result.opacity / 100, blendMode: 'source-atop' }
       : type === 'stroke'
         ? { color: result.color, opacity: result.opacity / 100, width: result.width }
-        : { color: result.color, opacity: result.opacity / 100, blur: result.blur, x: result.x, y: result.y },
+        : { color: result.color, opacity: result.opacity / 100, blur: result.blur, ..._shadowOffsets(result) },
   }));
   _schedulePersist();
   _renderLayerPanel();
@@ -8233,8 +8604,8 @@ async function _editRetainedEffect(layer, effect) {
         { key: 'color', label: 'Color', type: 'color', value: p.color || '#000000' },
         { key: 'opacity', label: 'Opacity', min: 0, max: 100, step: 1, value: Math.round((Number(p.opacity) || 0) * 100), suffix: '%' },
         { key: 'blur', label: 'Blur', min: 0, max: 100, step: 1, value: Number(p.blur) || 0, suffix: 'px' },
-        { key: 'x', label: 'Horizontal', min: -100, max: 100, step: 1, value: Number(p.x) || 0, suffix: 'px' },
-        { key: 'y', label: 'Vertical', min: -100, max: 100, step: 1, value: Number(p.y) || 0, suffix: 'px' },
+        { key: 'distance', label: 'Distance', min: 0, max: 200, step: 1, value: _shadowAngleDistance(p).distance, suffix: 'px' },
+        { key: 'angle', label: 'Direction', min: -180, max: 180, step: 1, value: _shadowAngleDistance(p).angle, suffix: '\u00b0' },
       ];
   const preview = values => {
     const params = type === 'gaussian-blur'
@@ -8245,7 +8616,7 @@ async function _editRetainedEffect(layer, effect) {
         ? { color: values.color, opacity: values.opacity / 100, blendMode: p.blendMode || 'source-atop' }
         : type === 'stroke'
           ? { color: values.color, opacity: values.opacity / 100, width: values.width }
-        : { color: values.color, opacity: values.opacity / 100, blur: values.blur, x: values.x, y: values.y };
+        : { color: values.color, opacity: values.opacity / 100, blur: values.blur, ..._shadowOffsets(values) };
     layer._effectPreview = { ...effect, params };
     composite();
   };
@@ -8262,7 +8633,7 @@ async function _editRetainedEffect(layer, effect) {
       ? { color: result.color, opacity: result.opacity / 100, blendMode: p.blendMode || 'source-atop' }
       : type === 'stroke'
         ? { color: result.color, opacity: result.opacity / 100, width: result.width }
-      : { color: result.color, opacity: result.opacity / 100, blur: result.blur, x: result.x, y: result.y };
+      : { color: result.color, opacity: result.opacity / 100, blur: result.blur, ..._shadowOffsets(result) };
   composite();
   _schedulePersist();
   _renderLayerPanel();
@@ -9346,11 +9717,10 @@ function _buildEditor(container) {
   const { toolbar, toolKeyMap: _toolKeyMap, syncActive: _syncToolActive } = _buildToolbar({
     currentTool: state.tool,
     onClearSelection: (which) => {
-      if (which === 'lasso') {
-        state.lassoPoints = [];
-        state.lassoActive = false;
-        composite();
-      } else if (which === 'marquee' || which === 'wand') {
+      if (which === 'marquee' || which === 'wand' || which === 'lasso'
+        || which === 'quickselect' || which === 'objectselect') {
+        // _wandClear()/_deselectSelection() materializes and clears the lasso
+        // too, so it fully clears the selection for every one of these tools.
         _wandClear();
       } else if (which === 'sam') {
         _openSamPrompt();
@@ -9380,7 +9750,13 @@ function _buildEditor(container) {
       // controls live in the right panel.
       const reactivated = state.tool === toolId;
       state.tool = toolId;
-      void _offerRasterizeForTool(toolId);
+      // Pixel is its own tool: it always stamps hard 1px squares, while a
+      // regular Brush/Eraser drops the pixel flag so they paint normally.
+      if (toolId === 'pixel') state.brushPixel = true;
+      else if (toolId === 'brush' || toolId === 'eraser') state.brushPixel = false;
+      // Paint tools rasterize silently on the canvas press (undoable), so a
+      // single click always paints — never a dialog at tool select.
+      if (!_pixelPaintTools.has(toolId)) void _offerRasterizeForTool(toolId);
       state.hoveredHandle = null;
       const controls = document.getElementById('ge-controls') || document.querySelector('.ge-controls');
       if (controls) {
@@ -9391,7 +9767,7 @@ function _buildEditor(container) {
       // panel auto-minimises the layers sheet so the controls aren't
       // covered. Swiping the layers handle back up restores it.
       const isMobile = window.innerWidth <= 820;
-      const hasToolControls = ['move', 'transform', 'brush', 'gradient', 'bucket', 'crop', 'eraser', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'eyedropper', 'text', 'shape', 'path', 'marquee', 'lasso', 'pen', 'quickselect', 'objectselect', 'wand', 'inpaint', 'sam'].includes(toolId);
+      const hasToolControls = ['move', 'transform', 'brush', 'pixel', 'gradient', 'bucket', 'crop', 'eraser', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'liquify', 'eyedropper', 'text', 'shape', 'path', 'marquee', 'lasso', 'pen', 'quickselect', 'objectselect', 'wand', 'inpaint', 'sam'].includes(toolId);
       const controlsVisible = controls && !controls.classList.contains('dismissed');
       if (isMobile && hasToolControls && controlsVisible) {
         const rp = document.querySelector('.ge-right-panel');
@@ -9410,11 +9786,14 @@ function _buildEditor(container) {
       // no longer a dock panel — it renders in the options bar.)
       if (dock && (toolId === 'move' || toolId === 'transform')) dock.show('properties');
       // Activate drag-resize handles when picking the Resize tool
-      if (toolId === 'transform' && !state.transformActive) _startTransform();
+      if (toolId === 'transform' && !state.transformActive) {
+        _startTransform();
+        _maybeShowTransformHint();
+      }
       // Show/hide brush controls. Brush, Eraser AND Clone use the
       // shared size+color row; Inpaint has its OWN size slider.
       const brushControls = document.getElementById('ge-brush-controls');
-      const needsBrush = ['brush', 'eraser', 'clone', 'heal', 'smudge', 'dodge', 'burn'].includes(toolId);
+      const needsBrush = ['brush', 'pixel', 'eraser', 'clone', 'heal', 'smudge', 'dodge', 'burn'].includes(toolId);
       if (brushControls) brushControls.style.display = needsBrush ? '' : 'none';
       // Surface the brush-preset picker inline in the options bar for
       // painting tools instead of burying it behind the "..." overflow.
@@ -9422,7 +9801,12 @@ function _buildEditor(container) {
       const textSection = document.getElementById('ge-text-section');
       const penSection = document.getElementById('ge-pen-section');
       if (penSection) penSection.style.display = toolId === 'pen' ? '' : 'none';
+      const liquifySection = document.getElementById('ge-liquify-section');
+      if (liquifySection) liquifySection.style.display = toolId === 'liquify' ? '' : 'none';
       if (textSection) textSection.style.display = toolId === 'text' ? '' : 'none';
+      // The Text option set is wider than the thin strip: let the bar grow
+      // to a second row instead of clipping the trailing fields.
+      document.querySelector('.ge-options-bar')?.classList.toggle('ge-options-tall', toolId === 'text');
       if (toolId === 'text') _syncTextControls();
       const shapeSection = document.getElementById('ge-shape-section');
       if (shapeSection) shapeSection.style.display = toolId === 'shape' ? '' : 'none';
@@ -9437,20 +9821,38 @@ function _buildEditor(container) {
       if (['move', 'transform'].includes(toolId)) _layerGeometry.sync();
       // Eraser and Clone don't care about color — hide the color row.
       const colorRow = document.getElementById('ge-color-row');
-      if (colorRow) colorRow.style.display = ['eraser', 'clone', 'heal', 'smudge', 'dodge', 'burn'].includes(toolId) ? 'none' : '';
+      if (colorRow) colorRow.style.display = ['eraser', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'liquify'].includes(toolId) ? 'none' : '';
       const colorLabel = colorRow?.querySelector('label');
       if (colorLabel) colorLabel.textContent = 'Color';
-      const sizeLabelEl = brushControls?.querySelector('.ge-size-slider')?.parentElement?.querySelector('label');
-      if (sizeLabelEl && sizeLabelEl.firstChild && sizeLabelEl.firstChild.nodeType === Node.TEXT_NODE) {
-        sizeLabelEl.firstChild.nodeValue = (toolId === 'eraser') ? 'Brush Size ' : 'Size ';
+      // Per-tool stroke modifiers all live in the shared brush "More" menu so
+      // every brush-family tool has the same compact strip as the Brush. Only
+      // the group for the active tool is shown; the rest stay hidden.
+      const strokeTool = (toolId === 'brush' || toolId === 'pixel' || toolId === 'dodge' || toolId === 'burn') ? 'brush'
+        : toolId === 'eraser' ? 'eraser'
+          : (toolId === 'clone' || toolId === 'heal') ? 'clone'
+            : toolId === 'smudge' ? 'smudge'
+              : '';
+      document.querySelectorAll('#ge-brush-more-menu [data-stroke-tool]').forEach((row) => {
+        row.style.display = row.dataset.strokeTool === strokeTool ? '' : 'none';
+      });
+      const dodgeBurnRow = document.getElementById('ge-dodgeburn-intensity-row');
+      // Intensity sits in the strip next to Size, so it must show for Dodge and
+      // Burn only (and never for the other brush-family tools).
+      if (dodgeBurnRow) dodgeBurnRow.style.display = (toolId === 'dodge' || toolId === 'burn') ? '' : 'none';
+      const dodgeBurnSlider = document.getElementById('ge-dodgeburn-intensity');
+      if (dodgeBurnSlider) {
+        const intensity = Number.isFinite(state.dodgeBurnIntensity) ? state.dodgeBurnIntensity : 25;
+        dodgeBurnSlider.value = String(intensity);
+        const label = document.getElementById('ge-dodgeburn-intensity-label');
+        if (label) label.textContent = `${Math.round(intensity)}%`;
       }
-      // Per-tool stroke-modifier sections (opacity / flow / softness).
-      const brushSection = document.getElementById('ge-brush-section');
-      if (brushSection) brushSection.style.display = ['brush', 'smudge', 'dodge', 'burn'].includes(toolId) ? '' : 'none';
-      const brushTitle = brushSection?.querySelector('.ge-section-title > span');
-      if (brushTitle) brushTitle.textContent = toolId === 'smudge' ? 'Smudge' : 'Brush';
-      const smudgeStrengthRow = document.getElementById('ge-smudge-strength-row');
-      if (smudgeStrengthRow) smudgeStrengthRow.style.display = toolId === 'smudge' ? '' : 'none';
+      // Every stroke group reads the same: a titled card of rows. The shared
+      // brush card is shown for Brush / Pixel / Dodge / Burn, so relabel its
+      // heading to the active tool (and the clone card to Healing for heal).
+      const brushStrokeTitle = document.getElementById('ge-stroke-title-brush');
+      if (brushStrokeTitle) brushStrokeTitle.textContent = _TOOLS[toolId]?.label || 'Brush';
+      const cloneStrokeTitle = document.getElementById('ge-stroke-title-clone');
+      if (cloneStrokeTitle) cloneStrokeTitle.textContent = toolId === 'heal' ? 'Healing' : 'Clone';
       const cloneSection = document.getElementById('ge-clone-section');
       if (cloneSection) cloneSection.style.display = ['clone', 'heal'].includes(toolId) ? '' : 'none';
       const cloneTitle = cloneSection?.querySelector('.ge-section-title > span');
@@ -9582,15 +9984,22 @@ function _buildEditor(container) {
       // Toggle cursor — hide native cursor for tools that draw via our
       // own circle overlay (brush/eraser/inpaint/lasso); for other tools
       // pick a cursor that matches the tool's affordance.
-      const useCircle = ['brush', 'eraser', 'inpaint', 'lasso', 'clone', 'heal', 'smudge', 'dodge', 'burn'].includes(state.tool);
+      const useCircle = ['brush', 'pixel', 'eraser', 'inpaint', 'lasso', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'liquify'].includes(state.tool);
       if (state.mainCanvas) {
         // Custom SVG cursor for the Move tool — white fill with black
         // stroke so it reads on both light and dark canvases.
         const moveCursorSvg = `data:image/svg+xml;utf8,${encodeURIComponent(
           '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="white" stroke="black" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 L9 5 H11 V11 H5 V9 L2 12 L5 15 V13 H11 V19 H9 L12 22 L15 19 H13 V13 H19 V15 L22 12 L19 9 V11 H13 V5 H15 Z"/></svg>'
         )}`;
+        // Custom pipette cursor for the Eyedropper tool — a white pipette with
+        // a dark outline, its tip at the hotspot, so the sampling tool reads as
+        // a live dropper rather than a plain crosshair.
+        const eyedropperCursorSvg = `data:image/svg+xml;utf8,${encodeURIComponent(
+          '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"><g stroke="black" stroke-width="4" opacity=".85" stroke-linecap="round" stroke-linejoin="round"><path d="m2 22 1-1h3l9-9"/><path d="M3 21v-3l9-9"/><path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.9.9a1 1 0 0 1 0 1.4l-1.6 1.6a1 1 0 0 1-1.4 0L12 8.4a1 1 0 0 1 0-1.4l1.6-1.6a1 1 0 0 1 1.4 0l.9.9Z"/></g><g stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m2 22 1-1h3l9-9"/><path d="M3 21v-3l9-9"/><path d="m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3L18 9l.9.9a1 1 0 0 1 0 1.4l-1.6 1.6a1 1 0 0 1-1.4 0L12 8.4a1 1 0 0 1 0-1.4l1.6-1.6a1 1 0 0 1 1.4 0l.9.9Z"/></g></svg>'
+        )}`;
         let cursor = 'crosshair';
         if (state.tool === 'move') cursor = `url("${moveCursorSvg}") 12 12, move`;
+        else if (state.tool === 'eyedropper') cursor = `url("${eyedropperCursorSvg}") 2 22, crosshair`;
         else if (state.tool === 'hand') cursor = 'grab';
         else if (state.tool === 'transform') cursor = 'default';
         else if (state.tool === 'zoom') cursor = 'zoom-in';
@@ -9775,6 +10184,10 @@ function _buildEditor(container) {
       const header = state.container?.closest('.modal')?.querySelector('.modal-header')
         || document.querySelector('#gallery-modal .modal-header');
       if (header) {
+        // The button is adopted out of the editor container, so rebuilding the
+        // editor (File > New, opening another document) used to leave the
+        // previous copy behind in the modal header and stack up duplicates.
+        header.querySelectorAll('.ge-header-max-btn').forEach((stale) => stale.remove());
         const anchor = header.querySelector('.modal-minimize-btn:not(.ge-header-max-btn)')
           || header.querySelector('.modal-close, .close-btn');
         if (anchor && anchor.parentNode) anchor.parentNode.insertBefore(maxBtn, anchor);
@@ -9797,7 +10210,7 @@ function _buildEditor(container) {
     toolbarMore.className = 'ge-tool-more';
     toolbarMore.title = 'More tools';
     toolbarMore.setAttribute('aria-label', 'More tools');
-    toolbarMore.textContent = '\u2026';
+    toolbarMore.textContent = '\u203A';
     toolbarMore.addEventListener('click', () => {
       toolbar.scrollBy({ left: Math.max(160, Math.round(toolbar.clientWidth * 0.6)), behavior: 'smooth' });
     });
@@ -9856,6 +10269,14 @@ function _buildEditor(container) {
   state.selectionOverlayCtx = state.selectionOverlay.getContext('2d');
   canvasArea.appendChild(state.selectionOverlay);
 
+  // Dedicated overlay for the in-progress pen path. Drawing it on its own
+  // canvas means adding/moving a point no longer re-composites the whole
+  // document (which made the image visibly refresh on every click).
+  state.penOverlay = document.createElement('canvas');
+  state.penOverlay.className = 'ge-pen-overlay';
+  state.penOverlayCtx = state.penOverlay.getContext('2d');
+  canvasArea.appendChild(state.penOverlay);
+
   // Transform overlay — separate canvas positioned over the main canvas
   // with extra margin so the resize/rotation handles can render OUTSIDE
   // the image bounds. Sized + zoomed in sync with the main canvas via
@@ -9899,6 +10320,7 @@ function _buildEditor(container) {
     continueDraw: _continueDraw,
     endDraw: _endDraw,
     cancelDraw: () => {
+      if (_cursorLoupeVisible) _setCursorLoupe(false);
       if (state.tool === 'pen') { _penTool.cancel(); return; }
       if (state.tool === 'path') { _pathTool.cancel(); return; }
       if (state.transformActive) _cancelTransform();
@@ -9936,7 +10358,10 @@ function _buildEditor(container) {
     zoomIn: () => document.getElementById('ge-zoom-in')?.click(),
     zoomOut: () => document.getElementById('ge-zoom-out')?.click(),
     zoomFit: () => document.getElementById('ge-zoom-100')?.click(),
+    applyGradient: () => _applyFullGradient(),
   });
+  // Let the module-level _renderLayerPanel keep these panels fresh (histogram et al).
+  _refreshSidePanels = () => colorPanels.refresh();
   const studioPanels = createStudioPanels({
     state,
     onSelectLayer: (id) => {
@@ -9987,7 +10412,7 @@ function _buildEditor(container) {
       { id: 'swatches', label: 'Swatches', group: 'Color', groupSize: 268, element: colorPanels.swatches },
       { id: 'gradients', label: 'Gradients', group: 'Color', element: colorPanels.gradients },
       { id: 'patterns', label: 'Patterns', group: 'Color', element: studioPanels.patterns },
-      { id: 'properties', label: 'Properties', group: 'Adjustments', groupSize: 150, element: studioPanels.properties },
+      { id: 'properties', label: 'Properties', group: 'Adjustments', groupSize: 232, element: studioPanels.properties },
       { id: 'adjustments', label: 'Adjustments', group: 'Adjustments', element: studioPanels.adjustments },
       { id: 'histogram', label: 'Histogram', group: 'Adjustments', element: colorPanels.histogram },
       { id: 'info', label: 'Info', group: 'Adjustments', element: colorPanels.info },
@@ -9998,10 +10423,34 @@ function _buildEditor(container) {
       { id: 'history', label: 'History', group: 'History', groupSize: 240, element: studioPanels.history },
       { id: 'actions', label: 'Actions', group: 'History', element: actionsPanel.element },
     ],
+    // "Close <section>" from a dock section's ... menu hides every panel in
+    // that group (it re-collapses out of the rail); each one comes back via
+    // Window > <panel>, which re-reveals the group.
+    onCloseGroup: (groupName) => {
+      for (const p of panelVisibility.PANELS) {
+        if (p.group === groupName) panelVisibility.setVisible(p.id, false);
+      }
+    },
   });
   editorBody.appendChild(rightPanel);
   panelVisibility.apply();
   window.gePanelVisibility = panelVisibility;
+  // Remember the workspace/window layout the user last chose and restore it on
+  // open, so the editor comes back the way they left it. A fresh session has no
+  // stored key, so the default arrangement is left untouched. Deferred a frame
+  // so the dock panels exist and the visibility tags stick. The right-panel
+  // width only applies on desktop (the phone layout is a full-width sheet).
+  try {
+    const savedWorkspace = localStorage.getItem('ge-active-workspace');
+    if (savedWorkspace) {
+      const restoreWorkspace = () => _applyWorkspace(savedWorkspace, {
+        dock,
+        rightPanel: window.innerWidth > 700 ? rightPanel : null,
+        setPanelVisible: (id, visible) => panelVisibility.setVisible(id, visible),
+      });
+      requestAnimationFrame(() => { try { restoreWorkspace(); panelVisibility.apply(); } catch (_) {} });
+    }
+  } catch (_) {}
   container.appendChild(editorBody);
   container.appendChild(_buildZoomFooter());
   // Mobile: the footer's undo/redo/history pill is lifted above the bottom
@@ -10022,7 +10471,7 @@ function _buildEditor(container) {
   // File…Help menus and tools are discoverable on phones (audit #5).
   try {
     attachScrollAffordance(container.querySelector('.ge-topbar-left'));
-    attachScrollAffordance(container.querySelector('.ge-toolbar'));
+    attachScrollAffordance(container.querySelector('.ge-toolbar-scroll'));
   } catch (_) {}
   {
     const initialStatusTool = document.getElementById('ge-status-tool');
@@ -10060,10 +10509,8 @@ function _buildEditor(container) {
   if (window.innerWidth > 700 && controls) {
     optionsBar.appendChild(controls);
     controls.classList.add('ge-controls--in-options');
-    // Reveal the "..." overflow affordance only when the tool actually has
-    // secondary rows that the thin strip cannot fit (brush pressure/presets).
-    const moreBtn = optionsBar.querySelector('#ge-options-more');
-    if (moreBtn) moreBtn.hidden = !controls.querySelector('.ge-brush-pressure-row, .ge-brush-preset-row');
+    // The "..." overflow affordance is shown/hidden per tool inside
+    // renderOptionsBar (it only reveals the secondary brush rows).
   }
   // Crop options: aspect-ratio presets (Free / Original / 1:1 / 4:5 / 16:9).
   // Choosing one locks new crop drags to the ratio and refits an existing
@@ -10085,10 +10532,18 @@ function _buildEditor(container) {
           b.classList.toggle('active', b.dataset.cropPreset === preset);
         });
         const ratio = ratioFor(preset);
-        const rect = state.cropRect;
-        if (ratio && rect && rect.w > 5 && rect.h > 5 && state.mainCanvas) {
+        if (ratio && state.mainCanvas) {
           const cw = state.mainCanvas.width;
           const ch = state.mainCanvas.height;
+          // No crop rect yet (the user picked a ratio before dragging): start
+          // from a centred rect that already matches the requested ratio.
+          let rect = state.cropRect;
+          if (!(rect && rect.w > 5 && rect.h > 5)) {
+            let w = cw;
+            let h = w / ratio;
+            if (h > ch) { h = ch; w = h * ratio; }
+            rect = { x: (cw - w) / 2, y: (ch - h) / 2, w, h };
+          }
           const cx = rect.x + rect.w / 2;
           const cy = rect.y + rect.h / 2;
           let w = rect.w;
@@ -10109,8 +10564,28 @@ function _buildEditor(container) {
       };
       presetRow.addEventListener('click', (e) => {
         const btn = e.target.closest('.ge-crop-preset');
-        if (btn) applyCropPreset(btn.dataset.cropPreset);
+        if (btn) {
+          const customRatioInput = document.getElementById('ge-crop-custom-ratio');
+          if (customRatioInput) customRatioInput.value = '';
+          applyCropPreset(btn.dataset.cropPreset);
+        }
       });
+      // Free-form ratio: type e.g. "3:2", "21:9" or "5x4" and press Enter.
+      const customRatioInput = document.getElementById('ge-crop-custom-ratio');
+      if (customRatioInput) {
+        const applyCustomRatio = () => {
+          const m = /^(\d+)\s*[:xX/]\s*(\d+)$/.exec((customRatioInput.value || '').trim());
+          if (!m) return;
+          const w = Number(m[1]);
+          const h = Number(m[2]);
+          if (!(w > 0) || !(h > 0)) return;
+          applyCropPreset(`${w}:${h}`);
+        };
+        customRatioInput.addEventListener('change', applyCustomRatio);
+        customRatioInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter') { e.preventDefault(); applyCustomRatio(); }
+        });
+      }
     }
   } catch (_) {}
   // Photoshop keeps the layer transform (X/Y/W/H) in the Properties panel,
@@ -10146,17 +10621,24 @@ function _buildEditor(container) {
   // brush use.)
 
   // Wire up controls
-  controls.querySelector('.ge-color-picker').addEventListener('input', (e) => { state.color = e.target.value; });
-  // Left-rail foreground/background color swatches (Photoshop-style).
-  // The foreground swatch mirrors `state.color`; the swap button flips
-  // the two swatches and keeps the main color picker in sync.
   {
     const fgSwatch = document.getElementById('ge-fg-color');
     const bgSwatch = document.getElementById('ge-bg-color');
     const mainPicker = controls.querySelector('.ge-color-picker');
     const _syncMainPicker = (hex) => { if (mainPicker) mainPicker.value = hex; };
+    const _syncFgSwatch = (hex) => { if (fgSwatch) fgSwatch.value = hex; };
+    // The strip's Color swatch and the sidebar foreground swatch are the
+    // same "current colour" — keep them mirrored in both directions.
+    mainPicker?.addEventListener('input', (e) => {
+      state.color = e.target.value;
+      _syncFgSwatch(e.target.value);
+    });
+    // Left-rail foreground/background color swatches (Photoshop-style).
+    // The foreground swatch mirrors `state.color`; the swap button flips
+    // the two swatches and keeps the main color picker in sync.
     if (fgSwatch) {
       fgSwatch.value = state.color || '#000000';
+      _syncMainPicker(fgSwatch.value);
       fgSwatch.addEventListener('input', (e) => {
         state.color = e.target.value;
         _syncMainPicker(e.target.value);
@@ -10441,6 +10923,67 @@ function _buildEditor(container) {
   document.getElementById('ge-pen-commit')?.addEventListener('click', () => _penTool.commit());
   document.getElementById('ge-pen-cancel')?.addEventListener('click', () => _penTool.cancel());
 
+  // Text/Shape "More" menus: the strip only shows the primary fields, so the
+  // rare rows live in a popover that never changes the bar height.
+  [
+    ['ge-text-more-toggle', 'ge-text-more'],
+    ['ge-shape-more-toggle', 'ge-shape-more'],
+  ].forEach(([btnId, menuId]) => {
+    const btn = document.getElementById(btnId);
+    const menu = document.getElementById(menuId);
+    if (!btn || !menu) return;
+    const close = () => {
+      menu.hidden = true;
+      btn.setAttribute('aria-expanded', 'false');
+      btn.classList.remove('active');
+    };
+    btn.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const open = menu.hidden;
+      menu.hidden = !open;
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+      btn.classList.toggle('active', open);
+    });
+    document.addEventListener('pointerdown', (event) => {
+      if (menu.hidden || !menu.isConnected) return;
+      if (menu.contains(event.target) || btn.contains(event.target)) return;
+      close();
+    });
+    // Escape is owned by the Gallery's earliest capture listener, which
+    // delegates to window.__galleryEditorHandleEscape; that handler closes an
+    // open options "More" panel (see below) before anything else.
+  });
+
+  // Liquify: mode + dab size/strength live in state; the sliders in the tool
+  // section mirror it (the options bar copies the same elements).
+  const _liquifyMode = document.getElementById('ge-liquify-mode');
+  const _liquifySize = document.getElementById('ge-liquify-size');
+  const _liquifyStrength = document.getElementById('ge-liquify-strength');
+  if (_liquifyMode) {
+    _liquifyMode.value = state.liquifyMode || 'push';
+    _liquifyMode.addEventListener('change', () => { state.liquifyMode = _liquifyMode.value; });
+  }
+  if (_liquifySize) {
+    const sync = () => {
+      state.liquifySize = Math.max(4, Number(_liquifySize.value) || 120);
+      const out = document.getElementById('ge-liquify-size-label');
+      if (out) out.textContent = Math.round(state.liquifySize) + 'px';
+    };
+    _liquifySize.value = String(state.liquifySize || 120);
+    _liquifySize.addEventListener('input', sync);
+    sync();
+  }
+  if (_liquifyStrength) {
+    const sync = () => {
+      state.liquifyStrength = Math.max(1, Math.min(100, Number(_liquifyStrength.value) || 50));
+      const out = document.getElementById('ge-liquify-strength-label');
+      if (out) out.textContent = Math.round(state.liquifyStrength) + '%';
+    };
+    _liquifyStrength.value = String(state.liquifyStrength || 50);
+    _liquifyStrength.addEventListener('input', sync);
+    sync();
+  }
+
   // AI model selectors (Gen, Inpaint, per-tool) — full
   // implementation in editor/ai-models.js.
   wireAIModelSelectors({
@@ -10658,12 +11201,32 @@ function _buildEditor(container) {
       let on = false;
       if (action.startsWith('workspace-')) on = action.slice('workspace-'.length) === activeWorkspace;
       else if (action === 'history') on = !!state.historyPanelEl;
-      else if (action === 'shortcuts') on = !!document.getElementById('ge-shortcuts-popover');
+      else if (action === 'shortcuts') on = !!_shortcutsPopover?.isOpen?.();
+      else if (action === 'quick-edit') {
+        const wrap = document.getElementById('ge-ai-command');
+        on = !!wrap && !wrap.classList.contains('ge-ai-command-collapsed');
+      }
       else if (panelVisibility.PANEL_IDS.includes(action)) on = panelVisibility.isVisible(action);
       item.classList.toggle('active', on);
       item.setAttribute('aria-checked', on ? 'true' : 'false');
     });
   }
+
+  // "Save Current" workspace: snapshot the current panel visibility, active
+  // dock tab and right-panel width into a custom slot the Workspace flyout can
+  // re-apply (the restore-on-open path reads it too).
+  const _saveCurrentWorkspace = () => {
+    const panels = panelVisibility.PANEL_IDS.filter((id) => panelVisibility.isVisible(id));
+    const activeTab = state.container?.querySelector?.('.ge-dock-tab.active')?.dataset?.panel || 'layers';
+    let width = 300;
+    const w = rightPanel ? parseFloat(rightPanel.style.width) : NaN;
+    if (Number.isFinite(w)) width = Math.round(w);
+    try {
+      localStorage.setItem('ge-workspace-custom', JSON.stringify({ label: 'Custom', tab: activeTab, width, panels }));
+      localStorage.setItem('ge-active-workspace', 'custom');
+    } catch { /* storage unavailable */ }
+    uiModule?.showToast?.('Workspace saved as Custom');
+  };
 
   wireExtraMenus({
     closeOtherTopbarMenus: _closeOtherTopbarMenus,
@@ -10673,8 +11236,55 @@ function _buildEditor(container) {
     exportLayeredPsd: () => _exportLayeredPsd(),
     uiModule,
     workspace: (name) => _applyWorkspace(name, { dock, rightPanel, setPanelVisible: (id, visible) => panelVisibility.setVisible(id, visible) }),
+    saveWorkspace: _saveCurrentWorkspace,
     syncWindowChecks: _syncWindowMenuChecks,
     togglePanel: (id) => panelVisibility.toggle(id),
+    // Window > Quick Edit mirrors the bar's own collapse control: unchecking
+    // hides the prompt, checking it brings the input back.
+    toggleQuickEdit: () => {
+      const wrap = document.getElementById('ge-ai-command');
+      if (!wrap) return;
+      const collapsed = wrap.classList.contains('ge-ai-command-collapsed');
+      wrap.dispatchEvent(new CustomEvent(collapsed ? 'ge-ai-command-open' : 'ge-ai-command-close'));
+    },
+    // File > New: flush the current draft, then build a blank document.
+    newDocument: (w, h) => {
+      if (!(w > 0) || !(h > 0)) return;
+      if (state.layers.length) { try { _persistDraft(); } catch (_) {} }
+      openEditor(null, null, { w: Math.round(w), h: Math.round(h) }, 'Untitled');
+    },
+    promptNewDocument: () => _promptCanvasSize({
+      title: 'New document',
+      okLabel: 'Create',
+      initialW: 1920,
+      initialH: 1080,
+      showUnits: true,
+      showPresets: true,
+    }),
+    newFromClipboard: async () => {
+      try {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          const type = item.types.find((t) => t.startsWith('image/'));
+          if (!type) continue;
+          const blob = await item.getType(type);
+          const dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = reject;
+            reader.readAsDataURL(blob);
+          });
+          const img = new Image();
+          await new Promise((resolve, reject) => { img.onload = resolve; img.onerror = reject; img.src = dataUrl; });
+          if (state.layers.length) { try { _persistDraft(); } catch (_) {} }
+          openEditor(dataUrl, null, { w: img.naturalWidth, h: img.naturalHeight }, 'Clipboard');
+          return;
+        }
+        uiModule?.showError?.('No image found on the clipboard');
+      } catch (_) {
+        uiModule?.showError?.('Could not read the clipboard');
+      }
+    },
   });
 
   // Command palette (Ctrl/Cmd+K) — full implementation in
@@ -10832,20 +11442,9 @@ function _buildEditor(container) {
       _runSamTextSelection();
     }
   });
-  document.getElementById('ge-sam-clear')?.addEventListener('click', () => _wandClear());
-  document.getElementById('ge-sam-mask')?.addEventListener('click', () => _wandToMask());
-  document.getElementById('ge-sam-vis')?.addEventListener('click', () => {
-    state.wandMaskVisible = !state.wandMaskVisible;
-    const btn = document.getElementById('ge-sam-vis');
-    if (btn) {
-      btn.innerHTML = state.wandMaskVisible
-        ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>'
-        : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 20C5 20 1 12 1 12a20.29 20.29 0 0 1 5.06-5.94"/><path d="M9.9 4.24A10.45 10.45 0 0 1 12 4c7 0 11 8 11 8a20.65 20.65 0 0 1-2.16 3.19"/><path d="M14.12 14.12A3 3 0 0 1 9.88 9.88"/><path d="M1 1l22 22"/></svg>';
-      btn.title = state.wandMaskVisible ? 'Hide selection overlay' : 'Show selection overlay';
-      btn.classList.toggle('visible', state.wandMaskVisible);
-    }
-    composite();
-  });
+  // The SAM action row (visibility / clear / mask) now shares the wand's
+  // unified action-row wiring inside wireSelectionControls — nothing extra to
+  // bind here.
   _wireAiCommandBox();
 
   // Merge / Flatten buttons (layer-panel footer) — full
@@ -10926,6 +11525,41 @@ function _buildEditor(container) {
     e.stopImmediatePropagation();
   }, true);
 
+  // Free Transform entered from a shortcut must swap the options strip the
+  // same way picking the Transform tool does — otherwise the previous tool's
+  // settings (e.g. Text) stay on screen and overlap the transform controls.
+  const _enterTransform = () => {
+    if (state.transformActive) return;
+    const btn = toolbar.querySelector('.ge-tool-flyout-item[data-tool-option="transform"]')
+      || toolbar.querySelector('[data-tool="transform"]');
+    if (btn) btn.click();
+    else _startTransform();
+  };
+  // One-time-per-session hint so the shortcut is discoverable (Ctrl+T is
+  // reserved by the browser, so Ctrl+Alt+T is the chord that works).
+  const _maybeShowTransformHint = () => {
+    try {
+      if (sessionStorage.getItem('ge-transform-hint')) return;
+      sessionStorage.setItem('ge-transform-hint', '1');
+    } catch (_) { /* storage unavailable */ }
+    // `toast-transform-hint` pins this one message to a single spot under the
+    // canvas; without it the generic panel rules moved it between the
+    // top-right corner and the bottom banner.
+    uiModule?.showToast?.('Free Transform — Enter applies, Esc cancels. Shortcut: Ctrl+Alt+T', { toastClass: 'toast-transform-hint' });
+  };
+
+  // Holding Alt with a paint tool borrows the eyedropper, so switch to the
+  // sampling cursor (and hide the brush ring) while Alt is held.
+  const _syncAltEyedropper = (on) => {
+    document.body.classList.toggle('ge-alt-eyedropper', !!on && _altEyedropperTools.has(state.tool));
+  };
+  if (!state._altEyedropperWired) {
+    state._altEyedropperWired = true;
+    document.addEventListener('keydown', (ev) => { if (state.editorOpen) _syncAltEyedropper(ev.altKey); });
+    document.addEventListener('keyup', (ev) => { if (state.editorOpen) _syncAltEyedropper(ev.altKey); });
+    window.addEventListener('blur', () => _syncAltEyedropper(false));
+  }
+
   // Keyboard shortcuts — full implementation in
   // editor/keyboard-shortcuts.js.
   wireKeyboardShortcuts({
@@ -10936,7 +11570,7 @@ function _buildEditor(container) {
     toggleShortcuts: _toggleShortcuts,
     confirmTransform: _confirmTransform,
     cancelTransform: _cancelTransform,
-    startTransform: _startTransform,
+    startTransform: _enterTransform,
     nudgeTransform: _nudgeTransform,
     resizeCustomPrompt: _resizeCustomPrompt,
     addEmptyLayer: _addEmptyLayer,
@@ -11277,8 +11911,24 @@ function _buildEditor(container) {
     return { adjType, params };
   };
   const _aiSignal = (typeof AbortController !== 'undefined') ? new AbortController().signal : undefined;
+  // The image the edit model sees: the flattened document by default, or just
+  // the selected layer (drawn at its offset on a document-size canvas) when
+  // the Quick Edit scope control is set to "This layer".
+  const _aiEditSourceCanvas = () => {
+    let scope = 'all';
+    try { scope = localStorage.getItem('ge-ai-command-edit-scope') || 'all'; } catch (_) {}
+    if (scope !== 'layer') return flatten();
+    const layer = activeLayer() || _activeParentLayer();
+    if (!layer || !layer.canvas) return flatten();
+    const out = document.createElement('canvas');
+    out.width = state.imgWidth;
+    out.height = state.imgHeight;
+    const off = state.layerOffsets.get(layer.id) || { x: 0, y: 0 };
+    out.getContext('2d').drawImage(layer.canvas, off.x, off.y);
+    return out;
+  };
   const _aiEditCanvas = async (endpoint, payload = {}, { keepNaturalSize = false } = {}) => {
-    const flat = flatten();
+    const flat = _aiEditSourceCanvas();
     const image = flat.toDataURL('image/png').split(',')[1];
     const requestId = 'qe-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
     _startAiProgress(requestId);
@@ -11292,6 +11942,7 @@ function _buildEditor(container) {
     // Never leave the card spinning: give up after 3 minutes and report "offline".
     const _ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
     const _timer = _ctl ? setTimeout(() => { try { _ctl.abort(); } catch (_) {} }, 180000) : null;
+    _aiEditAbort = _ctl;
     try {
       let res = null;
       let lastErr = 'Image edit failed';
@@ -11327,7 +11978,7 @@ function _buildEditor(container) {
       const data = await res.json();
       if (data.error) throw new Error(data.error);
       if (!data.image) throw new Error('No image returned');
-      const img = await _decodeAIImage(data.image, _aiSignal);
+      const img = await _decodeAIImage(data.image, _ctl ? _ctl.signal : _aiSignal);
       const c = document.createElement('canvas');
       if (keepNaturalSize) {
         // Outpaint/extend returns a LARGER frame; keep its real dimensions so the
@@ -11342,6 +11993,7 @@ function _buildEditor(container) {
       return { canvas: c, dataUrl: c.toDataURL('image/png') };
     } finally {
       if (_timer) clearTimeout(_timer);
+      if (_aiEditAbort === _ctl) _aiEditAbort = null;
       _stopAiProgress();
     }
   };
@@ -11624,9 +12276,13 @@ function _buildEditor(container) {
     }
     return entry;
   };
+  // Set while closing the active tab: the switch op's snapshot step would
+  // otherwise re-add the just-closed id (and copy its pixels onto the
+  // survivor), so it is skipped for that one transition.
+  let _suppressDocSync = false;
   const _syncActiveDocument = () => {
     try {
-      if (!state.editorOpen) return null;
+      if (_suppressDocSync || !state.editorOpen) return null;
       const entry = _activeDocEntry();
       entry.doc = _serializeEditorDocument(state);
       entry.name = state.draftName || entry.name;
@@ -11673,7 +12329,7 @@ function _buildEditor(container) {
           'ai.removeObject': { description: 'Remove the selected object and fill naturally. {prompt}.', run: (p) => _aiInpaintSelection((p && p.prompt) || 'remove the object, fill the area naturally') },
           'ai.harmonize': { description: 'Harmonize the layer/selection lighting with the rest of the image; result is a NEW layer. {strength}.', run: async (p) => { const { canvas } = await _aiEditCanvas('/api/image/harmonize', { strength: Number(p && p.strength) || 0.4 }); return _placeResultLayer(canvas, 'Harmonized', state.wandMask || null); } },
           'ai.generativeUpscale': { description: 'Upscale the image 2x/4x; result is a NEW layer. Falls back to a high-quality canvas upscale labelled "basic upscale" when no Real-ESRGAN model is served. {scale}.', run: async (p) => { const scale = Number(p && p.scale) === 4 ? 4 : 2; try { const { canvas } = await _aiEditCanvas('/api/image/upscale-local', { scale }); return _placeResultLayer(canvas, `Upscaled ${scale}x`, null); } catch (e) { const src = flatten(); const c = document.createElement('canvas'); c.width = Math.max(1, Math.round(src.width * scale)); c.height = Math.max(1, Math.round(src.height * scale)); const cx = c.getContext('2d'); cx.imageSmoothingEnabled = true; cx.imageSmoothingQuality = 'high'; cx.drawImage(src, 0, 0, c.width, c.height); _saveState('Upscale (basic)'); _resizeCanvasDocument(state, c.width, c.height, { anchorX: 0, anchorY: 0 }); const layerId = _placeResultLayer(c, `Upscaled ${scale}x (basic upscale)`, null); return { layerId, scale, method: 'basic', reason: String(e && e.message || e) }; } } },
-          'ai.generateImage': { description: 'Generate an image from a prompt (current canvas as reference) and place it as a NEW layer. {prompt,width,height}.', run: async (p) => { const endpoint = (typeof window !== 'undefined' && window.geGenerateImageEndpoint) || '/api/image/generate'; const reference = flatten().toDataURL('image/png').split(',')[1]; const body = { prompt: (p && p.prompt) || '', width: Math.max(1, Math.round(Number(p && p.width) || state.imgWidth)), height: Math.max(1, Math.round(Number(p && p.height) || state.imgHeight)), reference }; let _gres = null; try { _gres = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); } catch (_e) { throw new Error(_generationErrorMessage({ network: true, detail: (_e && _e.message) || 'network error' })); } const res = _gres; if (!res.ok) { let _gd = res.statusText; try { const e = await res.json(); _gd = e.detail || e.error || _gd; } catch (_) {} throw new Error(_generationErrorMessage({ status: res.status, detail: _gd })); } const data = await res.json(); if (data.error) throw new Error(_generationErrorMessage({ detail: data.error })); const b64 = data.image || (Array.isArray(data.images) && data.images[0]); if (!b64) throw new Error('No image returned'); try { window.__geGenerationDisabled = 0; } catch (_) {} const img = await _decodeAIImage(b64, _aiSignal); const c = document.createElement('canvas'); c.width = state.imgWidth; c.height = state.imgHeight; c.getContext('2d').drawImage(img, 0, 0, state.imgWidth, state.imgHeight); return _placeResultLayer(c, 'Generated', state.wandMask || null); } },
+          'ai.generateImage': { description: 'Generate an image from a prompt (current canvas as reference) and place it as a NEW layer. {prompt,width,height}.', run: async (p) => { const endpoint = (typeof window !== 'undefined' && window.geGenerateImageEndpoint) || '/api/image/generate'; const reference = flatten().toDataURL('image/png').split(',')[1]; const _pickedModel = (() => { try { const v = localStorage.getItem('ge-ai-command-model') || ''; return v.includes('::') ? v.split('::').pop() : ''; } catch (_) { return ''; } })(); const body = { prompt: (p && p.prompt) || '', width: Math.max(1, Math.round(Number(p && p.width) || state.imgWidth)), height: Math.max(1, Math.round(Number(p && p.height) || state.imgHeight)), reference, ...(_pickedModel ? { model: _pickedModel } : {}) }; let _gres = null; try { _gres = await fetch(endpoint, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); } catch (_e) { throw new Error(_generationErrorMessage({ network: true, detail: (_e && _e.message) || 'network error' })); } const res = _gres; if (!res.ok) { let _gd = res.statusText; try { const e = await res.json(); _gd = e.detail || e.error || _gd; } catch (_) {} throw new Error(_generationErrorMessage({ status: res.status, detail: _gd })); } const data = await res.json(); if (data.error) throw new Error(_generationErrorMessage({ detail: data.error })); const b64 = data.image || (Array.isArray(data.images) && data.images[0]); if (!b64) throw new Error('No image returned'); try { window.__geGenerationDisabled = 0; } catch (_) {} const img = await _decodeAIImage(b64, _aiSignal); const c = document.createElement('canvas'); c.width = state.imgWidth; c.height = state.imgHeight; c.getContext('2d').drawImage(img, 0, 0, state.imgWidth, state.imgHeight); return _placeResultLayer(c, 'Generated', state.wandMask || null); } },
           'ai.generativeExpand': { description: 'Generatively expand the canvas to width×height; only the new border is inpainted, the original pixels are kept pixel-identical, and the seam is feathered. {width,height,anchor,prompt}.', run: async (p) => { const tw = Math.max(1, Math.round(Number(p && p.width) || state.imgWidth)); const th = Math.max(1, Math.round(Number(p && p.height) || state.imgHeight)); if (tw <= state.imgWidth && th <= state.imgHeight) throw new Error('target must be larger than the current canvas'); const anchor = (p && p.anchor) || 'center'; const anchorX = anchor === 'left' ? 0 : anchor === 'right' ? 1 : 0.5; const anchorY = anchor === 'top' ? 0 : anchor === 'bottom' ? 1 : 0.5; _saveState('Generative expand'); const steps = Math.max(1, Math.round(Number(p && p.steps) || 4)); const sw = state.imgWidth; const sh = state.imgHeight; _resizeCanvasDocument(state, tw, th, { anchorX, anchorY }); const flat = flatten(); const b = _contentBounds(); const mask = document.createElement('canvas'); mask.width = tw; mask.height = th; const mctx = mask.getContext('2d'); mctx.fillStyle = '#ffffff'; mctx.fillRect(0, 0, tw, th); const prefill = document.createElement('canvas'); prefill.width = tw; prefill.height = th; const pctx = prefill.getContext('2d'); pctx.imageSmoothingEnabled = true; pctx.drawImage(flat, 0, 0, tw, th); if (b) { mctx.clearRect(b.x, b.y, b.w, b.h); const bx = b.x, by = b.y, bw = b.w, bh = b.h, rx = bx + bw, by2 = by + bh; if (bx > 0) pctx.drawImage(flat, bx, by, 1, bh, 0, by, bx, bh); if (rx < tw) pctx.drawImage(flat, rx - 1, by, 1, bh, rx, by, tw - rx, bh); if (by > 0) pctx.drawImage(flat, bx, by, bw, 1, bx, 0, bw, by); if (by2 < th) pctx.drawImage(flat, bx, by2 - 1, bw, 1, bx, by2, bw, th - by2); if (bx > 0 && by > 0) pctx.drawImage(flat, bx, by, 1, 1, 0, 0, bx, by); if (rx < tw && by > 0) pctx.drawImage(flat, rx - 1, by, 1, 1, rx, 0, tw - rx, by); if (bx > 0 && by2 < th) pctx.drawImage(flat, bx, by2 - 1, 1, 1, 0, by2, bx, th - by2); if (rx < tw && by2 < th) pctx.drawImage(flat, rx - 1, by2 - 1, 1, 1, rx, by2, tw - rx, th - by2); } else { const tx = Math.round((tw - sw) * anchorX); const ty = Math.round((th - sh) * anchorY); mctx.clearRect(tx, ty, sw, sh); } const image = prefill.toDataURL('image/png').split(',')[1]; const maskB64 = mask.toDataURL('image/png').split(',')[1]; const res = await fetch('/api/image/inpaint', { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image, mask: maskB64, prompt: (p && p.prompt) || 'extend the scene seamlessly, continuing the surrounding content and lighting naturally', steps }) }); if (!res.ok) { let err = res.statusText; try { const e = await res.json(); err = e.detail || e.error || err; } catch (_) {} throw new Error(err); } const data = await res.json(); if (data.error) throw new Error(data.error); if (!data.image) throw new Error('No image returned'); const img = await _decodeAIImage(data.image, _aiSignal); const seam = Math.max(12, Math.round(Math.min(tw, th) * 0.02)); let blendMask = _growMaskCanvas(mask, seam, true); blendMask = _featherMaskCanvas((cw, ch) => { const c = document.createElement('canvas'); c.width = cw; c.height = ch; return c; }, blendMask, Math.round(seam * 1.4)); const layer = createLayer('Generative expand', tw, th); layer.ctx.imageSmoothingEnabled = true; layer.ctx.imageSmoothingQuality = 'high'; layer.ctx.drawImage(img, 0, 0, tw, th); if (b) { const edge = _edgeBandAverage(flat, b); if (edge) { layer.ctx.save(); layer.ctx.globalAlpha = 0.14; layer.ctx.fillStyle = `rgb(${edge[0]}, ${edge[1]}, ${edge[2]})`; layer.ctx.fillRect(0, 0, tw, th); layer.ctx.restore(); } } _bakeMaskIntoLayer(layer.ctx, blendMask); state.layers.push(layer); state.activeLayerId = layer.id; state.selectedLayerIds = [layer.id]; composite(); _renderLayerPanel(); return { width: tw, height: th, layerId: layer.id, seam, steps }; } },
           'layers.rename': { description: 'Rename a layer {id|index|name, name|newName}.', run: (p) => { const l = _controlFindLayer(p) || activeLayer(); if (!l) throw new Error('layer not found'); const next = String(p.name || p.newName || '').trim(); if (!next) throw new Error('name required'); _saveState('Rename layer'); l.name = next; _renderLayerPanel(); return l.id; } },
           'layers.setVisibility': { description: 'Show/hide a layer {id|index|name, visible}.', run: (p) => { const l = _controlFindLayer(p) || activeLayer(); if (!l) throw new Error('layer not found'); _saveState('Toggle layer visibility'); l.visible = (p.visible === undefined) ? !l.visible : !!p.visible; composite(); _renderLayerPanel(); return l.visible; } },
@@ -11839,10 +12495,23 @@ function _buildEditor(container) {
       const plus = document.createElement('button');
       plus.type = 'button';
       plus.className = 'gallery-tab gallery-tab-new';
-      plus.title = 'New document tab';
-      plus.setAttribute('aria-label', 'New document tab');
+      plus.title = 'New edit tab';
+      plus.setAttribute('aria-label', 'New edit tab');
       plus.textContent = '+';
-      plus.addEventListener('click', () => { window.geEditorControl?.invoke('document.create', {}); });
+      // Ask for the canvas size with the same dialog as File ▸ New Image, so a
+      // new tab never silently replaces the current document's resolution.
+      plus.addEventListener('click', async () => {
+        const size = await _promptCanvasSize({
+          title: 'New edit',
+          okLabel: 'Create',
+          initialW: 1920,
+          initialH: 1080,
+          showUnits: true,
+          showPresets: true,
+        });
+        if (!size || !(size.w > 0) || !(size.h > 0)) return;
+        window.geEditorControl?.invoke('document.create', { width: size.w, height: size.h, name: 'Untitled' });
+      });
       extra.appendChild(plus);
     } catch (_) {}
   };
@@ -11859,7 +12528,12 @@ function _buildEditor(container) {
       }
       if (state.documentId === id) {
         const next = _openDocuments[Math.max(0, idx - 1)];
-        if (next) window.geEditorControl?.invoke('document.switch', { id: next.id });
+        if (next) {
+          state.documentId = next.id;
+          _suppressDocSync = true;
+          Promise.resolve(window.geEditorControl?.invoke('document.switch', { id: next.id }))
+            .finally(() => { _suppressDocSync = false; });
+        }
       } else {
         _renderEditorDocTabs();
       }
@@ -11867,6 +12541,14 @@ function _buildEditor(container) {
   };
   if (typeof window !== 'undefined') {
     window.geEditorDocTabs = _renderEditorDocTabs;
+    // The primary Edit tab's × first tries to close just the active document
+    // when several are open; the gallery keeps its close-the-editor behaviour
+    // for the last one.
+    window.geEditorCloseActiveDocument = () => {
+      if (_openDocuments.length <= 1) return false;
+      _closeEditorDoc(state.documentId);
+      return true;
+    };
     if (window.geEditorControl && !window.geEditorControl.__docTabsPatched) {
       const _origInvoke = window.geEditorControl.invoke.bind(window.geEditorControl);
       window.geEditorControl.invoke = async (op, params) => {
@@ -11971,6 +12653,22 @@ function _rasterizePlacedLayerCommand(layer) {
   uiModule?.showToast('Placed layer rasterized');
 }
 
+// Side-panel refresh hook. Set inside openEditor (after createColorPanels);
+// _renderLayerPanel is module-level but the panels live per-editor-instance,
+// so we stash the refresh callback here. Refreshes are coalesced to one per
+// frame and skipped while the rail is hidden so drags stay smooth.
+let _refreshSidePanels = null;
+let _sidePanelsRaf = 0;
+function _scheduleSidePanelRefresh() {
+  if (!_refreshSidePanels || _sidePanelsRaf) return;
+  const rail = state.container?.querySelector?.('.ge-right-panel') || document.querySelector('.ge-right-panel');
+  if (rail && rail.offsetWidth === 0) return;
+  _sidePanelsRaf = requestAnimationFrame(() => {
+    _sidePanelsRaf = 0;
+    try { _refreshSidePanels?.(); } catch (_) { /* panel not ready */ }
+  });
+}
+
 // Layer-panel renderer — implementation in editor/layer-panel.js.
 // Wrap to the legacy name so the dozens of `_renderLayerPanel()` call
 // sites scattered across the file keep working unchanged.
@@ -12010,6 +12708,10 @@ function _renderLayerPanel() {
   _syncTextControls();
   _syncShapeControls();
   _layerGeometry.sync();
+  // Keep the dock side panels (histogram/info/navigator/channels) in sync with
+  // the active layer after every edit — they are otherwise only drawn once at
+  // build time and would stay blank.
+  _scheduleSidePanelRefresh();
   return result;
 }
 
@@ -13100,6 +13802,9 @@ export function closeEditor(options = {}) {
   _setEditTabLabel(null);
   _clearActiveEditorSession();
   _unmountEditorLoading();
+  // The maximize control lives in the modal header while the editor is open;
+  // drop it on close so the header keeps only the window's own buttons.
+  document.querySelectorAll('.ge-header-max-btn').forEach((btn) => btn.remove());
   state.editorOpen = false;
   // Tear down the gallery multi-document tab strip.
   try {
@@ -13181,6 +13886,8 @@ export function closeEditor(options = {}) {
   state.mainCtx = null;
   state.selectionOverlay = null;
   state.selectionOverlayCtx = null;
+  state.penOverlay = null;
+  state.penOverlayCtx = null;
   state.quickMaskActive = false;
   state.documentCompositeCanvas = null;
   state.documentRenderReady = false;
@@ -13208,6 +13915,7 @@ export function closeEditor(options = {}) {
   state.compareBaselineCanvas = null;
   state.compareActive = false;
   state.container = null;
+  _refreshSidePanels = null;
   window.__galleryEditLive = false;
   return true;
 }

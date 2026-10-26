@@ -18,7 +18,7 @@ def test_dock_recomputes_tab_overflow_after_layout():
 def test_dock_overflow_chevron_tracks_scroll_width():
     src = DOCK.read_text(encoding="utf-8")
     assert "const overflowing = tabsEl.scrollWidth - tabsEl.clientWidth > 1;" in src
-    assert "moreEl.hidden = !overflowing;" in src
+    assert "moreEl.hidden = !(overflowing || typeof onCloseGroup === 'function');" in src
 
 
 def test_dock_hides_partial_tabs_instead_of_clipping_labels():

@@ -67,6 +67,11 @@ def test_import_and_save_live_in_the_topbar_row():
     assert "ge-win-btn ge-win-close ge-doc-tab-close" not in GALLERY
     assert "ge-editor-minimize" not in GALLERY
     assert "ge-header-max-btn svg { top: 0 !important; transform: none; }" in STYLE
+    # The adopted header button must not stack up when the editor is rebuilt.
+    assert "header.querySelectorAll('.ge-header-max-btn').forEach((stale) => stale.remove());" in GALLERY
+    assert "document.querySelectorAll('.ge-header-max-btn').forEach((btn) => btn.remove());" in GALLERY
+    # ...and the maximize glyph is centred by CSS, not an inline nudge.
+    assert 'stroke-linejoin="round"><polyline points="15 3 21 3 21 9"' in TOPBAR
 
 
 def test_save_menu_has_a_png_option():
@@ -96,7 +101,7 @@ def test_multi_document_tabs_render_in_the_gallery_tab_bar():
     assert "window.geEditorDocTabs = _renderEditorDocTabs" in GALLERY
     assert "const _renderEditorDocTabs = () => {" in GALLERY
     assert "window.geEditorControl?.invoke('document.switch', { id: doc.id })" in GALLERY
-    assert "window.geEditorControl?.invoke('document.create', {});" in GALLERY
+    assert "window.geEditorControl?.invoke('document.create', { width: size.w, height: size.h, name: 'Untitled' });" in GALLERY
     assert "gallery-tab gallery-tab-new" in GALLERY
     assert ".gallery-editor-tabs-extra { display: contents; }" in STYLE
     assert "window.geEditorDocTabs?.();" in GALLERY

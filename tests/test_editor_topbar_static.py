@@ -58,7 +58,7 @@ def test_mobile_topbar_pins_the_right_actions():
 
 def test_desktop_tool_rail_keeps_long_tool_names_readable():
     toolbar_start = STYLE.index(".ge-toolbar {")
-    toolbar_end = STYLE.index(".ge-toolbar::-webkit-scrollbar", toolbar_start)
+    toolbar_end = STYLE.index(".ge-toolbar-scroll::-webkit-scrollbar", toolbar_start)
     toolbar = STYLE[toolbar_start:toolbar_end]
     assert "width: 50px;" in toolbar
     label_rule = re.search(r"(?m)^\.ge-tool-label\s*\{([^}]*)\}", STYLE[toolbar_end:])

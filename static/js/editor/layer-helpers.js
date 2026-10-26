@@ -115,7 +115,7 @@ export function defaultAdjParams(type) {
 /** Preset names for the retained adjustment popup. */
 export function adjustmentPresetOptions(type) {
   const options = {
-    'brightness-contrast': ['Default', 'High Contrast'],
+    'brightness-contrast': ['Default', 'Brighten', 'Darken', 'Punch', 'High Contrast', 'Low Contrast', 'Faded'],
     'exposure': ['Default', 'Lift Exposure', 'Lower Exposure'],
     'white-balance': ['Default', 'Warm', 'Cool'],
     'hue-saturation': ['Default', 'Desaturate', 'Boost Color'],
@@ -135,8 +135,18 @@ export function adjustmentPresetOptions(type) {
 export function adjustmentPresetParams(type, preset) {
   const params = defaultAdjParams(type);
   switch (`${type}:${preset}`) {
+    case 'brightness-contrast:Brighten':
+      return { ...params, brightness: 1.18 };
+    case 'brightness-contrast:Darken':
+      return { ...params, brightness: 0.82 };
+    case 'brightness-contrast:Punch':
+      return { ...params, brightness: 1.04, contrast: 1.22 };
     case 'brightness-contrast:High Contrast':
       return { ...params, contrast: 1.28 };
+    case 'brightness-contrast:Low Contrast':
+      return { ...params, contrast: 0.75 };
+    case 'brightness-contrast:Faded':
+      return { ...params, brightness: 1.1, contrast: 0.85 };
     case 'exposure:Lift Exposure':
       return { ...params, exposure: 0.45 };
     case 'exposure:Lower Exposure':

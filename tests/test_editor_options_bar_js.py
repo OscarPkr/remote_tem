@@ -21,8 +21,6 @@ def test_options_bar_module_shape():
         "#ge-clone-opacity",
         "#ge-lasso-feather",
         "#ge-wand-feather",
-        "#ge-gradient-type",
-        "#ge-gradient-opacity",
     ):
         assert selector in src, selector
     # Selection modes reuse the existing wand-mode buttons rather than re-implementing.

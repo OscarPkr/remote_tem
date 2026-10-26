@@ -215,7 +215,10 @@ export function wireAIToolsMisc({
   function addEmptyLayer() {
     saveState('Add layer');
     const layer = createLayer('Layer ' + state.layers.length, state.imgWidth, state.imgHeight);
-    state.layers.push(layer);
+    // Photoshop inserts the new layer directly above the selected one.
+    const activeIndex = state.layers.findIndex(item => item.id === state.activeLayerId);
+    const insertIndex = activeIndex >= 0 ? activeIndex + 1 : state.layers.length;
+    state.layers.splice(insertIndex, 0, layer);
     state.activeLayerId = layer.id;
     renderLayerPanel();
     composite();

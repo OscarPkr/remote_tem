@@ -3,6 +3,7 @@
 // The stroke is sampled into positive/negative points plus a bounding
 // box, both already supported by the backend endpoint.
 
+import { state } from '../state.js';
 import { selectionModeForEvent } from '../selection-modifiers.js';
 
 export function createObjectSelectTool({
@@ -47,7 +48,7 @@ export function createObjectSelectTool({
     active = true;
     points = [];
     box = null;
-    mode = selectionModeForEvent(event, 'replace');
+    mode = selectionModeForEvent(event, state.wandMode || 'replace');
     const coords = canvasCoords(event);
     if (coords) addPoint(coords, event);
   };

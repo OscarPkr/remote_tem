@@ -79,6 +79,15 @@ def test_dock_css_present():
         assert token in css, token
 
 
+def test_panel_group_divider_resizes_with_a_fixed_basis():
+    src = DOCK.read_text(encoding="utf-8")
+    assert "function wireDivider(divider, groupIndex) {" in src
+    # The dragged group must keep an exact, non-shrinking basis; a `1 1` basis
+    # lets the height-constrained dock shrink it back to 0 (dead divider).
+    assert "target.style.flex = `0 0 ${Math.round(next)}px`;" in src
+    assert "1 1 ${Math.round(next)}px" not in src
+
+
 def test_status_bar_and_swatch_markup():
     topbar = (ROOT / "static/js/editor/build/topbar.js").read_text(encoding="utf-8")
     assert "ge-status-tool" in topbar
@@ -103,3 +112,14 @@ def test_3d_and_plugins_stubs_are_disabled():
 def test_dock_module_is_precached():
     sw = SW.read_text(encoding="utf-8")
     assert "'/static/js/editor/build/dock.js'" in sw
+
+
+def test_dock_divider_double_click_expands_and_restores():
+    src = DOCK.read_text(encoding="utf-8")
+    assert "divider.addEventListener('dblclick'" in src
+    assert "target.dataset.dockExpanded === '1'" in src
+    assert "target.dataset.dockPrevSize = String(" in src
+    assert "target.dataset.dockExpanded = '1';" in src
+    # a plain click from the double-click must not clear the expand flag
+    assert "let moved = false;" in src
+    assert "if (!moved) { moved = true;" in src

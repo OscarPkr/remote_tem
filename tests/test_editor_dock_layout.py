@@ -21,7 +21,7 @@ def test_dock_panel_wide_enough_for_full_tab_labels():
     panel = css.split(".ge-right-panel {")[1].split("}")[0]
     assert "width: 340px" in panel
     tab = css.split(".ge-dock-tab {")[1].split("}")[0]
-    assert "font-size: 9px" in tab
+    assert "font-size: 10px" in tab
 
 
 def test_history_and_actions_are_their_own_dock_group():

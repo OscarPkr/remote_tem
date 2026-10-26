@@ -24,7 +24,7 @@ def test_gallery_attaches_affordance_to_both_rails():
     src = GALLERY.read_text(encoding="utf-8")
     assert "import { attachScrollAffordance } from './editor/scroll-affordance.js';" in src
     assert "attachScrollAffordance(container.querySelector('.ge-topbar-left'))" in src
-    assert "attachScrollAffordance(container.querySelector('.ge-toolbar'))" in src
+    assert "attachScrollAffordance(container.querySelector('.ge-toolbar-scroll'))" in src
 
 
 def test_mobile_css_fades_overflowing_rail_edges():
@@ -34,7 +34,7 @@ def test_mobile_css_fades_overflowing_rail_edges():
     before = css[:idx]
     assert before.rfind("@media (max-width: 700px)") > 0
     assert ".ge-topbar-left.ge-scroll-fade," in css
-    assert ".ge-toolbar.ge-scroll-fade {" in css
+    assert ".ge-toolbar-scroll.ge-scroll-fade {" in css
     assert "mask-image: linear-gradient(to right, transparent 0, #000 42px" in css
     assert ".ge-topbar-left.ge-scroll-fade.is-at-left.is-at-right," in css
-    assert ".ge-toolbar.ge-scroll-fade.is-at-left.is-at-right" in css
+    assert ".ge-toolbar-scroll.ge-scroll-fade.is-at-left.is-at-right" in css

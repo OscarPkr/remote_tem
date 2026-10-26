@@ -45,7 +45,7 @@ export function shortcutsPopupHTML() {
           <div><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>S</kbd> Save to Gallery</div>
           <div><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd> New Layer</div>
           <div><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>G</kbd> Clipping Mask</div>
-          <div><kbd>Ctrl</kbd>+<kbd>T</kbd> Free Transform</div>
+          <div><kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>T</kbd> Free Transform</div>
           <div><kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>T</kbd> Canvas size…</div>
         </div>
         <div class="ge-shortcuts-col">

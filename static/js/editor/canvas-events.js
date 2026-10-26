@@ -136,12 +136,15 @@ export function wireCanvasEvents({ canvasArea, beginDraw, continueDraw, endDraw,
   };
   state.mainCanvas.addEventListener('pointerup', endPen);
   state.mainCanvas.addEventListener('pointercancel', endPen);
-  // Lasso can start OUTSIDE the canvas — fallback mousedown on the
-  // surrounding canvas-area so the user can begin a lasso path in
-  // the empty space around the image. Other tools stay canvas-only.
+  // Lasso and Crop can start OUTSIDE the canvas — fallback mousedown on the
+  // surrounding canvas-area so the user can begin a path/rect in the empty
+  // space around the image. Other tools stay canvas-only.
   canvasArea.addEventListener('mousedown', (e) => {
-    if (state.tool !== 'lasso') return;
+    if (state.tool !== 'lasso' && state.tool !== 'crop') return;
     if (e.target === state.mainCanvas) return; // already handled
+    // Ignore presses on editor chrome inside the area (the crop Apply panel,
+    // popups, buttons) so clicking Apply does not start a fresh crop.
+    if (e.target.closest?.('button, input, select, textarea, .ge-crop-apply, .ge-adj-popup, .ge-transform-popup, .ge-fx-popup, .ge-inpaint-popup, .ge-controls, .ge-right-panel, .ge-fx-menu')) return;
     beginDraw(e);
   });
   state.mainCanvas.addEventListener('mouseenter', (e) => {
@@ -302,7 +305,10 @@ export function wireCanvasEvents({ canvasArea, beginDraw, continueDraw, endDraw,
   };
   canvasArea.addEventListener('pointerdown', (e) => {
     const directPan = isDirectPanIntent(state.tool, state.spacePanActive, e.button);
-    if (state.tool === 'lasso' && !directPan) return;
+    // With the crop (or lasso) tool, an empty-area press draws a rect/path
+    // rather than panning — so the crop can be pulled out past the image.
+    // Space-held / middle-mouse (directPan) still pans.
+    if ((state.tool === 'lasso' || state.tool === 'crop') && !directPan) return;
     if (e.target.closest('button, input, .ge-adj-popup, .ge-transform-popup, .ge-fx-popup, .ge-inpaint-popup, .ge-controls, .ge-right-panel, .ge-fx-menu')) return;
     const onImage = e.target === state.mainCanvas || e.target === state.transformOverlay;
     if (onImage && !directPan) return;

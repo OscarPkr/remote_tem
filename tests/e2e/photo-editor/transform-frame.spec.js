@@ -5,7 +5,7 @@ const { openBlankEditor } = require('./helpers');
 test('transform frame exposes eight accurate handles and supports edge resize', async ({ page }) => {
   await openBlankEditor(page, { width: 640, height: 480 }, 'Transform frame');
   await selectTool(page, 'transform');
-  await expect(page.locator('.ge-transform-popup')).toBeVisible();
+  await expect(page.locator('#ge-transform-section')).toBeVisible();
 
   const frame = await page.evaluate(async () => {
     const { state } = await import('/static/js/editor/state.js');
@@ -154,7 +154,7 @@ test('rotated frame moves only from its visible interior and supports keyboard n
   })).toEqual({ x: 250, y: 180 });
 
   await page.keyboard.press('Escape');
-  await expect(page.locator('.ge-transform-popup')).toBeHidden();
+  await expect(page.locator('#ge-transform-section')).toBeHidden();
   await expect.poll(async () => page.evaluate(async () => {
     const { state } = await import('/static/js/editor/state.js');
     return state.transformActive;
@@ -216,7 +216,7 @@ test('mobile touch input can grab every transform handle', async ({ browser, bro
   try {
     await openBlankEditor(page, { width: 640, height: 480 }, 'Mobile transform handles');
     await selectTool(page, 'transform');
-    await expect(page.locator('.ge-transform-popup')).toBeVisible();
+    await expect(page.locator('#ge-transform-section')).toBeVisible();
     const cdp = await context.newCDPSession(page);
     const ids = ['tl', 't', 'tr', 'r', 'br', 'b', 'bl', 'l', 'rot'];
 
@@ -323,7 +323,7 @@ test('mobile touch input can grab every transform handle', async ({ browser, bro
 test('transform handle keeps tracking when the pointer crosses the right panel', async ({ page }) => {
   await openBlankEditor(page, { width: 640, height: 480 }, 'Transform overshoot');
   await selectTool(page, 'transform');
-  await expect(page.locator('.ge-transform-popup')).toBeVisible();
+  await expect(page.locator('#ge-transform-section')).toBeVisible();
 
   const setup = await page.evaluate(async () => {
     const { state } = await import('/static/js/editor/state.js');

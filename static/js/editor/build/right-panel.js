@@ -28,7 +28,7 @@
 import { state } from '../state.js';
 import { buildDock } from './dock.js';
 
-export function buildRightPanel({ controlsHTML, layerPanelHTML, extraPanels = [] }) {
+export function buildRightPanel({ controlsHTML, layerPanelHTML, extraPanels = [], onCloseGroup = null }) {
   const rightPanel = document.createElement('div');
   rightPanel.className = 'ge-right-panel';
   // Desktop: present Tool Options + Layers as tabs in a dock. Mobile
@@ -236,6 +236,7 @@ export function buildRightPanel({ controlsHTML, layerPanelHTML, extraPanels = []
       // Narrow desktop columns get the compact selector fallback; the
       // multi-group stack needs a bit more room to be usable.
       compact: window.innerWidth <= 820,
+      onCloseGroup,
     });
     rightPanel.appendChild(dock.dock);
     // Layers stays pinned below the dock so the layer list is always

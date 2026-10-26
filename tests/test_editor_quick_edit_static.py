@@ -52,7 +52,7 @@ def test_quick_edit_flip_and_rotate_accept_numeric_degrees():
 
 def test_quick_edit_transforms_do_not_add_a_second_undo_snapshot():
     start = EDITOR.index("if (/\\brotate\\b.*\\b180\\b")
-    end = EDITOR.index("const _bgRemove = ", start)
+    end = EDITOR.index("if (_looksBackgroundRemoval(p)) {", start)
     transform_block = EDITOR[start:end]
     assert "_saveState('Rotate" not in transform_block
     assert "_saveState('Flip" not in transform_block
@@ -163,7 +163,7 @@ def test_brush_preset_picker_is_visible_in_the_options_bar():
 def test_pixel_brush_shows_a_square_cursor():
     # The pixel brush draws hard squares, so the cursor preview is a square
     # snapped to whole pixels rather than a feathered circle.
-    assert "const pixelBrush = !!state.brushPixel && (state.tool === 'brush' || state.tool === 'eraser');" in EDITOR
+    assert "const pixelBrush = state.tool === 'pixel' || (!!state.brushPixel && (state.tool === 'brush' || state.tool === 'eraser'));" in EDITOR
     assert "state.cursorEl.classList.toggle('ge-brush-cursor--pixel', pixelBrush);" in EDITOR
     assert ".ge-brush-cursor.ge-brush-cursor--pixel" in STYLE
     assert "border-radius: 0;" in STYLE
@@ -207,9 +207,13 @@ def test_quick_edit_is_local_first_and_only_uses_ai_when_needed():
     assert "const planned = await _runLocalPlan(prompt);" in wrapper
     assert "if (tryLocal && !_looksGenerative(prompt)) {" in wrapper
     assert wrapper.index("_runLocalPlan(prompt)") < wrapper.index("agent.run(_enrichLookPrompt(prompt)")
-    # Routing mode selector: auto / quick / agent / image, with a helper.
+    # Routing mode selector: auto / gen / edit, with a helper.
     assert "function _getQuickEditMode() {" in EDITOR
     assert "id=\"ge-ai-command-mode\"" in EDITOR
+    assert "<option value=\"auto\">Auto</option>" in EDITOR
+    assert "<option value=\"gen\">Img Gen</option>" in EDITOR
+    assert "<option value=\"edit\">Img Edit</option>" in EDITOR
+    assert EDITOR.index('<option value="auto">Auto</option>') < EDITOR.index('<option value="gen">Img Gen</option>')
     assert "const mode = _getQuickEditMode();" in wrapper
     # Auto/Image/Tab fall through to the IMAGE MODEL, not a filter planner.
     assert "const _runImageModelEdit = async (prompt, { signal = null } = {}) => {" in EDITOR
@@ -232,7 +236,11 @@ def test_quick_edit_is_local_first_and_only_uses_ai_when_needed():
     assert "'Nothing to trim — the image already fills the canvas.'" in wrapper
     assert "invoke('document.crop', { x: b.x, y: b.y, width: b.w, height: b.h })" in wrapper
     # Deterministic ops are skipped in agent/image/Tab mode.
-    assert "const tryLocal = !forceAi && !forceAgent && mode !== 'image';" in wrapper
+    # Deterministic ops run in Auto only; Gen/Edit/Tab skip them.
+    assert "const tryLocal = !forceAi && mode === 'auto';" in wrapper
+    # Gen = text-to-image on a new layer; Edit = the image edit model only.
+    assert "if (mode === 'gen') {" in wrapper
+    assert "if (mode === 'edit' && !forceAi) {" in wrapper
     assert "if (tryLocal && /\\b(?:crop|trim)\\b/i.test(cropText) && !hasRatio && !/\\bselection\\b|\\bselected\\b/i.test(cropText)) {" in wrapper
 
 
@@ -306,7 +314,7 @@ def test_ai_work_glows_the_canvas():
     assert "height: Math.max(1, area.clientHeight)," in EDITOR
     assert "area.style.setProperty('--ge-ai-busy-w'" in EDITOR
     assert ".ge-canvas-area.ge-canvas-ai-busy::after" in STYLE
-    assert "background: rgba(6, 14, 9, 0.38);" in STYLE
+    assert "background: color-mix(in srgb, var(--bg, #111) 62%, transparent);" in STYLE
     assert "left: var(--ge-ai-busy-x, 0px);" in STYLE
     assert "width: var(--ge-ai-busy-w, 100%);" in STYLE
     assert "@keyframes ge-ai-canvas-sheen" in STYLE
@@ -490,9 +498,19 @@ def test_remove_background_intent_matches_common_phrasings():
     # The bg-removal fast path must catch "removal" (not just "remove"),
     # "bg remov", "remove bg", "no background", "cutout", "isolate the
     # subject" etc. — otherwise these fall through to the AI agent.
-    assert "const _bgRemove = " in EDITOR
+    assert "const _looksBackgroundRemoval = " in EDITOR
     assert "remov\\w*|erase|delete|drop|get\\s*rid\\s*of|cut\\s*out|cutout|knock\\s*out|isolate|strip|clear|transparent|no|without|rm" in EDITOR
-    assert "if (_bgRemove) {" in EDITOR
+    assert "if (_looksBackgroundRemoval(p)) {" in EDITOR
+
+
+def test_remove_background_never_falls_back_to_the_generative_model():
+    # A rembg outage must report the failure, not send "remove background" to
+    # the image model (which repainted a blank canvas instead).
+    guard = EDITOR[EDITOR.index("if (_looksBackgroundRemoval(prompt)) {"):]
+    guard = guard[:guard.index("// Explicit \"harmonize / blend the layers\"")]
+    assert "await _executeQuickEditLocal(prompt);" in guard
+    assert "Could not remove the background:" in guard
+    assert "_runImageModelEdit" not in guard
 
 
 def test_remove_background_mask_is_a_layer_mask():
@@ -698,3 +716,43 @@ def test_generation_503_is_handled_gracefully():
     assert "if (status === 503) return _GEN_DISABLED_MSG;" in EDITOR
     assert "_GEN_DISABLED_MSG = 'Image generation is switched off on the server at the moment.'" in EDITOR
     assert "window.__geGenerationDisabled" in EDITOR
+
+
+def test_sending_a_prompt_returns_focus_to_the_document():
+    # After Enter the prompt box used to keep focus, so pressing V (Move) or B
+    # (Brush) typed into an empty prompt instead of switching tools.
+    start = EDITOR.index("const enqueueQuickEditJob = (prompt, forceAi = false) => {")
+    body = EDITOR[start:start + 1400]
+    assert "input.blur();\n    pumpQuickEdit();" in body
+    assert "input.focus();\n    pumpQuickEdit();" not in body
+
+
+def test_edit_scope_control_chooses_all_layers_or_the_selected_layer():
+    # "Edit" used to always send the flattened document; the scope control next
+    # to the routing dropdown lets the selected layer be sent on its own.
+    assert 'id="ge-ai-command-scope"' in EDITOR
+    assert '<option value="all">All layers</option>' in EDITOR
+    assert '<option value="layer">This layer</option>' in EDITOR
+    assert "localStorage.getItem('ge-ai-command-edit-scope')" in EDITOR
+    assert "localStorage.setItem('ge-ai-command-edit-scope', scopeSelect.value);" in EDITOR
+    assert "scopeSelect.hidden = modeSelect.value === 'gen';" in EDITOR
+    assert "const _aiEditSourceCanvas = () => {" in EDITOR
+    assert "const flat = _aiEditSourceCanvas();" in EDITOR
+    assert "if (scope !== 'layer') return flatten();" in EDITOR
+    assert "out.getContext('2d').drawImage(layer.canvas, off.x, off.y);" in EDITOR
+    assert ".ge-ai-command .ge-ai-command-scope" in STYLE
+
+
+def test_cancel_aborts_the_in_flight_image_request():
+    # Cancel used to drop the row but leave the model call running, so the
+    # result still landed on the canvas. The job must abort the actual fetch.
+    assert "let _aiEditAbort = null;" in EDITOR
+    assert "_aiEditAbort = _ctl;" in EDITOR
+    assert "if (_aiEditAbort === _ctl) _aiEditAbort = null;" in EDITOR
+    cancel = EDITOR[EDITOR.index("const cancelJob = (job) => {"):]
+    cancel = cancel[:cancel.index("_setAiCommandStatus('', '');")]
+    assert "try { _aiEditAbort?.abort(); } catch (_) {}" in cancel
+    css = (ROOT / "static/css/13-image-editor.css").read_text(encoding="utf-8")
+    block = css[css.index(".ge-ai-job-cancel {"):]
+    block = block[:block.index("}")]
+    assert "top: -2px;" in block

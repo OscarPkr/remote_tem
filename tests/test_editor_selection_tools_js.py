@@ -51,11 +51,18 @@ def test_toolbar_declares_new_selection_tools():
 
 
 def test_eyedropper_icon_is_a_pipette_not_the_brush():
-    # The eyedropper and the brush must read as different tools at a glance,
-    # so the eyedropper uses a pipette (pointed tip + bulb), not a brush head.
+    # The eyedropper must read as an actual dropper at a glance, so it uses the
+    # pipette glyph (bulb + barrel + pointed tip), not a droplet or a brush head.
     assert "m2 22 1-1h3l9-9" in TOOLBAR
-    assert "m15 6 3.4-3.4a2.1 2.1 0 1 1 3 3" in TOOLBAR
-    assert "M9.06 11.9l8.07-8.06a2.85" in TOOLBAR
+    assert "M3 21v-3l9-9" in TOOLBAR
+    assert "3.4-3.4a2.1 2.1 0 1 1 3 3" in TOOLBAR
+
+
+def test_eyedropper_tool_uses_a_live_pipette_cursor():
+    # Picking the Eyedropper swaps the canvas cursor for the pipette (tip at the
+    # hotspot) instead of leaving the default crosshair.
+    assert "const eyedropperCursorSvg = `data:image/svg+xml;utf8,${encodeURIComponent(" in GALLERY
+    assert "else if (state.tool === 'eyedropper') cursor = `url(\"${eyedropperCursorSvg}\") 2 22, crosshair`;" in GALLERY
 
 
 def test_all_toolbar_tool_icons_are_uniform_svgs():
@@ -115,13 +122,15 @@ def test_editor_wires_tools_and_color_range():
     assert "if (state.tool === 'objectselect') return _objectSelectTool.end(e);" in GALLERY
     assert "async function _colorRangeSelection()" in GALLERY
     assert "colorRange: _colorRangeSelection," in GALLERY
-    assert "data-tool=\"quickselect\"" in GALLERY
-    assert "data-tool=\"objectselect\"" in GALLERY
+    assert "const toolBtn = (id) => state.container.querySelector(" in GALLERY
+    assert '.ge-tool-btn[data-tool="${id}"], .ge-tool-btn[data-tool-option="${id}"]' in GALLERY
+    assert "const quickSelectBtn = toolBtn('quickselect');" in GALLERY
+    assert "const objectSelectBtn = toolBtn('objectselect');" in GALLERY
 
 
 def test_options_bar_and_select_menu_entries():
-    assert "quickselect:  { modes: '#ge-quickselect-section',  feather: null }" in OPTIONS_BAR
-    assert "objectselect: { modes: '#ge-objectselect-section', feather: null }" in OPTIONS_BAR
+    assert "quickselect:  { modes: null, feather: null }" in OPTIONS_BAR
+    assert "objectselect: { modes: null, feather: null }" in OPTIONS_BAR
     assert 'data-selection-action="colorRange"' in TOPBAR
     assert "action === 'colorRange'" in WIRE_MENUS
     assert "colorRange," in WIRE_MENUS

@@ -47,7 +47,9 @@ def test_tool_key_selects_its_tool(tool, key):
     assert ("\n  " + tool + ": { label: '") in TOOLBAR_JS
     # … and the keyboard handler focuses the palette by key.
     assert "const toolId = toolKeyMap[e.key.toLowerCase()];" in KEYBOARD_JS
-    assert 'const toolBtn = toolbar.querySelector(`[data-tool="${toolId}"]`) || toolbar.querySelector(`[data-tool-option="${toolId}"]`);' in KEYBOARD_JS
+    assert 'const flyoutItem = toolbar.querySelector(`[data-tool-option="${toolId}"]`);' in KEYBOARD_JS
+    assert "const slotEl = flyoutItem ? flyoutItem.closest('.ge-tool-slot') : null;" in KEYBOARD_JS
+    assert "toolBtn = toolBtn || toolbar.querySelector(`[data-tool=\"${toolId}\"]`) || flyoutItem;" in KEYBOARD_JS
     assert "if (toolBtn) toolBtn.click();" in KEYBOARD_JS
 
 

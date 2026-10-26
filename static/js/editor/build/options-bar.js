@@ -13,7 +13,7 @@
  * On phones (<= 820px) the bar is hidden by CSS and the right-panel
  * bottom sheet remains the single surface, exactly as before.
  */
-import { TOOLS } from './toolbar.js?v=20261008flyouts';
+import { TOOLS } from './toolbar.js?v=20261010brushpresets';
 import { state } from '../state.js';
 
 // Per-tool option sources. Each value is a CSS selector for an existing
@@ -21,23 +21,29 @@ import { state } from '../state.js';
 const BRUSH_TOOLS = {
   brush:   { size: '.ge-size-slider', opacity: '#ge-brush-opacity', flow: '#ge-brush-flow', softness: '#ge-brush-softness' },
   smudge:  { size: '.ge-size-slider', opacity: '#ge-brush-opacity', flow: '#ge-brush-flow', softness: '#ge-brush-softness' },
-  dodge:   { size: '.ge-size-slider', opacity: '#ge-brush-opacity', flow: '#ge-brush-flow', softness: '#ge-brush-softness' },
-  burn:    { size: '.ge-size-slider', opacity: '#ge-brush-opacity', flow: '#ge-brush-flow', softness: '#ge-brush-softness' },
+  dodge:   { size: '.ge-size-slider', opacity: '#ge-brush-opacity', flow: '#ge-brush-flow', softness: '#ge-brush-softness', intensity: '#ge-dodgeburn-intensity' },
+  burn:    { size: '.ge-size-slider', opacity: '#ge-brush-opacity', flow: '#ge-brush-flow', softness: '#ge-brush-softness', intensity: '#ge-dodgeburn-intensity' },
   eraser:  { size: '.ge-size-slider', opacity: '#ge-eraser-opacity', flow: '#ge-eraser-flow', softness: '#ge-eraser-softness' },
   clone:   { size: '.ge-size-slider', opacity: '#ge-clone-opacity', flow: '#ge-clone-flow', softness: '#ge-clone-softness' },
   heal:    { size: '.ge-size-slider', opacity: '#ge-clone-opacity', flow: '#ge-clone-flow', softness: '#ge-clone-softness' },
 };
 
 const SELECTION_TOOLS = {
-  marquee: { modes: '#ge-marquee-section', feather: null },
-  lasso:   { modes: '#ge-lasso-section',   feather: '#ge-lasso-feather' },
-  wand:    { modes: '#ge-wand-section',    feather: '#ge-wand-feather' },
-  quickselect:  { modes: '#ge-quickselect-section',  feather: null },
-  objectselect: { modes: '#ge-objectselect-section', feather: null },
-  sam:     { modes: '#ge-sam-section',     feather: null },
+  marquee: { modes: null, feather: null },
+  lasso:   { modes: null, feather: '#ge-lasso-feather' },
+  wand:    { modes: null, feather: '#ge-wand-feather' },
+  quickselect:  { modes: null, feather: null },
+  objectselect: { modes: null, feather: null },
+  sam:     { modes: null, feather: null },
 };
 
-const MODE_LABELS = [['replace', 'New'], ['add', '+'], ['subtract', '−'], ['intersect', '∩']];
+// Liquify is not a brush: it exposes its own mode plus dab size and strength.
+const LIQUIFY_TOOLS = {
+  liquify: { size: '#ge-liquify-size', strength: '#ge-liquify-strength' },
+};
+
+const INTERSECT_ICON = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true" style="position:relative;top:2px"><circle cx="9" cy="12" r="6"/><circle cx="15" cy="12" r="6"/></svg>';
+const MODE_LABELS = [['replace', 'New'], ['add', '+'], ['subtract', '−'], ['intersect', INTERSECT_ICON]];
 
 function resolve(selector) {
   if (!selector) return null;
@@ -75,7 +81,7 @@ function makeSelect(label, sourceSelector) {
 function makeAutoSelect() {
   return `
     <label class="ge-opt ge-auto-select-option" data-opt="check">
-      <input type="checkbox" id="ge-auto-select-layer" />
+      <input type="checkbox" id="ge-auto-select-layer" class="ge-ctl-check" />
       <span class="ge-opt-label">Auto-Select</span>
     </label>
     <div class="ge-opt" data-opt="select">
@@ -103,13 +109,16 @@ function buildToolControls(toolId) {
     parts.push(makeRange('Opacity', src.opacity));
     parts.push(makeRange('Flow', src.flow));
     parts.push(makeRange('Softness', src.softness));
+    if (src.intensity) parts.push(makeRange('Intensity', src.intensity));
   } else if (SELECTION_TOOLS[toolId]) {
     const src = SELECTION_TOOLS[toolId];
-    parts.push(makeModes(src.modes));
+    if (src.modes) parts.push(makeModes(src.modes));
     if (src.feather) parts.push(makeRange('Feather', src.feather, { suffix: 'px' }));
-  } else if (toolId === 'gradient') {
-    parts.push(makeSelect('Type', '#ge-gradient-type'));
-    parts.push(makeRange('Opacity', '#ge-gradient-opacity'));
+  } else if (LIQUIFY_TOOLS[toolId]) {
+    const src = LIQUIFY_TOOLS[toolId];
+    parts.push(makeSelect('Mode', '#ge-liquify-mode'));
+    parts.push(makeRange('Size', src.size, { suffix: 'px' }));
+    parts.push(makeRange('Strength', src.strength));
   } else if (toolId === 'move') {
     parts.push(makeAutoSelect());
   }
@@ -157,12 +166,25 @@ export function syncOptionsBar(bar) {
 export function renderOptionsBar(bar, toolId) {
   if (!bar) return;
   bar.dataset.optionsTool = toolId;
-  const hasControls = !!(BRUSH_TOOLS[toolId] || SELECTION_TOOLS[toolId] || toolId === 'gradient' || toolId === 'move');
+  const hasControls = !!(BRUSH_TOOLS[toolId] || SELECTION_TOOLS[toolId] || LIQUIFY_TOOLS[toolId] || toolId === 'gradient' || toolId === 'move');
   // Keep the strip mounted at a stable height for every tool. Hiding it
   // for tools without options reflows the centered canvas-area and makes
   // the canvas jump vertically when switching tools; an empty strip is
   // visually harmless.
   bar.classList.toggle('ge-options-empty', !hasControls);
+
+  // Brush-family tools now expose their secondary rows (spacing / smoothing /
+  // blend / pen pressure) through their own caret dropdown in the strip, so
+  // the generic "..." overflow button is retired for every tool.
+  const moreBtn = bar.querySelector('#ge-options-more');
+  if (moreBtn) {
+    const showMore = false;
+    moreBtn.hidden = !showMore;
+    if (!showMore) {
+      bar.classList.remove('ge-more-open');
+      moreBtn.setAttribute('aria-expanded', 'false');
+    }
+  }
 
   const icon = bar.querySelector('.ge-options-tool-icon');
   const name = bar.querySelector('.ge-options-tool-name');

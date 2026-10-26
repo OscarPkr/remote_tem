@@ -116,10 +116,18 @@
   box-sizing: border-box;
   border-bottom: 1px solid var(--border);
   background: color-mix(in srgb, var(--panel) 92%, var(--fg) 8%);
+  position: relative;
   overflow-x: auto;
   overflow-y: hidden;
   scrollbar-width: thin;
 }
+/* A wand "More" dropdown must escape the bar's scroll clip while open. */
+.ge-options-bar:has(#ge-wand-more-menu:not([hidden])) { overflow: visible; }
+.ge-options-bar:has(#ge-brush-more-menu:not([hidden])) { overflow: visible; }
+.ge-options-bar:has(#ge-lasso-more-menu:not([hidden])) { overflow: visible; }
+.ge-options-bar:has(#ge-sam-more-menu:not([hidden])) { overflow: visible; }
+.ge-options-bar:has(#ge-quickselect-more-menu:not([hidden])) { overflow: visible; }
+.ge-options-bar:has(#ge-objectselect-more-menu:not([hidden])) { overflow: visible; }
 .ge-options-tool {
   display: flex;
   align-items: center;
@@ -146,7 +154,10 @@
   display: flex;
   align-items: center;
   gap: 14px;
-  flex: 1 1 auto;
+  /* Shrink to content instead of growing: an empty mirror body otherwise
+     expands and leaves a large blank gap before the relocated tool controls,
+     pushing them away from the left edge of the strip. */
+  flex: 0 1 auto;
   min-width: 0;
 }
 /* Tool options moved out of the dock into the options bar (Photoshop):
@@ -155,7 +166,9 @@
    this compact strip; the authoritative sliders mirror the contextual
    strip, so duplicated ranges are hidden. */
 .ge-options-bar .ge-controls.ge-controls--in-options {
-  flex: 0 1 auto;
+  /* Grow to fill the strip so the selection action row can be pinned to the
+     right edge of the screen. */
+  flex: 1 1 auto;
   flex-direction: row;
   flex-wrap: nowrap;
   align-items: center;
@@ -169,6 +182,15 @@
 }
 .ge-controls--in-options .ge-section-title,
 .ge-controls--in-options .ge-section-hint { display: none; }
+/* The "rembg not installed" notice would otherwise be a two-line block and
+   double the strip height; keep the install action, drop the essay. */
+.ge-controls--in-options #ge-rembg-dep-missing {
+  padding: 0;
+  border: 0;
+  background: none;
+  gap: 8px;
+}
+.ge-controls--in-options #ge-rembg-dep-missing .ge-dep-notice-text { display: none; }
 .ge-controls--in-options > section,
 .ge-controls--in-options > div { flex: 0 0 auto; }
 /* Lay out every visible tool section as one horizontal strip. Hidden
@@ -180,7 +202,57 @@
   flex-wrap: nowrap !important;
   align-items: center;
   gap: 12px;
+  /* Let the active tool section span the strip so its action row can be
+     pushed to the right edge. */
+  flex: 1 1 auto;
 }
+/* The Text tool's option set is too wide for the thin strip: let the bar grow
+   and wrap onto extra rows instead of clipping the trailing fields. */
+.ge-options-bar.ge-options-tall {
+  flex-wrap: wrap;
+  align-items: center;
+  overflow-y: visible;
+  row-gap: 4px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+/* The active tool's name already sits in the rail; on the tall (Text) strip
+   its label would claim a whole line and shove the controls down. */
+.ge-options-bar.ge-options-tall .ge-options-tool { display: none; }
+.ge-options-bar.ge-options-tall .ge-controls--in-options {
+  flex: 1 1 auto;
+  flex-wrap: wrap !important;
+  row-gap: 4px;
+}
+.ge-options-bar.ge-options-tall .ge-controls--in-options > div:not([style*="display:none"]):not([style*="display: none"]) {
+  flex-wrap: wrap !important;
+  row-gap: 4px;
+}
+/* The Text section's own field groups must wrap onto their own rows too,
+   otherwise the trailing format/Warp fields run past the right edge. */
+.ge-options-bar.ge-options-tall .ge-controls--in-options .ge-text-section {
+  display: flex !important;
+  flex-wrap: wrap !important;
+  align-items: flex-end;
+  gap: 8px;
+  width: 100%;
+}
+.ge-options-bar.ge-options-tall .ge-controls--in-options .ge-text-section > * {
+  flex: 0 0 auto;
+}
+.ge-options-bar.ge-options-tall .ge-controls--in-options .ge-text-section > textarea {
+  flex: 1 1 240px;
+  min-width: 240px;
+}
+
+/* The brush sliders (Opacity/Flow/Softness) are a touch tight against the
+   strip width once the Color/Size/preset controls are inline; trim the
+   gutters so the whole brush strip fits on one line. */
+.ge-controls--in-options #ge-brush-section { gap: 6px; }
+/* The brush controls (Color/Size/preset/caret) hug their content; only the
+   trailing slider section grows, so the Opacity/Flow/Softness group sits
+   right after the caret instead of leaving a wide gap. */
+.ge-controls--in-options #ge-brush-controls { flex: 0 0 auto; }
 .ge-controls--in-options .ge-control-row {
   margin: 0;
   flex: 0 0 auto;
@@ -190,6 +262,68 @@
   gap: 6px;
 }
 .ge-controls--in-options .ge-control-row label { white-space: nowrap; }
+/* The selection action row (visibility, clear ×, Invert, Erase, Copy Layer,
+   To Mask, Quick Mask) rides a touch high in the thin strip; nudge it up 2px
+   to sit on the same optical line as the Style/Free row before it. */
+.ge-controls--in-options .ge-control-row.ge-actions { position: relative; top: -2px; margin-left: auto; }
+/* The action buttons themselves ride ~2px below the mode/Style rows in the
+   thin strip; lift them so the whole row reads on one line (wand + marquee). */
+.ge-controls--in-options .ge-control-row.ge-actions .ge-btn {
+  position: relative;
+  top: -2px;
+}
+/* Pen selection: the action row belongs on the left edge (not pushed right by
+   the shared auto margin), and its ✓ should sit on the same optical line as
+   the ✕ in Cancel. */
+#ge-pen-section .ge-control-row.ge-actions { margin-left: 0; }
+#ge-pen-commit svg { position: relative; top: 2px; }
+/* Nudge the Clear ✕ glyph down 1px, and light it up (accent) while a
+   selection is active so it is obvious there is something to clear. */
+#ge-marquee-clear svg,
+#ge-wand-clear svg,
+#ge-lasso-clear svg,
+#ge-sam-clear svg,
+#ge-quickselect-clear svg,
+#ge-objectselect-clear svg { position: relative; top: 1px; }
+#ge-marquee-clear.has-selection,
+#ge-wand-clear.has-selection,
+#ge-lasso-clear.has-selection,
+#ge-sam-clear.has-selection,
+#ge-quickselect-clear.has-selection,
+#ge-objectselect-clear.has-selection { color: var(--accent, var(--red)); border-color: color-mix(in srgb, var(--accent, var(--red)) 55%, var(--border)); }
+/* The Clone "clear sampled source" ✕ matches the wand/marquee ✕: the SVG cross
+   sits 1px lower, and the button lights up (accent) while a source is set. */
+#ge-clone-source-clear svg { position: relative; top: -1px; }
+#ge-clone-source-clear.has-selection svg { top: 1px; }
+#ge-clone-source-clear.has-selection { color: var(--accent, var(--red)); border-color: color-mix(in srgb, var(--accent, var(--red)) 55%, var(--border)); }
+/* Every clear ✕ is the same square target, wherever it lives: the wand/
+   marquee/lasso/sam/quickselect/objectselect ones sit in the options strip
+   while the Clone one sits in the right panel, but they must read (and hit)
+   identically instead of inheriting each container's line-height. */
+#ge-marquee-clear,
+#ge-wand-clear,
+#ge-lasso-clear,
+#ge-sam-clear,
+#ge-quickselect-clear,
+#ge-objectselect-clear,
+#ge-clone-source-clear {
+  width: 26px;
+  height: 26px;
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  line-height: 1;
+}
+/* The marquee Style row lives in the nowrap options strip. When "Fixed
+   ratio/size" reveals the W/H inputs, their default intrinsic <input> width
+   inflates the grid's max-content and the <select> stretches super wide.
+   Bound the controls so the row stays compact. */
+.ge-controls--in-options .ge-marquee-constraint-row > select { max-width: 120px; }
+.ge-controls--in-options .ge-marquee-dimensions input { max-width: 64px; }
 /* The Text section is authored as a vertical panel. When it is relocated into
    the options bar its grids collapse to zero width, so the Font picker shrinks
    to ~14px and the Font/Size labels pile into "FoSize". Lay the text strip out
@@ -250,6 +384,8 @@
   width: 24px;
   height: 24px;
   padding: 0;
+  position: relative;
+  top: -2px;
   color: color-mix(in srgb, var(--fg) 65%, transparent);
   background: transparent;
   border: 1px solid var(--border);
@@ -333,7 +469,7 @@
   outline: 2px solid var(--accent, #4c8bf5);
   outline-offset: 1px;
 }
-.ge-opt-modes { display: inline-flex; gap: 2px; }
+.ge-opt-modes { display: inline-flex; gap: 2px; position: relative; top: -2px; }
 .ge-opt-mode {
   min-width: 26px;
   height: 24px;
@@ -570,7 +706,7 @@
 .ge-footer-zoom > .ge-btn { min-width: 28px; min-height: 26px; }
 .ge-footer-zoom .ge-zoom-stack { flex-direction: row; gap: 5px; min-width: 56px; }
 .ge-footer-zoom .ge-zoom-label { top: 0; left: 0; font-size: 11px; letter-spacing: 0; opacity: 0.8; }
-.ge-footer-zoom .ge-zoom-glyph { left: 0; }
+.ge-footer-zoom .ge-zoom-glyph { left: 0; top: 4px; }
 .ge-footer-zoom .ge-stacked-btn { min-width: 48px; }
 .gallery-editor-container {
   flex: 1;
@@ -591,21 +727,33 @@
 .ge-toolbar {
   display: flex;
   flex-direction: column;
-  gap: 2px;
-  /* Asymmetric horizontal padding shifts the whole column 4 px left —
-     buttons, hover backgrounds, active highlight pills, and section
-     separators all move together. */
-  padding: 6px 6px 6px 0;
   background: var(--panel);
   border-right: 1px solid var(--border);
   width: 50px;
   flex-shrink: 0;
   min-height: 0;
+  overflow: visible;
+}
+/* Only the tool slots scroll; the colour swatches stay pinned in the footer
+   below them instead of floating over (and blocking) the last slots. */
+.ge-toolbar-scroll {
+  display: flex;
+  flex-direction: column;
+  /* Stretch (not center) so each slot keeps the full rail width; the slot
+     itself centers its icon/label. */
+  align-items: stretch;
+  gap: 2px;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* Asymmetric horizontal padding shifts the whole column 4 px left —
+     buttons, hover backgrounds, active highlight pills, and section
+     separators all move together. */
+  padding: 6px 6px 6px 0;
   overflow-x: hidden;
   overflow-y: auto;
   scrollbar-width: none;
 }
-.ge-toolbar::-webkit-scrollbar { display: none; }
+.ge-toolbar-scroll::-webkit-scrollbar { display: none; }
 .ge-tool-sep {
   font-size: 8px;
   text-transform: uppercase;
@@ -621,10 +769,11 @@
 /* Foreground / background color swatches pinned to the bottom of the
    tool rail (Photoshop-style), with a swap button. */
 .ge-tool-swatches {
-  position: sticky;
-  bottom: 0;
-  margin-top: auto;
+  position: static;
+  flex: 0 0 auto;
+  margin-top: 0;
   padding: 10px 0 8px;
+  border-top: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -744,18 +893,31 @@
    mark). Clicking it opens the flyout; the face itself still selects. */
 .ge-tool-flyout-tri {
   position: absolute !important;
-  right: 3px !important;
-  bottom: 3px !important;
+  right: 0 !important;
+  bottom: 0 !important;
   left: auto !important;
-  width: 0;
-  height: 0;
-  border-left: 5px solid transparent;
-  border-bottom: 5px solid currentColor;
-  opacity: 0.5;
+  /* The visible corner mark is only ~7px, which is fiddly to hit, so the
+     element itself is a larger transparent hit area and the triangle is
+     painted by ::after. */
+  width: 18px;
+  height: 18px;
   z-index: 3;
   cursor: pointer;
 }
-.ge-tool-flyout-tri:hover { opacity: 0.9; }
+.ge-tool-flyout-tri::after {
+  content: '';
+  position: absolute;
+  right: 3px;
+  bottom: 3px;
+  width: 0;
+  height: 0;
+  /* A soft, themed corner mark on every flyout slot: the muted foreground
+     colour, never fully opaque, so it hints at extra tools without shouting. */
+  border-left: 7px solid transparent;
+  border-bottom: 7px solid var(--fg-muted, currentColor);
+  opacity: 0.7;
+}
+.ge-tool-flyout-tri:hover::after { opacity: 0.95; }
 .ge-tool-flyout-label { font-size: 12px; white-space: nowrap; }
 /* AI badge — same ✦ glyph the Enhance tool uses, pinned to the top-
    left of any tool button marked `ai: true`. Same color as the icon
@@ -1015,7 +1177,11 @@
   font-weight: 650;
 }
 .ge-ai-command-collapsed {
-  bottom: -16px;
+  /* Sit flush inside the canvas area: a negative offset made the pill part of
+     the scrollable overflow (the area is overflow:auto), adding a phantom
+     16px scroll range and clipping the bar. It still reads as a dim peek
+     thanks to the low opacity. */
+  bottom: 0;
   width: auto;
   min-width: 102px;
   padding: 2px 9px;
@@ -1023,9 +1189,18 @@
   border-color: color-mix(in srgb, var(--accent, var(--red)) 18%, var(--border));
   box-shadow: 0 3px 10px color-mix(in srgb, #000 16%, transparent);
 }
-.ge-canvas-area:hover .ge-ai-command-collapsed,
-.ge-ai-command-collapsed:hover,
-.ge-ai-command-collapsed:focus-within {
+/* A pointer anywhere over the canvas lightly reveals the collapsed Quick
+   Edit bar, but keeps it well translucent so it never sits fully in front of
+   the image — annoying when zoomed in. Only pointing at the bar itself (or
+   focusing it) brings it to full strength. */
+.ge-canvas-area:hover .ge-ai-command-collapsed {
+  bottom: 10px;
+  opacity: 0.55;
+  border-color: color-mix(in srgb, var(--accent, var(--red)) 42%, var(--border));
+  box-shadow: 0 8px 22px color-mix(in srgb, #000 24%, transparent);
+}
+.ge-canvas-area .ge-ai-command-collapsed:hover,
+.ge-canvas-area .ge-ai-command-collapsed:focus-within {
   bottom: 10px;
   opacity: 0.94;
   border-color: color-mix(in srgb, var(--accent, var(--red)) 42%, var(--border));
@@ -1408,6 +1583,8 @@
 .ge-ai-job-detail[hidden] { display: none; }
 .ge-ai-job-cancel {
   flex: 0 0 auto;
+  position: relative;
+  top: -2px;
   padding: 2px 6px;
   border-radius: 5px;
   border: 1px solid color-mix(in srgb, var(--red, #e5484d) 40%, transparent);
@@ -1553,7 +1730,7 @@
   z-index: 11;
   pointer-events: none;
   /* slight dark scrim under the ASCII skeleton so the glyphs read clearly */
-  background: rgba(6, 14, 9, 0.38);
+  background: color-mix(in srgb, var(--bg, #111) 62%, transparent);
 }
 .ge-canvas-area .ge-ai-ascii-fireflies {
   position: absolute;
@@ -1572,8 +1749,8 @@
   font-size: 11px;
   line-height: 1;
   letter-spacing: 0;
-  color: #b8e6c1;
-  text-shadow: 0 0 6px rgba(120, 220, 150, 0.55);
+  color: var(--accent, var(--red));
+  text-shadow: 0 0 6px color-mix(in srgb, var(--accent, var(--red)) 55%, transparent);
   background: transparent !important;
   opacity: 0;
   transition: opacity 0.25s ease;
@@ -1584,7 +1761,7 @@
   position: absolute;
   inset: 0;
   pointer-events: none;
-  background: linear-gradient(100deg, transparent 35%, rgba(184, 230, 193, 0.20) 50%, transparent 65%);
+  background: linear-gradient(100deg, transparent 35%, color-mix(in srgb, var(--accent, var(--red)) 20%, transparent) 50%, transparent 65%);
   background-size: 220% 100%;
   background-repeat: no-repeat;
   animation: ge-ai-canvas-sheen 2.2s linear infinite;
@@ -1612,6 +1789,12 @@
   image-rendering: pixelated;
   pointer-events: none;
   z-index: 4;
+}
+.ge-pen-overlay {
+  position: absolute;
+  pointer-events: none;
+  z-index: 5;
+  display: none;
 }
 .ge-quick-mask-bar {
   position: absolute;
@@ -1689,6 +1872,8 @@
   font: inherit;
 }
 .ge-marquee-dimensions .ge-icon-btn { width: 26px; height: 26px; }
+#ge-marquee-swap { position: relative; top: -1px; }
+#ge-marquee-swap svg { position: relative; left: -2px; }
 
 /* Right panel */
 .ge-right-panel {
@@ -1738,12 +1923,12 @@
 }
 .ge-layer-geometry-grid label {
   display: grid;
-  grid-template-columns: 12px minmax(0, 1fr);
+  grid-template-columns: 14px minmax(0, 1fr);
   align-items: center;
   gap: 2px;
   min-width: 0;
   color: var(--color-muted);
-  font-size: 9px;
+  font-size: 10px;
 }
 .ge-layer-geometry-grid input {
   width: 100%;
@@ -1793,8 +1978,9 @@
 .ge-pressure-option .toggle-switch { width: 24px; height: 14px; }
 .ge-pressure-option .toggle-slider::before { width: 10px; height: 10px; }
 .ge-pressure-option .toggle-switch input:checked + .toggle-slider::before { transform: translateX(10px); }
-.ge-brush-preset-row select { flex: 1 1 auto; min-width: 0; }
-.ge-brush-preset-row .ge-btn { flex: 0 0 auto; }
+.ge-brush-preset-row select { flex: 1 1 auto; min-width: 0; height: 24px; }
+.ge-brush-preset-row .ge-btn { flex: 0 0 auto; height: 24px; display: inline-flex; align-items: center; position: relative; top: -3px; }
+.ge-brush-preset-row .ge-btn[hidden] { display: none !important; }
 .ge-text-section,
 .ge-shape-section {
   display: flex;
@@ -1887,14 +2073,44 @@
   box-sizing: border-box;
   padding: 4px;
   overflow: hidden;
-  resize: both;
+  resize: none;
   border: 1px dashed var(--red);
   outline: 1px solid color-mix(in srgb, var(--red) 24%, transparent);
   border-radius: 2px;
-  background: color-mix(in srgb, var(--bg) 8%, transparent);
+  background: transparent;
   caret-color: var(--red);
   transform-origin: top left;
   box-shadow: none;
+}
+/* `body.ge-editor-open textarea` (documents-gallery-editor.css) is more
+   specific, so restate the transparent surface here: the artwork must stay
+   visible behind the on-canvas text while typing. */
+body.ge-editor-open textarea.ge-direct-text-editor {
+  background: transparent;
+  border: 1px dashed var(--red);
+  border-radius: 2px;
+}
+.ge-direct-text-handle {
+  position: fixed;
+  z-index: 10021;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin: -8px 0 0 -8px;
+  border: 0;
+  background: transparent;
+  color: #fff;
+  opacity: 0.55;
+  filter: drop-shadow(0 0 1px rgba(0, 0, 0, 0.9));
+  cursor: nwse-resize;
+  touch-action: none;
+  transition: opacity 0.12s ease;
+}
+.ge-direct-text-handle:hover,
+.ge-direct-text-handle:active {
+  opacity: 1;
 }
 
 /* Floating Transform popup — horizontal layout, draggable from
@@ -1973,7 +2189,50 @@
   padding: 4px 12px;
   min-width: 0;
 }
+/* Cancel + Apply share the right edge of the popup body. */
+.ge-transform-popup-body #ge-transform-cancel-btn {
+  margin-left: auto;
+}
 .ge-transform-popup-hint { padding: 0 12px; }
+/* Transform controls render inline in the editor options strip (header bar)
+   rather than in a floating popup. The section reuses the popup markup but
+   flattens the wrappers so every control sits on a single row. */
+#ge-transform-section {
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 6px;
+  overflow-x: auto;
+  overflow-y: visible;
+}
+#ge-transform-section .ge-transform-popup,
+#ge-transform-section .ge-transform-popup-body { display: contents; }
+/* The head sets `display: flex !important` for the floating popup, so the
+   strip must out-rank it to flatten the wrapper. */
+#ge-transform-section .ge-transform-popup-head { display: contents !important; }
+/* Drop the drag header chrome, the hint and the duplicated minimise/close
+   buttons so only the aspect lock + controls remain. */
+#ge-transform-section .ge-transform-popup-head .ge-adj-icon,
+#ge-transform-section .ge-transform-popup-head .ge-adj-title,
+#ge-transform-section .ge-transform-popup-head .ge-head-btns,
+#ge-transform-section .ge-transform-popup-hint,
+#ge-transform-section .ge-row-break { display: none !important; }
+#ge-transform-section .ge-transform-preserve-field {
+  flex: 0 0 auto;
+  white-space: nowrap;
+  margin-left: 4px;
+}
+/* In the inline strip the full label is both clipped and a source of reflow
+   (it wrapped to three lines); keep the checkbox with a tooltip instead. */
+#ge-transform-section .ge-transform-preserve-field span { display: none; }
+/* The floating popup spaced its buttons off the fields; in the inline strip
+   that stray top-margin inflates the row, so neutralise it. */
+#ge-transform-section button { margin-top: 0 !important; }
+/* Nudge the aspect lock and the +/- steppers down 2px so their glyphs sit on
+   the same optical centre as the other strip controls. */
+#ge-transform-section .ge-transform-aspect-btn,
+#ge-transform-section .ge-transform-spin button { position: relative; top: 2px; }
 .ge-transform-field {
   display: inline-flex;
   align-items: center;
@@ -2023,17 +2282,17 @@
   flex-direction: column;
   align-items: stretch;
   gap: 0;
-  height: 18px;
+  height: 20px;
 }
 .ge-transform-spin button {
   flex: 1 1 0;
-  width: 12px;
+  width: 14px;
   min-height: 0;
   padding: 0;
   background: transparent;
   color: var(--fg-muted);
   border: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
-  font-size: 7px;
+  font-size: 9px;
   line-height: 1;
   cursor: pointer;
   display: inline-flex;
@@ -2274,6 +2533,11 @@
   margin: 0;
 }
 .ge-size-label { font-size: 10px; opacity: 0.5; min-width: 28px; text-align: right; }
+/* The px readout IS the whole label on the brush size row, so let the label
+   hug the number instead of sitting in the shared 36px label column (same
+   principle as the Dodge/Burn "Int" label): otherwise the value floats well
+   to the left of its own slider and it is unclear which bar it controls. */
+.ge-brush-size-row label { min-width: 0; }
 
 /* Eraser controls: tighter rows + a small brush preview on the left of
    each label so the user can see what each slider affects. The three
@@ -2288,6 +2552,19 @@
      stays visible when the slider expands left over the label. */
   position: relative;
 }
+/* Some eraser-style rows are hidden with an inline display:none (e.g. the
+   smudge Strength row when the tool is not Smudge; it is shown/hidden by JS).
+   The `display:flex !important` above would otherwise override that inline
+   hide, so explicitly honour an inline none. */
+.ge-eraser-row[style*="display:none"],
+.ge-eraser-row[style*="display: none"] { display: none !important; }
+/* Dodge/Burn's Intensity label is abbreviated, so let the column shrink to
+   the word's own width: the text then sits right against its slider instead
+   of leaving a dead gap that made the pairing hard to read. */
+#ge-dodgeburn-intensity-row label { flex: 0 0 auto; min-width: 20px; }
+/* Nudge the Intensity dot and its label 10px to the right so the pair reads
+   as one unit instead of hugging the row's left edge. */
+#ge-dodgeburn-intensity-row > .ge-eraser-preview { margin-left: 10px; }
 /* Inline value chip next to the label text. (Previously absolutely-
    positioned over the slider track to ride the expand animation, which
    caused overlap now that the dynamic-slider behavior is off for these.) */
@@ -2315,6 +2592,14 @@
   cursor: text;
   border-radius: 3px;
   white-space: nowrap;
+}
+/* Wand strip: pull the tolerance value chip a touch closer to its slider. */
+#ge-wand-section .ge-slider-value { position: relative; left: -6px; }
+/* Keep the tolerance value chip tinted at all times (not just on hover) so it
+   clearly reads as belonging to the slider rather than floating far away. */
+#ge-wand-section #ge-wand-tol-label.ge-slider-value {
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  opacity: 1;
 }
 
 /* Per-tool model selector row (lives at the top of each AI tool's
@@ -2372,6 +2657,16 @@
   color: var(--fg);
   outline: none;
   text-align: center;
+}
+/* The chat shell sizes every text input to 32px tall; the inline chip
+   editor must stay chip-sized instead, otherwise its text sits ~4px low.
+   Higher specificity than `input[type="text"]` so it wins. */
+.ge-eraser-row input.ge-slider-edit,
+.ge-adj-row input.ge-slider-edit {
+  height: 16px;
+  line-height: 14px;
+  padding: 0 4px;
+  box-sizing: border-box;
 }
 
 /* Merge dropdown — position is set by JS each time it opens (relative to
@@ -2925,7 +3220,7 @@
   border-radius: 5px; color: var(--fg-muted); cursor: pointer; flex-shrink: 0;
 }
 .ge-history-snap-new:hover { color: var(--fg); border-color: color-mix(in srgb, var(--fg) 35%, transparent); }
-.ge-history-snap-new svg { width: 13px; height: 13px; display: block; flex: 0 0 auto; }
+.ge-history-snap-new svg { width: 14px; height: 14px; display: block; flex: 0 0 auto; }
 .ge-history-snap-rows { padding: 0 0 4px; }
 .ge-history-snap-empty { padding: 2px 10px 6px; font-size: 10px; opacity: 0.45; }
 .ge-history-snap-row {
@@ -3269,6 +3564,8 @@
   flex: 0 0 96px;
   font-size: 10px;
   opacity: 0.7;
+  text-align: right;
+  padding-right: 2px;
 }
 .ge-adj-row input[type="range"] {
   flex: 1 1 auto;
@@ -3573,15 +3870,165 @@
   line-height: 1;
   background: color-mix(in srgb, var(--fg) 5%, transparent);
   transition: opacity 0.15s, color 0.15s, border-color 0.15s, background 0.15s;
+  position: relative;
+  top: 0;
 }
-.ge-wand-live-btn:hover { opacity: 0.85; }
-.ge-wand-live-btn.active {
+.ge-wand-live-btn:hover { opacity: 0.85; }.ge-wand-live-btn.active {
   opacity: 1;
   background: color-mix(in srgb, var(--accent, var(--red)) 18%, transparent);
   border-color: var(--accent, var(--red));
   color: var(--accent, var(--red));
   font-weight: 600;
 }
+/* Wand sliders: the shared 78px label column reserved room for the value
+   chip that now lives after the slider, so "Tolerance"/"Feather" sat in a
+   wide box with a gap before the track. Let the label hug its text. */
+#ge-wand-section .ge-eraser-row label { flex: 0 0 auto; }
+/* Quick Select's brush-size row uses the same .ge-eraser-row pattern as the
+   wand Tolerance row, so its slider picks up the shared row styling (8px
+   track) instead of the bare .ge-ctl-range look, and its label hugs its text. */
+#ge-quickselect-section .ge-eraser-row label { flex: 0 0 auto; }
+/* The wand strip is too wide (mode + tolerance + feather + edge stroke +
+   actions). Tuck the post-selection refine sliders and the tip into a "More"
+   dropdown so the strip fits without horizontal scrolling. */
+.ge-wand-more-wrap { position: relative; display: inline-flex; }
+.ge-wand-more-btn { position: relative; top: -4px; left: -8px; padding: 0 4px; background: transparent; border-color: transparent; }
+.ge-wand-more-btn:hover { background: color-mix(in srgb, var(--fg) 12%, transparent); border-color: transparent; }
+.ge-wand-more-btn svg { display: block; transition: transform 0.12s ease; }
+.ge-wand-more-btn.active,
+.ge-wand-more-btn[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--accent, var(--red)) 18%, transparent);
+  border-color: var(--accent, var(--red));
+  color: var(--accent, var(--red));
+}
+.ge-wand-more-btn[aria-expanded="true"] svg { transform: rotate(180deg); }
+.ge-wand-more-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 260px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+.ge-wand-more-menu[hidden] { display: none; }
+.ge-wand-more-menu .ge-eraser-row { margin: 0; }
+.ge-wand-more-menu .ge-wand-tip { margin: 0; font-size: 9px; opacity: 0.45; }
+/* Brush "v" caret: same pattern as the wand caret — drops the less-used
+   stroke controls into a small popover so the strip stays one tidy line. */
+.ge-brush-more-wrap { position: relative; display: inline-flex; }
+.ge-brush-more-btn { position: relative; top: -2px; padding: 0 4px; background: transparent; border-color: transparent; }
+.ge-brush-more-btn:hover { background: color-mix(in srgb, var(--fg) 12%, transparent); border-color: transparent; }
+.ge-brush-more-btn svg { display: block; transition: transform 0.12s ease; }
+.ge-brush-more-btn.active,
+.ge-brush-more-btn[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--accent, var(--red)) 18%, transparent);
+  border-color: var(--accent, var(--red));
+  color: var(--accent, var(--red));
+}
+.ge-brush-more-btn[aria-expanded="true"] svg { transform: rotate(180deg); }
+.ge-brush-more-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 280px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+.ge-brush-more-menu[hidden] { display: none; }
+/* Text/Shape overflow menu: the strip keeps only the primary fields and the
+   rarely-used rows live in this popover, so switching tools no longer makes
+   the options bar (and the canvas below it) jump by ~80px. */
+.ge-options-bar:has(.ge-opt-more:not([hidden])) { overflow: visible; }
+.ge-controls--in-options .ge-text-section,
+.ge-controls--in-options .ge-shape-section { position: relative; }
+.ge-opt-more {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 320px;
+  max-height: min(70vh, 440px);
+  overflow-y: auto;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+.ge-opt-more[hidden] { display: none; }
+#ge-text-more .ge-text-grid,
+#ge-shape-more .ge-text-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
+  gap: 8px;
+  align-items: end;
+  width: 100%;
+}
+#ge-text-more .ge-text-field,
+#ge-shape-more .ge-text-field { min-width: 0; align-items: stretch; }
+#ge-shape-more .ge-control-row { flex-wrap: wrap; }
+.ge-more-toggle[aria-expanded="true"] {
+  border-color: var(--accent, var(--red));
+  color: var(--accent, var(--red));
+}
+/* Blend sits at the dropdown's right edge so it lines up with the sliders. */
+.ge-brush-more-menu #ge-brush-blend { margin-left: auto; }
+/* The caret lives right of the size slider, inside the size row. */
+.ge-brush-size-row .ge-brush-more-wrap { margin-left: 4px; }
+.ge-brush-more-menu .ge-eraser-row,
+.ge-brush-more-menu .ge-control-row { margin: 0; }
+.ge-brush-more-menu .ge-section-title { margin: 0; }
+.ge-controls--in-options .ge-brush-more-menu .ge-brush-pressure-row { display: flex !important; flex-direction: row !important; flex-wrap: nowrap !important; align-items: center; gap: 10px; }
+/* Lasso "v" caret: same pattern as the wand/brush caret — the secondary
+   lasso controls (feather, edge stroke, magnetic, width, contrast) drop
+   into a small popover so the lasso strip matches the other select tools. */
+.ge-lasso-more-wrap { position: relative; display: inline-flex; }
+.ge-lasso-more-btn { position: relative; top: -2px; padding: 0 4px; background: transparent; border-color: transparent; }
+.ge-lasso-more-btn:hover { background: color-mix(in srgb, var(--fg) 12%, transparent); border-color: transparent; }
+.ge-lasso-more-btn svg { display: block; transition: transform 0.12s ease; }
+.ge-lasso-more-btn.active,
+.ge-lasso-more-btn[aria-expanded="true"] {
+  background: color-mix(in srgb, var(--accent, var(--red)) 18%, transparent);
+  border-color: var(--accent, var(--red));
+  color: var(--accent, var(--red));
+}
+.ge-lasso-more-btn[aria-expanded="true"] svg { transform: rotate(180deg); }
+.ge-lasso-more-menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 260px;
+  padding: 10px 12px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+.ge-lasso-more-menu[hidden] { display: none; }
+.ge-lasso-more-menu .ge-eraser-row,
+.ge-lasso-more-menu .ge-control-row { margin: 0; }
+.ge-lasso-more-menu .ge-lasso-tip { margin: 0; font-size: 9px; opacity: 0.45; }
 /* Top-bar buttons (undo/redo, zoom +/-, Fit, 1:1, Resize, Edge, Import,
    Download, Save) — visually their glyphs sit too low compared to the
    surrounding labels, so shift contents up 2 px via asymmetric padding. */
@@ -4688,11 +5135,11 @@ button .spinner-whirlpool {
   flex-direction: column;
   flex: 0 1 auto;
   min-height: 0;
-  max-height: 68%;
+  max-height: 56%;
   overflow-y: auto;
   overflow-x: hidden;
 }
-.ge-right-panel--dock > .ge-layers { flex: 1 1 auto; min-height: 0; }
+.ge-right-panel--dock > .ge-layers { flex: 1 1 auto; min-height: 240px; }
 
 .ge-dock-group {
   display: flex;
@@ -4723,7 +5170,7 @@ button .spinner-whirlpool {
   flex: 0 0 auto;
   padding: 5px 14px 5px 8px;
   font: inherit;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.01em;
   text-transform: uppercase;
@@ -4824,6 +5271,18 @@ button .spinner-whirlpool {
 }
 .ge-dock-tabs-more:hover { color: var(--fg); }
 .ge-dock-collapse svg, .ge-dock-detach svg, .ge-dock-tabs-more svg { width: 16px; height: 16px; flex: 0 0 auto; }
+/* Unified control-icon size across the right dock + Layers panel so the
+   sidebar reads as one set (was a mix of 12/13/14px). */
+.ge-layer-btn svg,
+.ge-layer-fx-btn svg,
+.ge-layer-vis svg,
+.ge-layer-lock-btn svg,
+.ge-layer-mask-btn svg,
+.ge-layer-clip-btn svg,
+.ge-layer-group-toggle svg {
+  width: 14px;
+  height: 14px;
+}
 .ge-dock-tabs-menu {
   position: fixed;
   z-index: 10060;
@@ -4848,6 +5307,17 @@ button .spinner-whirlpool {
 }
 .ge-dock-tabs-menu-item:hover {
   background: color-mix(in srgb, var(--accent, #4c8bf5) 22%, transparent);
+}
+.ge-dock-tabs-menu-sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--border);
+}
+.ge-dock-tabs-menu-close {
+  color: var(--red, #e5484d);
+}
+.ge-dock-tabs-menu-close:hover {
+  background: color-mix(in srgb, var(--red, #e5484d) 20%, transparent);
 }
 .ge-dock-group.is-floating .ge-dock-detach { display: none; }
 /* Detached panel group — floats above the editor in its own draggable
@@ -5155,6 +5625,28 @@ button .spinner-whirlpool {
   transition: background 0.1s;
   font-size: 11px;
   color: var(--fg);
+}
+.ge-layer-item.is-effect-dragging {
+  opacity: 0.45;
+}
+.ge-layer-item.is-effect-drop-target,
+.ge-layer-group-row.is-effect-drop-target {
+  background: color-mix(in srgb, var(--accent, var(--red)) 22%, transparent);
+  outline: 1px solid var(--accent, var(--red));
+  outline-offset: -1px;
+}
+.ge-effect-drag-ghost {
+  position: fixed;
+  z-index: 10030;
+  padding: 4px 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--fg);
+  font-size: 10px;
+  white-space: nowrap;
+  pointer-events: none;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
 }
 .ge-layer-item:focus-visible,
 .ge-layer-group-row:focus-visible {
@@ -5582,6 +6074,39 @@ button .spinner-whirlpool {
 .ge-controls--in-options .ge-eyedropper-live-swatch { width: 14px; height: 14px; flex: 0 0 14px; }
 .ge-controls--in-options .ge-eyedropper-live-values { display: flex; flex-direction: row; align-items: center; gap: 8px; }
 
+/* Floating eyedropper loupe — a circle that mirrors the panel's live pixel
+   preview right next to the pointer while the eyedropper is pressed, so you
+   can see the exact pixel being sampled. */
+.ge-eyedropper-cursor-loupe {
+  position: fixed;
+  z-index: 2600;
+  width: 108px;
+  height: 108px;
+  padding: 3px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--panel) 92%, transparent);
+  box-shadow: 0 6px 20px color-mix(in srgb, #000 35%, transparent),
+    inset 0 0 0 1px color-mix(in srgb, var(--fg) 26%, transparent);
+  pointer-events: none;
+  display: none;
+  opacity: 0;
+  transform: scale(0.9);
+  transition: opacity .12s ease, transform .12s ease;
+}
+.ge-eyedropper-cursor-loupe.is-visible {
+  display: block;
+  opacity: 1;
+  transform: scale(1);
+}
+.ge-eyedropper-cursor-loupe canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: 50%;
+  image-rendering: pixelated;
+  background: var(--bg);
+}
+
 /* Left-edge drag handle on each layer row. */
 .ge-layer-drag {
   display: flex;
@@ -5721,6 +6246,37 @@ button .spinner-whirlpool {
   -moz-appearance: textfield;
 }
 .ge-crop-x { font-size: 11px; opacity: 0.5; }
+.ge-crop-apply select.ge-crop-size-preset {
+  max-width: 96px;
+  margin-right: 8px;
+  padding: 3px 4px;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font: inherit;
+  font-size: 11px;
+}
+.ge-crop-close {
+  position: absolute;
+  top: -13px;
+  right: -8px;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--panel);
+  color: var(--fg);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.ge-crop-close-x { display: block; line-height: 1; transform: translateY(-2px); }
+.ge-crop-close:hover { background: var(--red); color: #fff; border-color: transparent; }
 .ge-crop-apply-btn {
   padding: 4px 10px;
   background: var(--red);
@@ -5735,13 +6291,39 @@ button .spinner-whirlpool {
 }
 .ge-crop-apply-btn:hover { background: color-mix(in srgb, var(--red) 85%, #000); }
 
+/* Full crop-rect outline in screen space. The canvas-space crop overlay is
+   clipped to the image, so this frame shows the part of the rect that
+   reaches beyond the canvas (which expands the image on Apply). */
+.ge-crop-frame {
+  position: absolute;
+  pointer-events: none;
+  z-index: 6;
+  border: 1px dashed #fff;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.55);
+  box-sizing: border-box;
+}
+
 /* Crop aspect preset buttons (options bar) */
-.ge-crop-preset-row { display: flex; gap: 4px; }
+.ge-crop-preset-row { display: flex; gap: 4px; position: relative; top: -4px; }
 .ge-crop-preset.active {
   background: var(--accent, #4c8bf5);
   border-color: transparent;
   color: #fff;
 }
+.ge-crop-custom { display: inline-flex; align-items: center; }
+.ge-crop-custom input {
+  width: 58px;
+  height: 24px;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--fg);
+  font-size: 12px;
+  text-align: center;
+}
+.ge-crop-custom input::placeholder { color: var(--fg-muted, var(--fg)); opacity: 0.6; }
+.ge-crop-custom input:focus { outline: none; border-color: var(--accent, #4c8bf5); }
 
 /* Text input floating */
 .ge-text-input {
@@ -5776,11 +6358,21 @@ button .spinner-whirlpool {
     border-bottom: 0;
     gap: 0;
   }
-  .ge-inpaint-section.ge-inpaint-popover {
+  #ge-inpaint-section.ge-inpaint-popover {
     position: fixed;
     z-index: 10004;
     width: 330px;
     max-height: calc(100vh - 24px);
+    /* The strip's `.ge-controls--in-options > div` rule turns every visible
+       section into a horizontal nowrap flex row; the popover must stack its
+       rows vertically instead, or the prompt/model/buttons land hundreds of
+       pixels off the panel. */
+    display: flex !important;
+    flex-direction: column !important;
+    flex-wrap: nowrap !important;
+    align-items: stretch;
+    gap: 8px;
+    overflow-x: hidden;
     overflow-y: auto;
     padding: 10px;
     margin: 0;
@@ -5788,6 +6380,10 @@ button .spinner-whirlpool {
     border-radius: 8px;
     background: var(--panel);
     box-shadow: 0 12px 36px rgba(0, 0, 0, 0.42);
+  }
+  .ge-inpaint-section.ge-inpaint-popover .ge-inpaint-prompt {
+    flex: 0 0 auto;
+    width: 100%;
   }
   .ge-inpaint-section.ge-inpaint-popover .ge-inpaint-popover-head {
     display: flex;
@@ -5919,38 +6515,46 @@ button .spinner-whirlpool {
     flex-direction: row;
     width: 100%;
     height: auto;
-    padding: 4px 0;
+    padding: 0;
     border-right: none;
     border-bottom: 1px solid var(--border);
-    overflow-x: auto;
-    overflow-y: hidden;
+    overflow: visible;
     flex-shrink: 0;
     gap: 0;
+  }
+  .ge-toolbar-scroll {
+    flex-direction: row;
+    align-items: center;
+    gap: 0;
+    width: 100%;
+    padding: 4px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
     -webkit-overflow-scrolling: touch;
     scrollbar-width: none;
   }
-  .ge-toolbar::-webkit-scrollbar { display: none; }
+  .ge-toolbar-scroll::-webkit-scrollbar { display: none; }
   /* Audit #5: the menu row and tool rail scroll sideways with hidden
      scrollbars, so they read as static. Fade the overflowing edge (and drop
      the fade on the side with nothing more to scroll to) so it's obvious there
      are off-screen menus/tools. attachScrollAffordance() toggles the classes. */
   .ge-topbar-left.ge-scroll-fade,
-  .ge-toolbar.ge-scroll-fade {
+  .ge-toolbar-scroll.ge-scroll-fade {
     -webkit-mask-image: linear-gradient(to right, transparent 0, #000 42px, #000 calc(100% - 42px), transparent 100%);
             mask-image: linear-gradient(to right, transparent 0, #000 42px, #000 calc(100% - 42px), transparent 100%);
   }
   .ge-topbar-left.ge-scroll-fade.is-at-left,
-  .ge-toolbar.ge-scroll-fade.is-at-left {
+  .ge-toolbar-scroll.ge-scroll-fade.is-at-left {
     -webkit-mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 42px), transparent 100%);
             mask-image: linear-gradient(to right, #000 0, #000 calc(100% - 42px), transparent 100%);
   }
   .ge-topbar-left.ge-scroll-fade.is-at-right,
-  .ge-toolbar.ge-scroll-fade.is-at-right {
+  .ge-toolbar-scroll.ge-scroll-fade.is-at-right {
     -webkit-mask-image: linear-gradient(to right, transparent 0, #000 42px, #000 100%);
             mask-image: linear-gradient(to right, transparent 0, #000 42px, #000 100%);
   }
   .ge-topbar-left.ge-scroll-fade.is-at-left.is-at-right,
-  .ge-toolbar.ge-scroll-fade.is-at-left.is-at-right {
+  .ge-toolbar-scroll.ge-scroll-fade.is-at-left.is-at-right {
     -webkit-mask-image: none;
             mask-image: none;
   }
@@ -6219,7 +6823,7 @@ button .spinner-whirlpool {
     left: 8px !important;
     right: 8px !important;
     top: auto !important;
-    bottom: calc(env(safe-area-inset-bottom, 0px) + 8px) !important;
+    bottom: calc(var(--safe-bottom) + 8px) !important;
     width: auto !important;
     min-width: 0 !important;
     max-width: calc(100vw - 16px) !important;
@@ -6806,6 +7410,11 @@ button .spinner-whirlpool {
 .ge-hex-row { display: flex; align-items: center; gap: 4px; flex: 1 1 100%; width: 100%; margin-top: 6px; background: color-mix(in srgb, var(--fg) 6%, transparent); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
 .ge-hex-hash { color: color-mix(in srgb, var(--fg) 65%, transparent); font-size: 12px; font-weight: 600; }
 .ge-hex-input { flex: 1 1 auto; min-width: 0; background: transparent; border: 0; outline: 0; color: var(--fg); font: inherit; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; padding: 0; }
+.ge-hex-copy { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; background: transparent; border: 0; border-radius: 4px; color: color-mix(in srgb, var(--fg) 55%, transparent); cursor: pointer; }
+.ge-hex-copy:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 12%, transparent); }
+.ge-hex-copy.copied { color: var(--accent, var(--red)); }
+.ge-hex-fav.active { color: var(--accent, var(--red)); }
+.ge-hex-fav.active svg { fill: var(--accent, var(--red)); }
 .ge-gradient-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(56px, 1fr));
@@ -7049,8 +7658,8 @@ button .spinner-whirlpool {
 .ge-adjustment-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 3px;
-  padding: 4px 6px;
+  gap: 2px;
+  padding: 3px 4px;
 }
 .ge-adjustment-grid .ge-btn {
   width: 100%;
@@ -7153,7 +7762,7 @@ button .spinner-whirlpool {
   appearance: none;
   width: 14px;
   height: 14px;
-  margin-top: -4px;
+  margin-top: -5px;
   border-radius: 50%;
   background: var(--fg);
   border: 2px solid var(--panel);
@@ -7347,7 +7956,7 @@ input.ge-ctl-check:focus-visible {
   user-select: none;
   touch-action: none;
 }
-.ge-scrub::after { content: '\2194'; font-size: 8px; opacity: 0.4; margin-left: 3px; }
+.ge-scrub::after { content: '\2194'; font-size: 10px; opacity: 0.4; margin-left: 3px; }
 .ge-scrub.ge-scrubbing { color: var(--accent, var(--red)); }
 
 /* On touch/mobile the topbar menus are icon/touch driven — hide keyboard shortcut hints. */
@@ -7380,7 +7989,7 @@ input.ge-ctl-check:focus-visible {
 /* Tool-aware canvas right-click menu (canvas-context-menu.js). */
 .ge-canvas-menu {
   position: fixed;
-  z-index: 100000;
+  z-index: var(--portal-z, 100000);
   min-width: 208px;
   padding: 5px;
   background: #2b2b2b;
@@ -7664,13 +8273,19 @@ input.ge-ctl-check:focus-visible {
   .ge-ai-command .ge-btn-ai-mark { animation: none; }
 }
 
-/* Quick Edit routing-mode selector (Auto / Quick / Agent / Image): uses the
+/* Quick Edit routing-mode selector (Auto / Img Gen / Img Edit): uses the
    standard ctl-select look, pushed to the right of the header row. */
 .ge-ai-command .ge-ai-command-mode {
   margin-left: auto;
   margin-right: 6px;
   max-width: 104px;
 }
+/* Edit-input scope (All layers / This layer) beside the routing mode. */
+.ge-ai-command .ge-ai-command-scope {
+  margin-right: 6px;
+  max-width: 104px;
+}
+.ge-ai-command .ge-ai-command-scope[hidden] { display: none; }
 
 /* Mobile footer fix (audit 2026-10-11 #1): the footer overflowed horizontally
    (scrollWidth 532 vs clientWidth 378) so the zoom controls sat off-screen.
@@ -7702,6 +8317,21 @@ input.ge-ctl-check:focus-visible {
   }
 }
 
+/* Phones: the floating zoom/Setup footer collides with the peek/expanded
+   layers sheet and the Quick Edit card, so remove it entirely on phones.
+   Undo/Redo/History already live in the layers-sheet header, and pinch-zoom
+   replaces the zoom buttons. */
+@media (max-width: 700px) {
+  .ge-editor-footer {
+    display: none !important;
+  }
+  /* The Quick Edit card lifts over the layers sheet / keyboard; keep it above
+     every other editor asset (sheet headers, tool rail, popups) while lifted. */
+  .ge-ai-command {
+    z-index: 90;
+  }
+}
+
 /* EVAL: an editor toast fired while a floating panel is open (Adjust/Develop,
    FX, Transform, filter modal, History) is moved to the bottom-centre by
    ui.js so it never covers the panel's controls. */
@@ -7712,6 +8342,21 @@ body.ge-editor-open .toast.toast-editor-bottom {
   right: 12px;
   max-width: none;
   min-width: 0;
+}
+
+/* The one-time Free Transform hint always lands in the same place: centred
+   under the canvas. Without this it alternated between the top-right corner
+   and the full-width bottom banner depending on what else was open. */
+body.ge-editor-open .toast.toast-transform-hint {
+  top: auto;
+  bottom: 84px;
+  left: 0;
+  right: 0;
+  margin-left: auto;
+  margin-right: auto;
+  width: max-content;
+  min-width: 0;
+  max-width: min(520px, calc(100vw - 32px));
 }
 
 /* Audit #7 / EVAL: on a phone, a toast at the viewport top overlaps the
@@ -7762,7 +8407,7 @@ body.ge-editor-open .toast.toast-editor-bottom {
      single-row (wrapping them made the chrome 2-3x taller), but their sideways
      scroll is contained so it never drags the page or overshoots the fade. */
   .ge-topbar-left,
-  .ge-toolbar,
+  .ge-toolbar-scroll,
   .ge-dock-tabs {
     overscroll-behavior-x: contain;
     -webkit-overflow-scrolling: touch;
@@ -7791,7 +8436,9 @@ body.ge-editor-open .toast.toast-editor-bottom {
   align-items: center;
   gap: 5px;
   min-height: 0;
-  padding: 3px 6px;
+  margin: 0;
+  padding: 2px 7px;
+  line-height: 1.2;
 }
 .ge-adj-icon { display: inline-flex; flex: 0 0 auto; }
 .ge-adj-icon svg { width: 14px; height: 14px; display: block; }
@@ -8272,7 +8919,7 @@ body.ge-editor-open .tour-hint {
   border-top-color: var(--red);
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin { to { transform: rotate(360deg); } }
+
 
 /* The global "Pro tip" hint card can overlap the editor menus; hide it while
    the editor is open. */
@@ -8311,7 +8958,7 @@ body.ge-editor-open .tour-hint {
   border-top-color: var(--red);
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin { to { transform: rotate(360deg); } }
+
 
 /* The onboarding "Pro tip" tour hint floats over the editor menus; hide it
    while the editor is open so it never occludes a dropdown or flyout. */
@@ -8350,7 +8997,7 @@ body.ge-editor-open .tour-hint {
   border-top-color: var(--red);
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin { to { transform: rotate(360deg); } }
+
 
 /* Long dropdown menus (Filter especially) can grow past the viewport bottom;
    cap them to the space below the topbar and let them scroll. */
@@ -8502,9 +9149,7 @@ body.ge-editor-open .tour-hint {
   border-radius: 50%;
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin {
-  to { transform: rotate(360deg); }
-}
+
 
 /* Flyout submenu panels: compact rows + a viewport-bounded height so long
    lists (the 19 Image > Adjustments entries) all fit or scroll. */
@@ -8586,7 +9231,7 @@ body.ge-editor-open .tour-hint {
   border-top-color: var(--red);
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin { to { transform: rotate(360deg); } }
+
 
 /* The global "Pro tip" hint card can overlap the editor menus; hide it while
    the editor is open. */
@@ -8625,7 +9270,7 @@ body.ge-editor-open .tour-hint {
   border-top-color: var(--red);
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin { to { transform: rotate(360deg); } }
+
 
 /* The onboarding "Pro tip" tour hint floats over the editor menus; hide it
    while the editor is open so it never occludes a dropdown or flyout. */
@@ -8664,7 +9309,7 @@ body.ge-editor-open .tour-hint {
   border-top-color: var(--red);
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin { to { transform: rotate(360deg); } }
+
 
 /* Phone editor: while the Quick Edit card is open it owns the bottom of the
    canvas. Force the layers sheet back to its peek height and hide the floating
@@ -8828,9 +9473,7 @@ body.ge-editor-open .tour-hint {
   border-radius: 50%;
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin {
-  to { transform: rotate(360deg); }
-}
+
 
 /* Flyout submenu panels: compact rows + a viewport-bounded height so long
    lists (the 19 Image > Adjustments entries) all fit or scroll. */
@@ -8912,7 +9555,7 @@ body.ge-editor-open .tour-hint {
   border-top-color: var(--red);
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin { to { transform: rotate(360deg); } }
+
 
 /* The global "Pro tip" hint card can overlap the editor menus; hide it while
    the editor is open. */
@@ -8951,7 +9594,7 @@ body.ge-editor-open .tour-hint {
   border-top-color: var(--red);
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin { to { transform: rotate(360deg); } }
+
 
 /* The onboarding "Pro tip" tour hint floats over the editor menus; hide it
    while the editor is open so it never occludes a dropdown or flyout. */
@@ -8990,7 +9633,7 @@ body.ge-editor-open .tour-hint {
   border-top-color: var(--red);
   animation: ge-busy-spin 0.8s linear infinite;
 }
-@keyframes ge-busy-spin { to { transform: rotate(360deg); } }
+
 
 /* Photoshop-style nested submenus (Filter groups + Image > Adjustments).
    A parent row shows a chevron and reveals a flyout panel on hover/click.
@@ -9024,6 +9667,11 @@ body.ge-editor-open .tour-hint {
 .ge-menu-parent:focus-within + .ge-submenu,
 .ge-submenu:hover {
   display: block;
+}
+.ge-submenu-sep {
+  height: 1px;
+  margin: 4px 2px;
+  background: var(--border);
 }
 /* The dropdowns clip overflow to draw the custom scroll thumb; release the
    clip while a flyout is open/hovered so it can extend past the menu edge. */
@@ -9138,4 +9786,20 @@ body.ge-editor-open .tour-hint {
     min-width: 42px;
     min-height: 42px;
   }
+}
+
+/* Holding Alt with a paint tool borrows the eyedropper: show the sampling
+   cursor and hide the brush ring so the borrow is obvious. */
+body.ge-alt-eyedropper .ge-canvas-area,
+body.ge-alt-eyedropper .ge-main-canvas {
+  cursor: url("data:image/svg+xml;utf8,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%2224%22%20height%3D%2224%22%20viewBox%3D%220%200%2024%2024%22%20fill%3D%22none%22%3E%3Cg%20stroke%3D%22black%22%20stroke-width%3D%224%22%20opacity%3D%22.85%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22m2%2022%201-1h3l9-9%22%2F%3E%3Cpath%20d%3D%22M3%2021v-3l9-9%22%2F%3E%3Cpath%20d%3D%22m15%206%203.4-3.4a2.1%202.1%200%201%201%203%203L18%209l.9.9a1%201%200%200%201%200%201.4l-1.6%201.6a1%201%200%200%201-1.4%200L12%208.4a1%201%200%200%201%200-1.4l1.6-1.6a1%201%200%200%201%201.4%200l.9.9Z%22%2F%3E%3C%2Fg%3E%3Cg%20stroke%3D%22white%22%20stroke-width%3D%222%22%20stroke-linecap%3D%22round%22%20stroke-linejoin%3D%22round%22%3E%3Cpath%20d%3D%22m2%2022%201-1h3l9-9%22%2F%3E%3Cpath%20d%3D%22M3%2021v-3l9-9%22%2F%3E%3Cpath%20d%3D%22m15%206%203.4-3.4a2.1%202.1%200%201%201%203%203L18%209l.9.9a1%201%200%200%201%200%201.4l-1.6%201.6a1%201%200%200%201-1.4%200L12%208.4a1%201%200%200%201%200-1.4l1.6-1.6a1%201%200%200%201%201.4%200l.9.9Z%22%2F%3E%3C%2Fg%3E%3C%2Fsvg%3E") 2 22, crosshair !important;
+}
+body.ge-alt-eyedropper .ge-brush-cursor {
+  display: none !important;
+}
+
+.ge-liquify-hint {
+  color: var(--fg-muted, #8a8f98);
+  font-size: 11px;
+  line-height: 1.35;
 }

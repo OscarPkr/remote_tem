@@ -67,7 +67,7 @@ def test_extra_menus_are_precached_and_mounted():
     assert "'/static/js/editor/wire-extra-menus.js'" in SW
     assert "import { wireExtraMenus } from './editor/wire-extra-menus.js';" in GALLERY
     assert "wireExtraMenus({" in GALLERY
-    assert "export function wireExtraMenus({ closeOtherTopbarMenus, registerDocClickAway, dock, combineShapes, workspace, uiModule, exportLayeredPsd, syncWindowChecks, togglePanel })" in WIRE
+    assert "export function wireExtraMenus({ closeOtherTopbarMenus, registerDocClickAway, dock, combineShapes, workspace, saveWorkspace, uiModule, exportLayeredPsd, syncWindowChecks, togglePanel, toggleQuickEdit, newDocument, promptNewDocument, newFromClipboard })" in WIRE
 
 
 def test_cross_menu_close_knows_new_menus():

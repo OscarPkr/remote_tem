@@ -25,6 +25,10 @@
  *   combineShapes:         (op: string) => void,
  *   syncWindowChecks?:     (menu: HTMLElement | null) => void,
  *   togglePanel?:          (id: string) => void,
+ *   saveWorkspace?:        () => void,
+ *   newDocument?:          (w: number, h: number) => void,
+ *   promptNewDocument?:    () => Promise<{ w: number, h: number } | null>,
+ *   newFromClipboard?:     () => void,
  * }} deps
  */
 import { wireSubmenuToggles } from './submenu-toggles.js';
@@ -88,8 +92,19 @@ function wireMenuKeyboard(container) {
   });
 }
 
-export function wireExtraMenus({ closeOtherTopbarMenus, registerDocClickAway, dock, combineShapes, workspace, uiModule, exportLayeredPsd, syncWindowChecks, togglePanel }) {
+export function wireExtraMenus({ closeOtherTopbarMenus, registerDocClickAway, dock, combineShapes, workspace, saveWorkspace, uiModule, exportLayeredPsd, syncWindowChecks, togglePanel, toggleQuickEdit, newDocument, promptNewDocument, newFromClipboard }) {
   const click = (id) => document.getElementById(id)?.click();
+  // Picking a workspace is a one-shot choice, so it closes the Window menu
+  // (and any open flyout) unlike the panel toggles, which keep it open.
+  const closeWindowMenu = () => {
+    const menu = document.getElementById('ge-window-menu');
+    if (!menu) return;
+    menu.querySelectorAll('.ge-menu-parent.open').forEach((parent) => {
+      parent.classList.remove('open');
+      parent.setAttribute('aria-expanded', 'false');
+    });
+    menu.hidden = true;
+  };
   // A menu row may synthesise a click on an external control (Window/Edit >
   // History clicks #ge-history-btn). That click bubbles to the document and
   // would trip our own click-away handler, closing the menu mid-toggle — so
@@ -169,16 +184,31 @@ export function wireExtraMenus({ closeOtherTopbarMenus, registerDocClickAway, do
     const action = item.dataset.windowAction;
     if (action === 'history') click('ge-history-btn');
     else if (action === 'shortcuts') click('ge-shortcuts-btn');
-    else if (action.startsWith('workspace-')) {
+    else if (action === 'workspace-save') {
+      saveWorkspace?.();
+      closeWindowMenu();
+    } else if (action.startsWith('workspace-')) {
       const name = action.slice('workspace-'.length);
       try { localStorage.setItem('ge-active-workspace', name); } catch {}
       workspace?.(name);
-    } else if (WINDOW_PANEL_ACTIONS.includes(action)) togglePanel?.(action);
+      closeWindowMenu();
+    } else if (action === 'quick-edit') toggleQuickEdit?.();
+    else if (WINDOW_PANEL_ACTIONS.includes(action)) togglePanel?.(action);
   }, () => syncWindowChecks?.(document.getElementById('ge-window-menu')), true);
 
   bind('ge-file-menu-btn', 'ge-file-menu', (item) => {
     const action = item.dataset.fileAction;
     if (action === 'import') click('ge-import-topbar');
+    else if (action === 'new-default') newDocument?.(1920, 1080);
+    else if (action === 'new-square') newDocument?.(1080, 1080);
+    else if (action === 'new-portrait') newDocument?.(1080, 1350);
+    else if (action === 'new-story') newDocument?.(1080, 1920);
+    else if (action === 'new-clipboard') newFromClipboard?.();
+    else if (action === 'new-custom') {
+      Promise.resolve(promptNewDocument?.()).then((size) => {
+        if (size && size.w > 0 && size.h > 0) newDocument?.(size.w, size.h);
+      });
+    }
     else if (action === 'save') click('ge-save');
     else if (action === 'save-copy') click('ge-export-gallery');
     else if (action === 'export') click('ge-download');

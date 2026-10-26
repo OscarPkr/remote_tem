@@ -23,7 +23,7 @@
  * }} opts
  * @returns {{ dock: HTMLDivElement, show: (id: string) => void, readonly activeId: string|null }}
  */
-export function buildDock({ entries = [], persistKey = 'ge-dock-active', defaultId = null, compact = false } = {}) {
+export function buildDock({ entries = [], persistKey = 'ge-dock-active', defaultId = null, compact = false, onCloseGroup = null } = {}) {
   const dock = document.createElement('div');
   dock.className = 'ge-dock';
   if (compact) dock.classList.add('ge-dock--compact');
@@ -218,7 +218,7 @@ export function buildDock({ entries = [], persistKey = 'ge-dock-active', default
       divider.className = 'ge-dock-divider';
       divider.setAttribute('role', 'separator');
       divider.setAttribute('aria-orientation', 'horizontal');
-      divider.title = 'Drag to resize panel group';
+      divider.title = 'Drag to resize · double-click to expand/collapse a panel group';
       dock.appendChild(divider);
       wireDivider(divider, groupIndex);
     }
@@ -324,7 +324,9 @@ export function buildDock({ entries = [], persistKey = 'ge-dock-active', default
     // Reset any previous hiding so widths are measured at their natural size.
     items.forEach(item => { item.style.display = ''; });
     const overflowing = tabsEl.scrollWidth - tabsEl.clientWidth > 1;
-    moreEl.hidden = !overflowing;
+    // Keep the menu reachable even when the tabs fit, so its "Close <group>"
+    // action (and every tab) stays available for every section.
+    moreEl.hidden = !(overflowing || typeof onCloseGroup === 'function');
     if (!overflowing) return;
     // Photoshop-style tab overflow: rather than clipping a label mid-word
     // ("PATTERNS" -> "P…", "CHARACTER" -> "CHARA"), keep only the tabs that
@@ -378,6 +380,22 @@ export function buildDock({ entries = [], persistKey = 'ge-dock-active', default
       });
       tabsMenu.appendChild(item);
     });
+    // Close the whole section (panel group) from the same menu — Photoshop's
+    // "Close Tab Group". Only offered when the host supplies a handler.
+    if (typeof onCloseGroup === 'function') {
+      const sep = document.createElement('div');
+      sep.className = 'ge-dock-tabs-menu-sep';
+      tabsMenu.appendChild(sep);
+      const closeItem = document.createElement('button');
+      closeItem.type = 'button';
+      closeItem.className = 'ge-dock-tabs-menu-item ge-dock-tabs-menu-close';
+      closeItem.textContent = `Close ${group.name}`;
+      closeItem.addEventListener('click', () => {
+        closeTabsMenu();
+        try { onCloseGroup(group.name); } catch (_) {}
+      });
+      tabsMenu.appendChild(closeItem);
+    }
     document.body.appendChild(tabsMenu);
     const r = anchor.getBoundingClientRect();
     tabsMenu.style.left = `${Math.max(4, Math.min(window.innerWidth - 160, r.left))}px`;
@@ -390,10 +408,12 @@ export function buildDock({ entries = [], persistKey = 'ge-dock-active', default
     let startY = 0;
     let startH = 0;
     let resizing = false;
+    let moved = false;
     divider.addEventListener('pointerdown', (event) => {
       const target = groupEl();
       if (!target) return;
       resizing = true;
+      moved = false;
       startY = event.clientY;
       startH = target.getBoundingClientRect().height;
       divider.setPointerCapture(event.pointerId);
@@ -404,8 +424,14 @@ export function buildDock({ entries = [], persistKey = 'ge-dock-active', default
       if (!resizing) return;
       const target = groupEl();
       if (!target) return;
+      // A real drag supersedes any double-click expand state (a plain click,
+      // which a double-click fires, must not, or the toggle would never fire).
+      if (!moved) { moved = true; target.dataset.dockExpanded = '0'; target.classList.remove('is-expanded'); }
       const next = Math.max(28, startH + (event.clientY - startY));
-      target.style.flex = `1 1 ${Math.round(next)}px`;
+      // Fixed basis (no grow/shrink): a `1 1` basis lets the height-constrained
+      // dock shrink the dragged group straight back to 0, so the divider looked
+      // dead. Keeping it `0 0` holds the size and lets the dock scroll instead.
+      target.style.flex = `0 0 ${Math.round(next)}px`;
       target.style.height = `${Math.round(next)}px`;
     });
     const end = (event) => {
@@ -416,6 +442,35 @@ export function buildDock({ entries = [], persistKey = 'ge-dock-active', default
     };
     divider.addEventListener('pointerup', end);
     divider.addEventListener('pointercancel', end);
+    // Double-click toggles the group above between "show everything" and the
+    // previous size. Handy on a cramped sidebar: one double-click unrolls the
+    // whole group (its body is normally height-clamped and scrolls), another
+    // restores exactly what it was.
+    divider.addEventListener('dblclick', (event) => {
+      event.preventDefault();
+      const target = groupEl();
+      if (!target) return;
+      const body = target.querySelector('.ge-dock-panels');
+      if (target.dataset.dockExpanded === '1') {
+        const prev = parseFloat(target.dataset.dockPrevSize || '');
+        const restore = Number.isFinite(prev) && prev > 0 ? prev : 200;
+        target.style.flex = `0 0 ${Math.round(restore)}px`;
+        target.style.height = `${Math.round(restore)}px`;
+        target.dataset.dockExpanded = '0';
+        target.classList.remove('is-expanded');
+        return;
+      }
+      const head = target.querySelector('.ge-dock-tabs');
+      const headH = head ? head.getBoundingClientRect().height : 0;
+      const bodyH = body ? body.scrollHeight : 0;
+      const full = Math.ceil(headH + bodyH + 2);
+      target.dataset.dockPrevSize = String(Math.round(target.getBoundingClientRect().height));
+      target.classList.remove('is-collapsed');
+      target.style.flex = `0 0 ${full}px`;
+      target.style.height = `${full}px`;
+      target.dataset.dockExpanded = '1';
+      target.classList.add('is-expanded');
+    });
   }
 
   // Move a panel group out of the dock into a floating, draggable

@@ -21,7 +21,7 @@ def test_hex_code_field_is_wired():
     js = _read("static/js/editor/panels/panels.js")
     assert "const hexRow = el('div', 'ge-hex-row');" in js
     assert "const hexInput = el('input', 'ge-hex-input');" in js
-    assert "hexRow.append(hexHash, hexInput);" in js
+    assert "hexRow.append(hexHash, hexInput, hexCopy, hexFav);" in js
     assert "swatchBody.appendChild(hexRow);" in js
     assert "const _setHex = (hex) => {" in js
     assert "hexInput.addEventListener('input'," in js

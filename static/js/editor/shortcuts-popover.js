@@ -129,6 +129,9 @@ export function createShortcutsPopover() {
       outside = (e) => {
         if (el.contains(e.target)) return;
         if (e.target.closest('#ge-shortcuts-btn')) return;
+        // A click on a topbar dropdown row is an explicit toggle (e.g. the
+        // Window menu's "Keyboard Shortcuts" row), not a click-away.
+        if (e.target.closest && e.target.closest('.ge-topbar .dropdown')) return;
         toggleShortcuts(false);
       };
       setTimeout(() => document.addEventListener('mousedown', outside, true), 0);

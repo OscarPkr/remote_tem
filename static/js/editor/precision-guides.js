@@ -144,15 +144,15 @@ export function createPrecisionGuides({ canvasArea, composite, saveState, schedu
   function drawDocumentOverlay(ctx) {
     if (!ctx || !state.imgWidth || !state.imgHeight) return;
     ctx.save();
-    const pixelBrush = !!state.brushPixel && (state.tool === 'brush' || state.tool === 'eraser');
-    if (state.gridVisible || pixelBrush) {
-      const base = pixelBrush
-        ? Math.max(1, Math.round(Number(state.brushSize) || 1))
-        : Math.max(2, Number(state.gridSize) || 16);
-      const multiplier = pixelBrush ? 1 : Math.max(1, Math.ceil(5 / Math.max(0.0001, base * state.zoom)));
+    // The pixel grid is shown only when the user turns on View > Grid. The
+    // Pixel tool used to force a strong blue grid over the whole document,
+    // which read as an unwanted blue tint over the image.
+    if (state.gridVisible) {
+      const base = Math.max(2, Number(state.gridSize) || 16);
+      const multiplier = Math.max(1, Math.ceil(5 / Math.max(0.0001, base * state.zoom)));
       const spacing = base * multiplier;
-      const strong = pixelBrush ? 'rgba(122, 208, 255, 0.55)' : 'rgba(110, 180, 220, 0.42)';
-      const weak = pixelBrush ? 'rgba(122, 208, 255, 0.30)' : 'rgba(110, 180, 220, 0.22)';
+      const strong = 'rgba(110, 180, 220, 0.42)';
+      const weak = 'rgba(110, 180, 220, 0.22)';
       ctx.lineWidth = 1 / state.zoom;
       for (let x = spacing; x < state.imgWidth; x += spacing) {
         ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, state.imgHeight);

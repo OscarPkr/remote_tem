@@ -4,7 +4,8 @@ const { openBlankEditor } = require('./helpers');
 
 const FONTS = [
   'Inter', 'Roboto', 'Playfair Display', 'Lobster',
-  'Bebas Neue', 'Roboto Mono', 'Georgia', 'Courier New',
+  'Bebas Neue', 'Roboto Mono', 'Space Grotesk', 'Fraunces',
+  'Syne', 'Bungee', 'Instrument Serif', 'Georgia', 'Courier New',
 ];
 const md5 = (buf) => crypto.createHash('md5').update(buf).digest('hex');
 

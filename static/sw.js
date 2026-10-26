@@ -7,7 +7,7 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
-const CACHE_NAME = 'odysseus-v660-photo-editor';
+const CACHE_NAME = 'odysseus-v1113-pr40-editor-precache';
 
 // KaTeX resolves these from its own stylesheet, so caching the CSS without them
 // gives offline math fallback glyphs instead of proper typesetting.
@@ -185,6 +185,10 @@ const PRECACHE = [
   '/static/lib/katex/katex.min.js',
   '/static/lib/katex/katex.min.css',
   ...KATEX_FONTS,
+  '/static/manifest.json',
+  '/static/icons/icon-192.png',
+  '/static/icons/icon-512.png',
+  '/static/icons/icon-maskable-512.png',
 ];
 
 // Lazily-imported panel modules (js/panels.js). Not in index.html by design;
@@ -301,6 +305,7 @@ const PANEL_PRECACHE = [
   '/static/js/editor/tools/move.js',
   '/static/js/editor/tools/object-select.js',
   '/static/js/editor/tools/pen-selection.js',
+  '/static/js/editor/tools/liquify.js',
   '/static/js/editor/tools/pen-path.js',
   '/static/js/editor/tools/quick-select.js',
   '/static/js/editor/tools/stroke.js',
@@ -318,7 +323,7 @@ const PANEL_PRECACHE = [
   '/static/js/editor/wire-topbar.js',
   '/static/js/editor/wire-view-menu.js',
   // Editor modules reachable only through the lazy galleryEditor.js graph.
-  '/static/js/editor/build/toolbar.js?v=20261008flyouts',
+  '/static/js/editor/build/toolbar.js?v=20261010brushpresets',
   '/static/js/editor/canvas-context-menu.js',
   '/static/js/editor/scroll-affordance.js',
   '/static/js/editor/panel-visibility.js',

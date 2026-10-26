@@ -35,19 +35,26 @@ def test_editor_paste_owns_clipboard_images_while_editor_open():
 
 
 def test_editor_ctrl_v_pastes_the_internal_selection_clipboard():
-    """Ctrl/Cmd+V must paste the internal selection clipboard directly.
+    """Ctrl/Cmd+V must not shadow a newer OS-clipboard image.
 
-    On an insecure origin (the editor is served over http on a LAN IP)
-    ``navigator.clipboard`` is unavailable, so copying a selection never reaches
-    the OS clipboard and the native ``paste`` event carries stale ``text/plain``
-    -> the internal-paste branch is skipped and Ctrl+V silently does nothing
-    (the toolbar buttons worked because they bypass the event entirely).
+    Intercepting the keystroke (preventDefault) bypasses the browser's paste
+    event and always re-pasted ``state.internalClipboard``, so a screenshot
+    taken outside the gallery could never be pasted. The key handler may only
+    fall back to the internal copy when the paste event delivered no image
+    (insecure origin: copy never reaches the OS clipboard).
     """
     src = SRC.read_text(encoding="utf-8")
     # Shared, hoisted paste helper (also used by the native paste listener).
     assert "const pasteAsLayer = (imgSource, label, offset = { x: 0, y: 0 }) => {" in src
-    # Explicit keyboard handler for the internal clipboard.
+    # The paste listener must prefer real clipboard images.
+    assert "const imageItem = Array.from(e.clipboardData?.items || [])" in src
+    # Deferred keyboard fallback for the internal clipboard.
     assert "window.addEventListener('keydown', (e) => {" in src
     assert "if (String(e.key || '').toLowerCase() !== 'v') return;" in src
-    assert "if (!state.internalClipboard) return;" in src
+    assert "pasteKeyPending = true;" in src
+    assert "if (!pasteKeyPending) return;" in src
     assert "pasteAsLayer(state.internalClipboard, 'Pasted Selection'" in src
+    # The key handler must NOT swallow the keystroke any more.
+    keydown = src[src.index("// ── Ctrl/Cmd+V ──"):src.index("// ── Drag-and-drop ──")]
+    assert "e.preventDefault();" not in keydown
+    assert "e.stopImmediatePropagation();" not in keydown

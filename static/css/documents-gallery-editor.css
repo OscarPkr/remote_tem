@@ -1287,7 +1287,8 @@ body.ge-editor-open .ge-setup-btn:hover {
 }
 
 /* The options-bar checkbox overrode the shared dot with a square + a drawn
-   ::after tick; force it back to the app's 14px circular dot (part 1). */
+   ::after tick; force it back to the app's 14px circular dot, filled with the
+   highlight (accent) colour when checked (part 1). */
 body.ge-editor-open .ge-opt input[type="checkbox"],
 body.ge-editor-open .ge-opt input[type="radio"] {
   border-radius: 50%;
@@ -1295,8 +1296,8 @@ body.ge-editor-open .ge-opt input[type="radio"] {
 }
 body.ge-editor-open .ge-opt input[type="checkbox"]:checked,
 body.ge-editor-open .ge-opt input[type="radio"]:checked {
-  background: var(--fg);
-  border-color: var(--fg);
+  background: var(--accent, var(--red));
+  border-color: var(--accent, var(--red));
 }
 body.ge-editor-open .ge-opt input[type="checkbox"]:checked::after {
   content: none;
