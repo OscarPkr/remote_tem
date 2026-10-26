@@ -173,4 +173,3 @@ def test_pixel_brush_snaps_only_while_shift_is_held():
     # The shift modifier has to reach the pipeline from the DOM event.
     stroke = (ROOT / "static/js/editor/tools/stroke.js").read_text()
     assert "shift: !!e?.shiftKey" in stroke
-

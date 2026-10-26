@@ -182,4 +182,3 @@ def test_new_filters_reuse_live_filter_dialog():
     assert "renderer: _median," in EDITOR
     assert "renderer: _polarCoordinates," in EDITOR
     assert "renderer: _differenceClouds," in EDITOR
-

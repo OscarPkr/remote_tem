@@ -47,4 +47,3 @@ export function applyBrushPreset(state, preset) {
   state.brushBlendMode = preset.blendMode || 'source-over';
   state.brushPixel = !!preset.pixel;
 }
-

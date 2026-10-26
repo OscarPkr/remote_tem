@@ -494,4 +494,3 @@ export function decodeLayeredPsd(arrayBuffer) {
   }
   return { width, height, layers: layers.reverse() };
 }
-

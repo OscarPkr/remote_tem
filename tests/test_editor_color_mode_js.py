@@ -65,4 +65,3 @@ def test_codec_persists_color_mode():
     src = read("static/js/editor/document-codec.js")
     assert "colorMode: state.colorMode || 'rgb'" in src
     assert "colorMode: migrated.colorMode === 'grayscale' ? 'grayscale' : 'rgb'" in src
-

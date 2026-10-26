@@ -168,4 +168,3 @@ def test_select_and_mask_workspace():
     assert "selectAndMask: _selectAndMask," in GALLERY
     assert 'data-selection-action="selectAndMask"' in TOPBAR
     assert "action === 'selectAndMask'" in WIRE_MENUS
-

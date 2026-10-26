@@ -55,4 +55,3 @@ def test_blanket_button_inflation_is_gone():
 
 def test_panels_button_is_last_in_the_header():
     assert "order: 1;" in CSS
-
