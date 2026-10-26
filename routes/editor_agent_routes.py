@@ -1732,6 +1732,7 @@ def setup_editor_agent_routes() -> APIRouter:
             from core.database import SessionLocal, ModelEndpoint
             from src.auth_helpers import owner_filter
             from src.endpoint_resolver import _endpoint_enabled_models
+            from src.image_model_ids import looks_like_image_generation_model
 
             db = SessionLocal()
             try:
@@ -1741,10 +1742,16 @@ def setup_editor_agent_routes() -> APIRouter:
                     owner,
                 )
                 for ep in query.all():
-                    if getattr(ep, "model_type", None) != "image":
-                        continue
+                    # Image-only endpoints (the local Qwen server) list their
+                    # models verbatim. Gateway/chat endpoints (OpenRouter, …)
+                    # mix chat and image models, so expose only ids that are
+                    # recognisably image-capable — the same test the request
+                    # router uses.
+                    image_endpoint = getattr(ep, "model_type", None) == "image"
                     provider = getattr(ep, "name", None) or getattr(ep, "base_url", "") or "image"
                     for name in _endpoint_enabled_models(ep):
+                        if not image_endpoint and not looks_like_image_generation_model(name):
+                            continue
                         key = (provider, name)
                         if key in seen:
                             continue

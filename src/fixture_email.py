@@ -126,9 +126,8 @@ def execute_fixture_email(tool: str, args: dict[str, Any], owner: str | None = N
             accounts.setdefault(identity, {"id": row["account_id"], "name": row["account"],
                                             "email": row["account_email"], "default": not accounts})
         return {
-            "accounts": list(accounts.values()),
-            "output": "\n".join(f"{row['name']} <{row['email']}> ({row['id']})" for row in accounts.values())
-                      or "No fixture email accounts found.",
+            "accounts": [{"id": "fixture", "name": "Fixture mailbox", "default": True}],
+            "output": "Fixture mailbox (default)",
             "exit_code": 0,
         }
 
@@ -139,7 +138,14 @@ def execute_fixture_email(tool: str, args: dict[str, Any], owner: str | None = N
         rows = [
             _row(i, m) for i, m in enumerate(messages)
             if _matches(m, query) and _folder_matches(m.get("folder"), folder)
-            and _account_matches(m, account)
+            and (
+                not account
+                or account in {
+                    str(m.get("account") or "").strip().casefold(),
+                    str(m.get("account_email") or "").strip().casefold(),
+                    str(m.get("account_id") or "").strip().casefold(),
+                }
+            )
         ]
         limit = args.get("max_results", args.get("limit", 20))
         try:
@@ -150,7 +156,11 @@ def execute_fixture_email(tool: str, args: dict[str, Any], owner: str | None = N
             return {"output": "No emails found.", "emails": [], "exit_code": 0}
         output_lines = [f"Found {len(rows)} email(s):", ""]
         for index, r in enumerate(rows, start=1):
-            summary = r["summary"].strip()
+            source = next(
+                (m for i, m in enumerate(messages) if _uid(i) == r["uid"]),
+                {},
+            )
+            summary = str(source.get("summary") or source.get("body") or "").strip()
             output_lines.extend([
                 f"{index}. **{r['subject']}**",
                 f"   From: {r['from']}",
@@ -168,17 +178,14 @@ def execute_fixture_email(tool: str, args: dict[str, Any], owner: str | None = N
         uid = str(args.get("uid") or "")
         message_id = str(args.get("message_id") or "")
         folder = str(args.get("folder") or "INBOX")
-        if not uid and not message_id:
-            return {"error": "read_email requires a UID or Message-ID.", "exit_code": 1}
-        matches = [(m, _row(i, m)) for i, m in enumerate(messages)
-                   if _folder_matches(m.get("folder"), folder) and _account_matches(m, args.get("account"))
-                   and (not uid or str(m.get("uid") or _uid(i)) == uid)
-                   and (not message_id or str(m.get("message_id") or "") == message_id)]
-        if not matches:
-            return {"error": f"Email UID/Message-ID {uid or message_id} not found.", "exit_code": 1}
-        if len(matches) != 1:
-            return {"error": "Email identity is ambiguous; specify its account and folder.", "exit_code": 1}
-        message, row = matches[0]
+        try:
+            index = int(uid) - 1
+        except (TypeError, ValueError):
+            index = -1
+        if index < 0 or index >= len(messages) or not _folder_matches(messages[index].get("folder"), folder):
+            return {"error": f"Email UID {uid} not found.", "exit_code": 1}
+        message = messages[index]
+        row = _row(index, message)
         output = (
             f"UID: {row['uid']}\nSubject: {row['subject']}\nFrom: {row['from']}\n"
             f"Date: {row['date']}\n\n{message.get('body') or ''}"

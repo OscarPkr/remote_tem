@@ -25,17 +25,21 @@ import json
 import re
 import html
 import io
+import tempfile
 import zipfile
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from html.parser import HTMLParser as _HTMLParser
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from email.message import EmailMessage
+from email import policy as email_policy
 
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
+from starlette.concurrency import run_in_threadpool
 from fastapi import APIRouter, Query, UploadFile, File, BackgroundTasks, HTTPException, Depends, Request
 from fastapi.responses import FileResponse, StreamingResponse
 from src.constants import DATA_DIR
@@ -61,6 +65,7 @@ from .email_helpers import (
     _fetch_sender_thread_context, _pre_retrieve_context,
     _EMAIL_REPLY_SYS_PROMPT_BASE, _POOL_HOOKS,
     _friendly_email_auth_error, _email_summary_failure_log_detail,
+    _mail_connection_test_error, _mail_private_blocked, _PolicySMTP, _PolicySMTP_SSL,
     _generate_email_summary, EMAIL_SUMMARY_ERROR_CODE, EMAIL_SUMMARY_ERROR_MESSAGE,
     SendEmailRequest, ExtractStyleRequest,
     ATTACHMENTS_DIR, COMPOSE_UPLOADS_DIR, SCHEDULED_DB,
@@ -81,6 +86,17 @@ _SERVER_OWNED_OAUTH_FIELDS = {
     "oauth_token_expiry",
 }
 _CACHE_HOOKS: dict = {"invalidate_list": None}
+
+
+def _check_mail_host(host, owner: str, label: str) -> str | None:
+    """Reject unsafe or unresolved mail hosts before saving or testing them."""
+    from src.url_safety import check_outbound_host
+    ok, reason = check_outbound_host(host, block_private=_mail_private_blocked(owner))
+    if ok:
+        return None
+    logger.warning("Rejected %s mail host for owner=%r: %s", label, owner, reason)
+    # Resolver and exception details belong in server logs, never the response.
+    return f"Rejected {label} host: server address is not allowed or does not resolve"
 
 
 def _normalized_mail_host(value) -> str:
@@ -635,8 +651,13 @@ def _message_id_chain(*values: str) -> list[str]:
 
 
 def _uid_from_fetch_meta(meta_b: bytes) -> str:
-    m = re.search(rb"\bUID\s+(\d+)\b", meta_b)
+    m = re.search(rb"\bUID\s+(\d+)\b", meta_b, re.IGNORECASE)
     return m.group(1).decode() if m else ""
+
+
+def _size_from_fetch_meta(meta_b: bytes) -> int | None:
+    m = re.search(rb"\bRFC822\.SIZE\s+(\d+)\b", meta_b, re.IGNORECASE)
+    return int(m.group(1)) if m else None
 
 
 def _parse_list_unsubscribe_header(value: str | None) -> list[dict]:
@@ -1542,6 +1563,44 @@ def _envelope_recipients(*fields: str) -> list:
     return out
 
 
+_MD_LINK_URL_RE = re.compile(r"\((https?://)[^)\s]*")
+
+
+def _md_links_to_html(s: str) -> str:
+    """Linear ``re.sub(r"\\[([^\\]]+)\\]\\((https?://[^)\\s]+)\\)", '<a href="\\2">\\1</a>', s)``.
+
+    Every `[` before the next `]` shares that `]`, so only the first can match;
+    and when a URL runs into whitespace/end without `)`, every later `[` whose
+    `]` also lies before that stop fails the same way. Skipping those spans
+    keeps a `[[[` or `[a](http://x[a](http://x` flood O(n) instead of the
+    regex's O(n^2).
+    """
+    out: list[str] = []
+    emitted = scan = 0
+    while True:
+        open_at = s.find("[", scan)
+        if open_at < 0:
+            break
+        close_at = s.find("]", open_at + 1)
+        if close_at < 0:
+            break
+        scan = close_at + 1
+        if close_at == open_at + 1:
+            continue
+        url = _MD_LINK_URL_RE.match(s, close_at + 1)
+        if url is None:
+            continue
+        end = url.end()
+        if end < len(s) and s[end] == ")" and end > url.end(1):
+            out.append(s[emitted:open_at])
+            out.append(f'<a href="{s[url.start(1):end]}">{s[open_at + 1:close_at]}</a>')
+            emitted = scan = end + 1
+        elif end > url.end(1):
+            scan = max(scan, s.rfind("]", scan, end) + 1)
+    out.append(s[emitted:])
+    return "".join(out)
+
+
 def _md_to_email_html(text: str) -> str:
     """Render the compose markdown body to a SAFE HTML fragment for the email's
     text/html part. Everything is HTML-escaped FIRST (so a pasted <script> /
@@ -1557,7 +1616,7 @@ def _md_to_email_html(text: str) -> str:
         s = re.sub(r"~~([^~]+)~~", r"<del>\1</del>", s)
         s = re.sub(r"`([^`]+)`", r"<code>\1</code>", s)
         # links: text + http(s) url only (escape() already neutralised quotes)
-        s = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r'<a href="\2">\1</a>', s)
+        s = _md_links_to_html(s)
         return s
 
     parts: list[str] = []
@@ -1776,11 +1835,6 @@ def setup_email_routes():
             return None
         return v[1]
 
-    # Stale-while-revalidate snapshot store: a last-good list response per key
-    # with NO TTL, so a list view can render instantly from a snapshot (or the
-    # durable index) and refresh in the background instead of blocking ~2-5 s on
-    # IMAP. Kept small and separate from the TTL cache so invalidation of the
-    # fresh cache never removes the fallback snapshot.
     _LIST_STALE = {}
 
     def _list_stale_get(key):
@@ -4012,7 +4066,7 @@ def setup_email_routes():
             _row, att = fixture_att
             filename = str(att.get("filename") or f"attachment-{index}.txt")
             safe_name = re.sub(r"[^\w\s\-.]", "_", filename).strip() or f"attachment-{index}.txt"
-            target_dir = attachment_extract_dir(folder, uid)
+            target_dir = attachment_extract_dir(folder, uid, owner=owner, account_id=account_id)
             target_dir.mkdir(parents=True, exist_ok=True)
             filepath = target_dir / safe_name
             filepath.write_bytes(str(att.get("content") or "").encode("utf-8"))
@@ -4031,7 +4085,7 @@ def setup_email_routes():
             msg = email_mod.message_from_bytes(raw)
 
             # Extract to a per-email folder
-            target_dir = attachment_extract_dir(folder, uid)
+            target_dir = attachment_extract_dir(folder, uid, owner=owner, account_id=account_id)
             filepath = _extract_attachment_to_disk(msg, index, target_dir)
             if not filepath:
                 return {"error": f"Attachment index {index} not found"}
@@ -4063,7 +4117,7 @@ def setup_email_routes():
             if not attachments:
                 raise HTTPException(status_code=404, detail="No downloadable attachments")
 
-            target_dir = attachment_extract_dir(folder, uid)
+            target_dir = attachment_extract_dir(folder, uid, owner=owner, account_id=account_id)
             zip_buf = io.BytesIO()
             used_names: dict[str, int] = {}
             with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -4203,7 +4257,7 @@ def setup_email_routes():
                                     att for att in _list_attachments_from_msg(msg)
                                     if not _is_likely_signature_image_attachment(att)
                                 ]
-                                target_dir = attachment_extract_dir(folder, uid)
+                                target_dir = attachment_extract_dir(folder, uid, owner=owner, account_id=acct)
                                 for att in attachments:
                                     idx = att.get("index")
                                     if idx is None:
@@ -4232,6 +4286,414 @@ def setup_email_routes():
             media_type="application/zip",
             headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
         )
+
+    @router.post("/messages-download-bulk")
+    async def download_bulk_messages(request: Request, owner: str = Depends(require_owner)):
+        """Export selected original email messages as .eml files in a ZIP."""
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON body")
+        messages = payload.get("messages") if isinstance(payload, dict) else None
+        if not isinstance(messages, list) or not messages:
+            raise HTTPException(status_code=400, detail="No emails selected")
+        if len(messages) > 250:
+            raise HTTPException(status_code=400, detail="Too many emails selected")
+
+        category = str(payload.get("category") or "selected").strip().lower()
+        category = re.sub(r"[^a-z0-9_-]+", "-", category).strip("-") or "selected"
+        selected_dates = sorted({
+            str(row.get("date") or "").strip()
+            for row in messages if isinstance(row, dict)
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(row.get("date") or "").strip())
+        })
+        date_span = ""
+        if selected_dates:
+            date_span = selected_dates[0] if len(selected_dates) == 1 else f"{selected_dates[0]} - {selected_dates[-1]}"
+        export_folder = f"emails-{category}" + (f" ({date_span})" if date_span else "")
+
+        # 512 MiB safety cap prevents unbounded memory growth when exporting
+        # many large messages.
+        max_total_bytes = 512 * 1024 * 1024
+        max_message_bytes = 64 * 1024 * 1024
+        spool_threshold_bytes = 32 * 1024 * 1024
+        used_names: set[str] = set()
+        exported = 0
+        skipped = 0
+        total_bytes = 0
+        validated_accounts: set[str] = set()
+
+        def _email_filename(row: dict, uid: str) -> str:
+            date = str(row.get("date") or "").strip()
+            date = date if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) else ""
+            subject = str(row.get("subject") or "email").strip()
+            subject = re.sub(r'[<>:"/\\|?*\x00-\x1f\x7f]+', "_", subject)
+            subject = re.sub(r"\s+", " ", subject).strip(" .")[:100] or "email"
+            safe_uid = re.sub(r"[^A-Za-z0-9_-]+", "_", uid).strip("_") or "message"
+            prefix = f"{date} - " if date else ""
+            return _safe_attachment_zip_name(f"{prefix}{subject} - {safe_uid}.eml", "email.eml")
+
+        def _fixture_message_bytes(fixture: dict, uid: str, folder: str) -> bytes:
+            msg = EmailMessage()
+            sender_name = str(fixture.get("from_name") or "").strip()
+            sender_address = str(fixture.get("from_address") or "").strip()
+            sender = email.utils.formataddr((sender_name, sender_address)) if sender_address else sender_name
+            for key, value in (
+                ("From", sender),
+                ("To", fixture.get("to") or owner),
+                ("Subject", fixture.get("subject") or "(no subject)"),
+                ("Message-ID", fixture.get("message_id") or f"<fixture-{uid}@mail.local>"),
+            ):
+                clean_value = re.sub(r"[\r\n]+", " ", str(value or "")).strip()
+                if clean_value:
+                    msg[key] = clean_value
+            raw_date = str(fixture.get("date") or "").strip()
+            if raw_date:
+                try:
+                    parsed_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00"))
+                    if parsed_date.tzinfo is None:
+                        parsed_date = parsed_date.replace(tzinfo=timezone.utc)
+                except Exception:
+                    try:
+                        parsed_date = email.utils.parsedate_to_datetime(raw_date)
+                    except Exception:
+                        parsed_date = None
+                if parsed_date is not None:
+                    msg["Date"] = email.utils.format_datetime(parsed_date)
+            msg.set_content(str(fixture.get("body") or ""))
+            for attachment in fixture.get("attachments") or []:
+                try:
+                    index = int(attachment.get("index"))
+                    source = _fixture_attachment_source(uid, index, owner, folder)
+                    if not source:
+                        continue
+                    _row, raw_attachment = source
+                    content_type = str(raw_attachment.get("content_type") or "application/octet-stream")
+                    maintype, _, subtype = content_type.partition("/")
+                    if not subtype:
+                        maintype, subtype = "application", "octet-stream"
+                    msg.add_attachment(
+                        str(raw_attachment.get("content") or "").encode("utf-8"),
+                        maintype=maintype,
+                        subtype=subtype,
+                        filename=str(raw_attachment.get("filename") or attachment.get("filename") or f"attachment-{index}"),
+                    )
+                except Exception:
+                    logger.debug("Skipping malformed fixture email attachment uid=%s", uid, exc_info=True)
+            return msg.as_bytes(policy=email_policy.SMTP)
+
+        # Optimization: single message exports return raw .eml directly without ZIP compression.
+        if len(messages) == 1:
+            row = messages[0]
+            if not isinstance(row, dict):
+                raise HTTPException(status_code=404, detail="No selected emails could be exported")
+            uid = str(row.get("uid") or "").strip()
+            if not uid:
+                raise HTTPException(status_code=404, detail="No selected emails could be exported")
+            folder = str(row.get("folder") or "INBOX").strip() or "INBOX"
+            account_id = str(row.get("account_id") or row.get("account") or "").strip() or None
+            if account_id:
+                _assert_owns_account(account_id, owner)
+
+            filename = _email_filename(row, uid)
+            message_bytes: bytes | None = None
+
+            fixture = _fixture_email_read(uid, folder, owner)
+            if fixture is not None and not fixture.get("error"):
+                message_bytes = _fixture_message_bytes(fixture, uid, folder)
+            elif re.fullmatch(r"\d+", uid):
+                try:
+                    with _imap(account_id, owner=owner) as conn:
+                        conn.select(_q(folder), readonly=True)
+                        uid_b = uid.encode()
+                        st_sz, sz_data = None, None
+                        try:
+                            st_sz, sz_data = _imap_uid_fetch(conn, uid_b, "(UID RFC822.SIZE)")
+                        except Exception as sz_err:
+                            logger.warning("Single message size preflight query error for uid=%s: %s", uid, sz_err)
+
+                        if st_sz != "OK":
+                            logger.warning("Single message size preflight status=%s for uid=%s", st_sz, uid)
+                            raise HTTPException(status_code=502, detail="Unable to verify email size safety")
+
+                        if not sz_data:
+                            # Message does not exist in mailbox (missing mail)
+                            raise HTTPException(status_code=404, detail="No selected emails could be exported")
+
+                        sz: int | None = None
+                        for item in sz_data:
+                            meta = item[0] if isinstance(item, tuple) else item
+                            if isinstance(meta, bytes):
+                                u = _uid_from_fetch_meta(meta)
+                                if u == uid:
+                                    sz = _size_from_fetch_meta(meta)
+                                    break
+
+                        if sz is None or sz < 0:
+                            logger.warning("Single message size preflight returned invalid/malformed size for uid=%s", uid)
+                            raise HTTPException(status_code=502, detail="Invalid email size metadata from server")
+
+                        if sz > max_message_bytes or sz > max_total_bytes:
+                            raise HTTPException(status_code=413, detail="Export too large")
+
+                        # Preflight size safety established; perform RFC822 fetch.
+                        st, msg_data = _imap_uid_fetch(conn, uid_b, "(UID RFC822)")
+                        if st == "OK" and msg_data:
+                            for meta, raw in _group_uid_fetch_records(msg_data):
+                                if _uid_from_fetch_meta(meta) == uid and raw:
+                                    message_bytes = bytes(raw)
+                                    break
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    logger.warning("Single email export failed for uid=%s folder=%s: %s", uid, folder, exc)
+
+            if not message_bytes:
+                raise HTTPException(status_code=404, detail="No selected emails could be exported")
+
+            if len(message_bytes) > max_message_bytes or len(message_bytes) > max_total_bytes:
+                raise HTTPException(status_code=413, detail="Export too large")
+
+            return StreamingResponse(
+                io.BytesIO(message_bytes),
+                media_type="message/rfc822",
+                headers={
+                    "Content-Disposition": f"attachment; filename=\"email.eml\"; filename*=UTF-8''{quote(filename, safe='')}",
+                    "X-Exported-Emails": "1",
+                    "X-Skipped-Emails": "0",
+                },
+            )
+
+        seen_items: set[tuple[str | None, str, str]] = set()
+        remote_groups: dict[tuple[str | None, str], dict[str, tuple[str, dict]]] = {}
+        spooled_file = tempfile.SpooledTemporaryFile(max_size=spool_threshold_bytes, mode="w+b")
+        response_started = False
+        try:
+            with zipfile.ZipFile(spooled_file, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for row in messages:
+                    if not isinstance(row, dict):
+                        skipped += 1
+                        continue
+                    uid = str(row.get("uid") or "").strip()
+                    if not uid:
+                        skipped += 1
+                        continue
+                    folder = str(row.get("folder") or "INBOX").strip() or "INBOX"
+                    account_id = str(row.get("account_id") or row.get("account") or "").strip() or None
+                    if account_id and account_id not in validated_accounts:
+                        _assert_owns_account(account_id, owner)
+                        validated_accounts.add(account_id)
+
+                    item_key = (account_id, folder, uid)
+                    if item_key in seen_items:
+                        skipped += 1
+                        continue
+                    seen_items.add(item_key)
+
+                    fixture = _fixture_email_read(uid, folder, owner)
+                    if fixture is not None and not fixture.get("error"):
+                        filename = _email_filename(row, uid)
+                        unique_name = filename
+                        suffix = 2
+                        while unique_name.lower() in used_names:
+                            unique_name = f"{Path(filename).stem}-{suffix}.eml"
+                            suffix += 1
+                        used_names.add(unique_name.lower())
+                        message_bytes = _fixture_message_bytes(fixture, uid, folder)
+                        if len(message_bytes) > max_message_bytes:
+                            raise HTTPException(status_code=413, detail="Export too large")
+                        total_bytes += len(message_bytes)
+                        if total_bytes > max_total_bytes:
+                            raise HTTPException(status_code=413, detail="Export too large")
+                        try:
+                            zf.writestr(f"{export_folder}/{unique_name}", message_bytes)
+                        except Exception as zip_err:
+                            logger.error("ZIP entry write failed for fixture: %s", zip_err)
+                            raise HTTPException(status_code=500, detail="Failed to create export archive")
+                        exported += 1
+                        continue
+                    if not re.fullmatch(r"\d+", uid):
+                        skipped += 1
+                        continue
+                    group = remote_groups.setdefault((account_id, folder), {})
+                    group.setdefault(uid, (_email_filename(row, uid), row))
+
+                preflight_error: HTTPException | None = None
+
+                # Fetch original RFC822 data in batches and store it byte-for-byte.
+                # Note on IMAP memory-safety: Python's standard imaplib buffers socket responses into
+                # memory before returning literals to application code. Preflight verification ensures
+                # we do not intentionally fetch messages exceeding limits, but an untrusted or non-compliant
+                # IMAP server sending unexpectedly large literals cannot be bounded at the transport level
+                # without custom socket streaming. Post-fetch checks guard application-level storage.
+                for (account_id, folder), rows_by_uid in remote_groups.items():
+                    rows = list(rows_by_uid.items())
+                    remaining_rows = len(rows)
+                    try:
+                        with _imap(account_id, owner=owner) as conn:
+                            conn.select(_q(folder), readonly=True)
+
+                            # Size preflight query to catch oversized exports early and bound batch sizes.
+                            uid_set_all = ",".join(uid for uid, _ in rows).encode()
+                            st_sz, sz_data = None, None
+                            try:
+                                st_sz, sz_data = _imap_uid_fetch(conn, uid_set_all, "(UID RFC822.SIZE)")
+                            except Exception as sz_err:
+                                logger.warning("IMAP size preflight query failed for folder=%s: %s", folder, sz_err)
+
+                            if st_sz != "OK":
+                                logger.warning("IMAP size preflight status=%s for folder=%s account=%s", st_sz, folder, account_id)
+                                preflight_error = HTTPException(status_code=502, detail="Unable to verify email size safety")
+                                skipped += remaining_rows
+                                remaining_rows = 0
+                                continue
+
+                            if not sz_data:
+                                # All requested UIDs in this mailbox are missing on server
+                                skipped += remaining_rows
+                                remaining_rows = 0
+                                continue
+
+                            reported_sizes: dict[str, int | None] = {}
+                            for item in sz_data:
+                                meta = item[0] if isinstance(item, tuple) else item
+                                if isinstance(meta, bytes):
+                                    u = _uid_from_fetch_meta(meta)
+                                    if u:
+                                        reported_sizes[u] = _size_from_fetch_meta(meta)
+
+                            # Categorize requested UIDs
+                            malformed_uids = [
+                                uid for uid, _ in rows
+                                if uid in reported_sizes and (reported_sizes[uid] is None or reported_sizes[uid] < 0)
+                            ]
+                            if malformed_uids:
+                                logger.warning("IMAP size preflight returned invalid/malformed size for uids=%s in folder=%s", malformed_uids, folder)
+                                preflight_error = HTTPException(status_code=502, detail="Invalid email size metadata from server")
+                                skipped += remaining_rows
+                                remaining_rows = 0
+                                continue
+
+                            # Identify missing mail (requested UIDs not returned in preflight)
+                            missing_uids = {uid for uid, _ in rows if uid not in reported_sizes}
+                            if missing_uids:
+                                skipped += len(missing_uids)
+                                remaining_rows -= len(missing_uids)
+                                rows = [item for item in rows if item[0] not in missing_uids]
+
+                            if not rows:
+                                continue
+
+                            size_by_uid: dict[str, int] = {
+                                uid: reported_sizes[uid] for uid, _ in rows
+                            }
+
+                            for u, s in size_by_uid.items():
+                                if s > max_message_bytes:
+                                    raise HTTPException(status_code=413, detail="Export too large")
+                            if total_bytes + sum(size_by_uid.values()) > max_total_bytes:
+                                raise HTTPException(status_code=413, detail="Export too large")
+
+                            # Form batches with at most 20 messages and capped at 10 MiB payload.
+                            batches: list[list[tuple[str, tuple[str, dict]]]] = []
+                            cur_batch: list[tuple[str, tuple[str, dict]]] = []
+                            cur_batch_bytes = 0
+                            max_batch_bytes = 10 * 1024 * 1024
+                            for item in rows:
+                                uid_val = item[0]
+                                sz = size_by_uid[uid_val]
+                                if cur_batch and (
+                                    len(cur_batch) >= 20 or
+                                    (cur_batch_bytes + sz > max_batch_bytes)
+                                ):
+                                    batches.append(cur_batch)
+                                    cur_batch = []
+                                    cur_batch_bytes = 0
+                                cur_batch.append(item)
+                                cur_batch_bytes += sz
+                            if cur_batch:
+                                batches.append(cur_batch)
+
+                            for batch in batches:
+                                wanted = {uid: filename for uid, (filename, _row) in batch}
+                                uid_set = ",".join(wanted).encode()
+                                status, msg_data = _imap_uid_fetch(conn, uid_set, "(UID RFC822)")
+                                if status != "OK" or not msg_data:
+                                    skipped += len(batch)
+                                    remaining_rows -= len(batch)
+                                    continue
+                                found: set[str] = set()
+                                for meta, raw_message in _group_uid_fetch_records(msg_data):
+                                    uid = _uid_from_fetch_meta(meta)
+                                    if not uid or uid not in wanted or not raw_message:
+                                        continue
+                                    if uid in found:
+                                        # P2: Reject duplicate IMAP response records for an already-processed UID
+                                        logger.debug("Ignoring duplicate IMAP FETCH record for uid=%s in folder=%s", uid, folder)
+                                        continue
+                                    filename = wanted[uid]
+                                    unique_name = filename
+                                    suffix = 2
+                                    while unique_name.lower() in used_names:
+                                        unique_name = f"{Path(filename).stem}-{suffix}.eml"
+                                        suffix += 1
+                                    used_names.add(unique_name.lower())
+                                    message_bytes = bytes(raw_message)
+                                    if len(message_bytes) > max_message_bytes:
+                                        raise HTTPException(status_code=413, detail="Export too large")
+                                    total_bytes += len(message_bytes)
+                                    if total_bytes > max_total_bytes:
+                                        raise HTTPException(status_code=413, detail="Export too large")
+                                    try:
+                                        zf.writestr(f"{export_folder}/{unique_name}", message_bytes)
+                                    except Exception as zip_err:
+                                        logger.error("ZIP entry write failed for remote message: %s", zip_err)
+                                        raise HTTPException(status_code=500, detail="Failed to create export archive")
+                                    found.add(uid)
+                                    exported += 1
+                                    remaining_rows -= 1
+                                missing = len(batch) - len(found)
+                                skipped += len(batch) - len(found)
+                                remaining_rows -= missing
+                    except HTTPException:
+                        raise
+                    except Exception as exc:
+                        skipped += remaining_rows
+                        logger.warning("Bulk email export skipped mailbox folder=%s account=%s count=%s: %s", folder, account_id, remaining_rows, exc)
+
+            if preflight_error is not None:
+                raise preflight_error
+
+            if exported <= 0:
+                raise HTTPException(status_code=404, detail="No selected emails could be exported")
+
+            spooled_file.seek(0)
+            zip_name = _safe_attachment_zip_name(f"{export_folder}.zip", "selected-emails.zip")
+            logger.info("Bulk email export complete owner=%s selected=%s exported=%s skipped=%s", owner, len(messages), exported, skipped)
+
+            def _iter_spooled(f, chunk_size=64 * 1024):
+                try:
+                    while True:
+                        chunk = f.read(chunk_size)
+                        if not chunk:
+                            break
+                        yield chunk
+                finally:
+                    f.close()
+
+            response_started = True
+            return StreamingResponse(
+                _iter_spooled(spooled_file),
+                media_type="application/zip",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{zip_name}"',
+                    "X-Exported-Emails": str(exported),
+                    "X-Skipped-Emails": str(skipped),
+                },
+            )
+        finally:
+            if not response_started:
+                spooled_file.close()
 
     @router.get("/inline-image/{uid}")
     async def inline_image(
@@ -4268,7 +4730,7 @@ def setup_email_routes():
                     continue
                 if not ct.lower().startswith("image/"):
                     raise HTTPException(status_code=415, detail="Content-ID is not an image")
-                target_dir = attachment_extract_dir(folder, uid)
+                target_dir = attachment_extract_dir(folder, uid, owner=owner, account_id=account_id)
                 filepath = _extract_attachment_to_disk(msg, idx, target_dir)
                 if not filepath:
                     raise HTTPException(status_code=404, detail="Inline image not found")
@@ -4306,7 +4768,7 @@ def setup_email_routes():
             raw = msg_data[0][1]
             msg = email_mod.message_from_bytes(raw)
 
-            target_dir = attachment_extract_dir(folder, uid)
+            target_dir = attachment_extract_dir(folder, uid, owner=owner, account_id=account_id)
             filepath = _extract_attachment_to_disk(msg, index, target_dir)
             if not filepath:
                 return {"error": f"Attachment index {index} not found"}
@@ -4634,7 +5096,9 @@ def setup_email_routes():
                 try:
                     content = filepath.read_text(encoding="utf-8", errors="replace")
                 except Exception as e:
-                    return {"error": f"Failed to read text file: {e}", "filename": base}
+                    # OSError text includes the server-side extraction path.
+                    logger.warning("Failed to read text attachment %s: %s", base, e)
+                    return {"error": "Failed to read text file", "filename": base}
                 doc_id = _create_markdown_doc(content, "Imported from email attachment")
                 return {"doc_id": doc_id, "filename": filepath.name}
 
@@ -4651,7 +5115,7 @@ def setup_email_routes():
             _row, att = fixture_att
             filename = str(att.get("filename") or f"attachment-{index}.txt")
             safe_name = re.sub(r"[^\w\s\-.]", "_", filename).strip() or f"attachment-{index}.txt"
-            target_dir = attachment_extract_dir(folder, uid)
+            target_dir = attachment_extract_dir(folder, uid, owner=owner, account_id=account_id)
             target_dir.mkdir(parents=True, exist_ok=True)
             filepath = target_dir / safe_name
             filepath.write_bytes(str(att.get("content") or "").encode("utf-8"))
@@ -4665,7 +5129,7 @@ def setup_email_routes():
             raw = msg_data[0][1]
             msg = email_mod.message_from_bytes(raw)
 
-            target_dir = attachment_extract_dir(folder, uid)
+            target_dir = attachment_extract_dir(folder, uid, owner=owner, account_id=account_id)
             filepath = _extract_attachment_to_disk(msg, index, target_dir)
             if not filepath:
                 return {"error": f"Attachment index {index} not found"}
@@ -5319,7 +5783,7 @@ def setup_email_routes():
                 return {"success": False, "error": "Email not found"}
             raw = msg_data[0][1]
             msg = email_mod.message_from_bytes(raw)
-            target_dir = attachment_extract_dir(folder, uid)
+            target_dir = attachment_extract_dir(folder, uid, owner=owner, account_id=account_id)
             filepath = _extract_attachment_to_disk(msg, index, target_dir)
             if not filepath:
                 return {"success": False, "error": f"Attachment index {index} not found"}
@@ -6769,6 +7233,12 @@ def setup_email_routes():
         if account_id:
             _assert_owns_account(account_id, owner)
 
+        for field, label in (("imap_host", "IMAP"), ("smtp_host", "SMTP")):
+            if data.get(field):
+                host_error = await run_in_threadpool(_check_mail_host, data[field], owner, label)
+                if host_error:
+                    return {"ok": False, "error": host_error}
+
         # Non-reply automation flags stay global. Away/auto-reply settings are
         # account-scoped when an account_id is supplied by the Email Settings UI.
         settings = _load_settings()
@@ -6909,6 +7379,11 @@ def setup_email_routes():
         smtp_port, port_err = _coerce_port(data.get("smtp_port"), 465)
         if port_err:
             return {"ok": False, "error": port_err}
+        for field, label in (("imap_host", "IMAP"), ("smtp_host", "SMTP")):
+            if data.get(field):
+                host_error = await run_in_threadpool(_check_mail_host, data[field], owner, label)
+                if host_error:
+                    return {"ok": False, "error": host_error}
         db = SessionLocal()
         try:
             _lock_email_account_owner_mutation(db, owner)
@@ -6954,6 +7429,11 @@ def setup_email_routes():
         """Update an email account. Passwords only overwrite if non-empty."""
         # Path param account_id — dep validated via Query, re-check the path-param value.
         _assert_owns_account(account_id, owner)
+        for field, label in (("imap_host", "IMAP"), ("smtp_host", "SMTP")):
+            if data.get(field):
+                host_error = await run_in_threadpool(_check_mail_host, data[field], owner, label)
+                if host_error:
+                    return {"ok": False, "error": host_error}
         from core.database import SessionLocal, EmailAccount
         db = SessionLocal()
         try:
@@ -7026,6 +7506,158 @@ def setup_email_routes():
         finally:
             db.close()
 
+    def _test_mail_connections(body: dict, owner: str) -> dict:
+        """Blocking IMAP/SMTP connection test for /accounts/test.
+
+        Runs in the threadpool: each probe can block for its full socket
+        timeout, which on the event loop stalled every other request. The
+        connections go through the outbound mail address policy for `owner`
+        (the user who chose the hosts)."""
+        imap_result = {"ok": False}
+        smtp_result = None
+
+        imap_host = (body.get("imap_host") or "").strip()
+        imap_port, imap_port_err = _coerce_port(body.get("imap_port"), 993)
+        imap_user = (body.get("imap_user") or "").strip()
+        imap_pass = body.get("imap_password") or ""
+        imap_starttls = bool(body.get("imap_starttls"))
+        oauth_provider = body.get("oauth_provider") or ""
+
+        google_token = None
+        google_token_loaded = False
+        google_ssl_context = (
+            ssl.create_default_context()
+            if oauth_provider == "google"
+            else None
+        )
+
+        def _google_token():
+            nonlocal google_token, google_token_loaded
+            if not google_token_loaded:
+                google_token = _get_valid_google_token(body.get("account_id"), body)
+                google_token_loaded = True
+            if not google_token:
+                raise RuntimeError("Google OAuth token unavailable — reconnect the account")
+            return google_token
+
+        if imap_port_err:
+            imap_result = {"ok": False, "error": imap_port_err}
+        elif not (imap_host and imap_user and (imap_pass or oauth_provider == "google")):
+            imap_result = {"ok": False, "error": "Need IMAP host, username, and password"}
+        elif oauth_provider == "google" and _normalized_mail_host(imap_host) != _GOOGLE_OAUTH_IMAP_HOST:
+            imap_result = {"ok": False, "error": "Google OAuth IMAP requires imap.gmail.com"}
+        elif oauth_provider == "google" and not _google_oauth_imap_transport_allowed(imap_port, imap_starttls):
+            imap_result = {"ok": False, "error": "Google OAuth IMAP requires TLS on port 993 or STARTTLS on port 143"}
+        else:
+            # Connection mode resolution:
+            #   STARTTLS on  → plain IMAP4 + .starttls() (upgrade)
+            #   STARTTLS off + port 993 → IMAP4_SSL (implicit SSL, "IMAPS")
+            #   STARTTLS off + any other port → plain IMAP4 (no encryption)
+            # Without the last branch, local servers exposed on a non-993
+            # port (Dovecot on 31143, etc.) would always fail the SSL
+            # handshake because they're not actually wrapped in TLS.
+            try:
+                imap_kwargs = {
+                    "starttls": imap_starttls,
+                    "timeout": _IMAP_TIMEOUT_SECONDS,
+                    "owner": owner,
+                }
+                if google_ssl_context:
+                    imap_kwargs["ssl_context"] = google_ssl_context
+                conn = _open_imap_connection(
+                    imap_host,
+                    imap_port,
+                    **imap_kwargs,
+                )
+                try:
+                    if oauth_provider == "google":
+                        token = _google_token()
+                        conn.authenticate("XOAUTH2", lambda x: _xoauth2_bytes(imap_user, token))
+                    else:
+                        conn.login(imap_user, imap_pass)
+                    imap_result = {"ok": True}
+                finally:
+                    try: conn.logout()
+                    except Exception: pass
+            except Exception as e:
+                imap_result = {"ok": False, "error": _mail_connection_test_error("IMAP", imap_host, e)}
+
+        smtp_host = (body.get("smtp_host") or "").strip()
+        smtp_port, smtp_port_err = _coerce_port(body.get("smtp_port"), 465)
+        if smtp_host and smtp_port_err:
+            smtp_result = {"ok": False, "error": smtp_port_err}
+        elif oauth_provider == "google" and smtp_host and _normalized_mail_host(smtp_host) != _GOOGLE_OAUTH_SMTP_HOST:
+            smtp_result = {"ok": False, "error": "Google OAuth SMTP requires smtp.gmail.com"}
+        elif (
+            oauth_provider == "google"
+            and smtp_host
+            and not _google_oauth_smtp_transport_allowed(
+                smtp_port,
+                _smtp_security_mode({"smtp_security": body.get("smtp_security"), "smtp_port": smtp_port}),
+            )
+        ):
+            smtp_result = {"ok": False, "error": "Google OAuth SMTP requires TLS on port 465 or STARTTLS on port 587"}
+        elif smtp_host:
+            smtp_security = _smtp_security_mode({"smtp_security": body.get("smtp_security"), "smtp_port": smtp_port})
+            smtp_user = (body.get("smtp_user") or imap_user).strip()
+            smtp_pass = body.get("smtp_password") or imap_pass
+            smtp = None
+            try:
+                if smtp_security == "ssl":
+                    smtp_kwargs = (
+                        {"context": google_ssl_context}
+                        if google_ssl_context
+                        else {}
+                    )
+                    smtp = _PolicySMTP_SSL(
+                        smtp_host,
+                        smtp_port,
+                        timeout=10,
+                        block_private=_mail_private_blocked(owner),
+                        **smtp_kwargs,
+                    )
+                else:
+                    smtp = _PolicySMTP(smtp_host, smtp_port, timeout=10, block_private=_mail_private_blocked(owner))
+                    if smtp_security == "starttls":
+                        try:
+                            if google_ssl_context:
+                                smtp.starttls(context=google_ssl_context)
+                            else:
+                                smtp.starttls()
+                        except Exception:
+                            # STARTTLS failed before the auth cleanup block.
+                            # Close the still-open plaintext socket explicitly.
+                            try:
+                                smtp.close()
+                            except Exception:
+                                pass
+                            smtp = None
+                            raise
+                if oauth_provider == "google":
+                    token = _google_token()
+                    smtp.ehlo()
+                    smtp.auth("XOAUTH2", lambda challenge=None: _xoauth2_raw(smtp_user, token), initial_response_ok=True)
+                else:
+                    smtp.login(smtp_user, smtp_pass)
+                smtp_result = {"ok": True}
+            except Exception as e:
+                smtp_result = {"ok": False, "error": _mail_connection_test_error("SMTP", smtp_host, e)}
+            finally:
+                if smtp is not None:
+                    try:
+                        smtp.quit()
+                    except Exception:
+                        try:
+                            smtp.close()
+                        except Exception:
+                            pass
+
+        return {
+            "ok": imap_result["ok"] and (smtp_result is None or smtp_result["ok"]),
+            "imap": imap_result,
+            "smtp": smtp_result,
+        }
+
     @router.post("/accounts/test")
     async def test_account_config(req: Request, owner: str = Depends(require_user)):
         """Try to actually connect to the provided IMAP (and optionally SMTP)
@@ -7089,148 +7721,7 @@ def setup_email_routes():
             # inline test payloads select the OAuth branch or supply token data.
             body = {key: value for key, value in body.items() if key not in _SERVER_OWNED_OAUTH_FIELDS}
 
-        imap_result = {"ok": False}
-        smtp_result = None
-
-        imap_host = (body.get("imap_host") or "").strip()
-        imap_port, imap_port_err = _coerce_port(body.get("imap_port"), 993)
-        imap_user = (body.get("imap_user") or "").strip()
-        imap_pass = body.get("imap_password") or ""
-        imap_starttls = bool(body.get("imap_starttls"))
-        oauth_provider = body.get("oauth_provider") or ""
-
-        google_token = None
-        google_token_loaded = False
-        google_ssl_context = (
-            ssl.create_default_context()
-            if oauth_provider == "google"
-            else None
-        )
-
-        def _google_token():
-            nonlocal google_token, google_token_loaded
-            if not google_token_loaded:
-                google_token = _get_valid_google_token(body.get("account_id"), body)
-                google_token_loaded = True
-            if not google_token:
-                raise RuntimeError("Google OAuth token unavailable — reconnect the account")
-            return google_token
-
-        if imap_port_err:
-            imap_result = {"ok": False, "error": imap_port_err}
-        elif not (imap_host and imap_user and (imap_pass or oauth_provider == "google")):
-            imap_result = {"ok": False, "error": "Need IMAP host, username, and password"}
-        elif oauth_provider == "google" and _normalized_mail_host(imap_host) != _GOOGLE_OAUTH_IMAP_HOST:
-            imap_result = {"ok": False, "error": "Google OAuth IMAP requires imap.gmail.com"}
-        elif oauth_provider == "google" and not _google_oauth_imap_transport_allowed(imap_port, imap_starttls):
-            imap_result = {"ok": False, "error": "Google OAuth IMAP requires TLS on port 993 or STARTTLS on port 143"}
-        else:
-            # Connection mode resolution:
-            #   STARTTLS on  → plain IMAP4 + .starttls() (upgrade)
-            #   STARTTLS off + port 993 → IMAP4_SSL (implicit SSL, "IMAPS")
-            #   STARTTLS off + any other port → plain IMAP4 (no encryption)
-            # Without the last branch, local servers exposed on a non-993
-            # port (Dovecot on 31143, etc.) would always fail the SSL
-            # handshake because they're not actually wrapped in TLS.
-            try:
-                imap_kwargs = {
-                    "starttls": imap_starttls,
-                    "timeout": _IMAP_TIMEOUT_SECONDS,
-                }
-                if google_ssl_context:
-                    imap_kwargs["ssl_context"] = google_ssl_context
-                conn = _open_imap_connection(
-                    imap_host,
-                    imap_port,
-                    **imap_kwargs,
-                )
-                try:
-                    if oauth_provider == "google":
-                        token = _google_token()
-                        conn.authenticate("XOAUTH2", lambda x: _xoauth2_bytes(imap_user, token))
-                    else:
-                        conn.login(imap_user, imap_pass)
-                    imap_result = {"ok": True}
-                finally:
-                    try: conn.logout()
-                    except Exception: pass
-            except Exception as e:
-                imap_result = {"ok": False, "error": _friendly_email_auth_error("IMAP", imap_host, e)}
-
-        smtp_host = (body.get("smtp_host") or "").strip()
-        smtp_port, smtp_port_err = _coerce_port(body.get("smtp_port"), 465)
-        if smtp_host and smtp_port_err:
-            smtp_result = {"ok": False, "error": smtp_port_err}
-        elif oauth_provider == "google" and smtp_host and _normalized_mail_host(smtp_host) != _GOOGLE_OAUTH_SMTP_HOST:
-            smtp_result = {"ok": False, "error": "Google OAuth SMTP requires smtp.gmail.com"}
-        elif (
-            oauth_provider == "google"
-            and smtp_host
-            and not _google_oauth_smtp_transport_allowed(
-                smtp_port,
-                _smtp_security_mode({"smtp_security": body.get("smtp_security"), "smtp_port": smtp_port}),
-            )
-        ):
-            smtp_result = {"ok": False, "error": "Google OAuth SMTP requires TLS on port 465 or STARTTLS on port 587"}
-        elif smtp_host:
-            smtp_security = _smtp_security_mode({"smtp_security": body.get("smtp_security"), "smtp_port": smtp_port})
-            smtp_user = (body.get("smtp_user") or imap_user).strip()
-            smtp_pass = body.get("smtp_password") or imap_pass
-            smtp = None
-            try:
-                if smtp_security == "ssl":
-                    smtp_kwargs = (
-                        {"context": google_ssl_context}
-                        if google_ssl_context
-                        else {}
-                    )
-                    smtp = smtplib.SMTP_SSL(
-                        smtp_host,
-                        smtp_port,
-                        timeout=10,
-                        **smtp_kwargs,
-                    )
-                else:
-                    smtp = smtplib.SMTP(smtp_host, smtp_port, timeout=10)
-                    if smtp_security == "starttls":
-                        try:
-                            if google_ssl_context:
-                                smtp.starttls(context=google_ssl_context)
-                            else:
-                                smtp.starttls()
-                        except Exception:
-                            # STARTTLS failed before the auth cleanup block.
-                            # Close the still-open plaintext socket explicitly.
-                            try:
-                                smtp.close()
-                            except Exception:
-                                pass
-                            smtp = None
-                            raise
-                if oauth_provider == "google":
-                    token = _google_token()
-                    smtp.ehlo()
-                    smtp.auth("XOAUTH2", lambda challenge=None: _xoauth2_raw(smtp_user, token), initial_response_ok=True)
-                else:
-                    smtp.login(smtp_user, smtp_pass)
-                smtp_result = {"ok": True}
-            except Exception as e:
-                smtp_result = {"ok": False, "error": _friendly_email_auth_error("SMTP", smtp_host, e)}
-            finally:
-                if smtp is not None:
-                    try:
-                        smtp.quit()
-                    except Exception:
-                        try:
-                            smtp.close()
-                        except Exception:
-                            pass
-
-        return {
-            "ok": imap_result["ok"] and (smtp_result is None or smtp_result["ok"]),
-            "imap": imap_result,
-            "smtp": smtp_result,
-        }
+        return await run_in_threadpool(_test_mail_connections, body, owner)
 
     @router.post("/accounts/{account_id}/set-default")
     async def set_default_account(account_id: str, owner: str = Depends(require_user)):

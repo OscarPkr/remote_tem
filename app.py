@@ -792,7 +792,8 @@ app.include_router(setup_research_routes(research_handler, session_manager=sessi
 
 # History
 from routes.history.history_routes import setup_history_routes
-app.include_router(setup_history_routes(session_manager, upload_handler=upload_handler))
+history_router = setup_history_routes(session_manager, upload_handler=upload_handler)
+app.include_router(history_router)
 
 # Search
 from routes.search.search_routes import setup_search_routes
@@ -956,6 +957,7 @@ app.include_router(setup_codex_routes(
     memory_router=memory_router,
     calendar_router=calendar_router,
     document_router=document_router,
+    history_router=history_router,
 ))
 app.include_router(setup_claude_routes())
 
@@ -1033,12 +1035,10 @@ async def serve_login(request: Request):
 @app.get("/api/version")
 async def get_version():
     from core.constants import APP_BUILD_VERSION, APP_SOURCE_COMMIT, APP_VERSION
-    from src import activity
     return {
         "version": APP_VERSION,
         "build": APP_BUILD_VERSION,
         "source_commit": APP_SOURCE_COMMIT,
-        "busy_image_ops": activity.heavy_image_ops_active(),
     }
 
 
@@ -1046,7 +1046,10 @@ async def get_version():
 async def get_busy():
     """Report in-flight heavy work so a deploy can wait instead of dropping it."""
     from src import activity
-    return activity.activity()
+    return {
+        "busy_image_ops": activity.heavy_image_ops_active(),
+        **activity.activity(),
+    }
 
 @app.get("/api/health")
 async def health_check() -> Dict[str, str]:

@@ -39,6 +39,7 @@ def test_resolve_model_keeps_request_when_served_list_unknown():
 
 
 def test_self_check_resolves_the_model_before_calling(monkeypatch):
+    monkeypatch.setattr(eam, "local_bases", lambda: ["http://editor.test/v1"])
     base = eam.local_bases()[0]
     _cache(base, ["Qwen/Qwen3.5-9B"])
     seen = {}
@@ -56,6 +57,7 @@ def test_self_check_resolves_the_model_before_calling(monkeypatch):
 
 
 def test_caption_resolves_the_caption_model(monkeypatch):
+    monkeypatch.setattr(eam, "caption_base", lambda: "http://caption.test/v1")
     seen = {}
 
     async def fake_post(b, model, messages, headers, timeout, **kwargs):
@@ -69,3 +71,13 @@ def test_caption_resolves_the_caption_model(monkeypatch):
     txt = asyncio.run(m.caption_image("data:image/png;base64,AAAA"))
     assert txt == "a photo"
     assert seen["model"] == "Qwen/Qwen3.5-9B"
+
+
+def test_unconfigured_editor_helpers_do_not_probe_private_hosts(monkeypatch):
+    monkeypatch.setattr(eam, "local_bases", lambda: [])
+    monkeypatch.setattr(eam, "caption_base", lambda: "")
+    monkeypatch.setattr(eam, "probe_models", lambda *a: (_ for _ in ()).throw(AssertionError("unexpected probe")))
+    eam._probe_worker()
+    assert asyncio.run(eam.caption_image("data:image/png;base64,AAAA")) is None
+    result = asyncio.run(eam.self_check("data:image/png;base64,AAAA", "data:image/png;base64,BBBB", "brighter"))
+    assert result["reason"] == "unavailable"

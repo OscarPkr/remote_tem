@@ -25,3 +25,15 @@ def test_image_model_picker_lives_in_the_settings_container():
 def test_picker_persists_with_the_shared_localstorage_key():
     assert "localStorage.setItem(_GE_MODEL_KEY" in GALLERY_JS
     assert "localStorage.getItem(_GE_MODEL_KEY)" in GALLERY_JS
+
+
+def test_cloud_image_models_are_listed_alongside_the_local_ones():
+    """Gateway endpoints (OpenRouter) register as llm but carry image models.
+
+    The picker must surface those ids too — otherwise the only selectable
+    edit model is the local Qwen server.
+    """
+    routes = (ROOT / "routes/editor_agent_routes.py").read_text(encoding="utf-8")
+    assert "from src.image_model_ids import looks_like_image_generation_model" in routes
+    assert 'image_endpoint = getattr(ep, "model_type", None) == "image"' in routes
+    assert "if not image_endpoint and not looks_like_image_generation_model(name):" in routes

@@ -1914,7 +1914,7 @@ def setup_gallery_routes() -> APIRouter:
                 raise HTTPException(504, "OpenAI inpaint timed out (300s)")
             except httpx.TransportError as exc:
                 logger.warning("inpaint_proxy: OpenAI endpoint unreachable: %s", exc)
-                raise HTTPException(502, f"Image server unreachable ({base}): {type(exc).__name__}")
+                raise HTTPException(502, f"Image server unreachable: {type(exc).__name__}")
 
         # Self-hosted diffusion server path. Newer Odysseus image
         # wrappers expose the OpenAI-compatible /v1/images/edits
@@ -2059,7 +2059,7 @@ def setup_gallery_routes() -> APIRouter:
             raise HTTPException(504, "Inpaint request timed out (240s)")
         except httpx.TransportError as exc:
             logger.warning("inpaint_proxy: image endpoint unreachable: %s", exc)
-            raise HTTPException(502, f"Image server unreachable ({base}): {type(exc).__name__}")
+            raise HTTPException(502, f"Image server unreachable: {type(exc).__name__}")
         except HTTPException:
             raise
         except Exception:
@@ -2563,7 +2563,13 @@ def setup_gallery_routes() -> APIRouter:
             from src.ai_interaction import do_generate_image
         except Exception:
             raise HTTPException(502, "Image generation is unavailable")
-        content = _json.dumps({"prompt": prompt, "size": size})
+        # The editor's model picker may choose a specific (cloud) image model;
+        # forward it so settings defaults only apply when none is selected.
+        model_choice = str((body or {}).get("model") or "").strip()
+        payload = {"prompt": prompt, "size": size}
+        if model_choice:
+            payload["model"] = model_choice
+        content = _json.dumps(payload)
         result = await do_generate_image(content, owner=user, incognito=True)
         if not isinstance(result, dict) or result.get("error"):
             msg = (result.get("error") if isinstance(result, dict) else None) or "Image generation failed"

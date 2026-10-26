@@ -1,8 +1,8 @@
 """Editor agent/planner model resolution.
 
 The image-editor Quick Edit planner (`/api/editor/plan`, `/api/editor/agent`)
-runs on a LOCAL Qwen3.5-9B vision model served on seneca when one is
-reachable, instead of the hosted chat model. This module owns:
+runs on an explicitly configured local vision model when one is reachable,
+with the configured chat model as a fallback. This module owns:
 
   * the local model base URLs / model id (settings-overridable),
   * an ordered candidate list (per-request ``agent_model`` override, then the
@@ -30,18 +30,12 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# The local Qwen3.5-9B vision server (seneca). :8097 (tmux AGENT_VLM) is the
-# canonical editor-agent endpoint. Override with the ``editor_agent_base_url``
-# setting (single URL wins) or the ``ODYSSEUS_EDITOR_AGENT_BASES`` env
-# (comma-separated). NOTE: :8095 is a DIFFERENT server (Qwen3-VL-30B) used ONLY
-# for the caption fallback below — never list it here as an agent model.
-DEFAULT_LOCAL_BASES = [
-    "http://100.69.120.65:8097/v1",
-]
+# Local endpoints are opt-in through settings or ODYSSEUS_EDITOR_AGENT_BASES.
+DEFAULT_LOCAL_BASES = []
 DEFAULT_LOCAL_MODEL = "Qwen/Qwen3.5-9B"
 
 # Vision caption model used when the editor-agent model cannot accept images.
-DEFAULT_CAPTION_BASE = "http://100.69.120.65:8095/v1"
+DEFAULT_CAPTION_BASE = ""
 DEFAULT_CAPTION_MODEL = "Qwen/Qwen3.5-9B"
 
 # Served-model-id cache per base (populated on first use). The local servers 400
@@ -278,6 +272,8 @@ async def caption_image(data_url: str, owner: Optional[str] = None, timeout: flo
         }
     ]
     base = caption_base()
+    if not base:
+        return None
     model = await _resolve_model(base, caption_model(), local_model())
     return await _post_chat(base, model, messages, None, timeout, max_tokens=200)
 
@@ -320,6 +316,9 @@ async def self_check(
         return {"done": True, "issues": [], "retry_hint": "",
                 "reason": "unavailable", "text": "DONE"}
     bases = local_bases() or list(DEFAULT_LOCAL_BASES)
+    if not bases:
+        return {"done": True, "issues": [], "retry_hint": "",
+                "reason": "unavailable", "text": "DONE"}
     base = bases[0]
     mdl = await _resolve_model(base, str(model or local_model()), local_model())
     messages = [{
@@ -482,8 +481,9 @@ def _probe_worker() -> None:
         _PROBE[base] = ok
         logger.info("editor agent local base %s reachable=%s", base, ok)
     cap = caption_base()
-    _PROBE[cap] = probe_models(cap)
-    logger.info("editor agent caption base %s reachable=%s", cap, _PROBE[cap])
+    if cap:
+        _PROBE[cap] = probe_models(cap)
+        logger.info("editor agent caption base %s reachable=%s", cap, _PROBE[cap])
 
 
 def startup_probe() -> None:
