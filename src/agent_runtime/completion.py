@@ -309,11 +309,6 @@ def with_completion_gate(func):
                                 has_final = False
                             answer += str(data.get('delta') or '')
                         answer_events.append(data)
-                        if data.get('thinking') is True and 'delta' in data:
-                            # Stream reasoning deltas live; only the answer
-                            # prose is held for the terminal evidence review.
-                            streamed_answer_events.add(id(data))
-                            yield _event(data)
                         continue
                     yield chunk
             if provider_error and not answer_events and not metrics_events:
