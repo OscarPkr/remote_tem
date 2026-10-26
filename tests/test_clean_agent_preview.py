@@ -7504,4 +7504,3 @@ async def test_direct_feedback_advice_is_not_replaced_with_preview_denial(monkey
     assert ''.join(event.get('delta', '') for event in events) == answer
     assert not any(event.get('type') == 'final_response' and event.get('content') == denied_response()
                    for event in events)
-
