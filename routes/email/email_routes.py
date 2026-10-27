@@ -1827,18 +1827,22 @@ def setup_email_routes():
         # a cached message body.
         return (account_id or "", folder, str(uid), owner)
 
-    def _list_cache_get(key):
-        v = _LIST_CACHE.get(key)
-        if not v: return None
-        if v[0] < _time.monotonic():
-            _LIST_CACHE.pop(key, None)
-            return None
-        return v[1]
-
     _LIST_STALE = {}
+    _LIST_LOCK = _threading.RLock()
+    _LIST_EPOCH = [0]
+
+    def _list_cache_get(key):
+        with _LIST_LOCK:
+            v = _LIST_CACHE.get(key)
+            if not v: return None
+            if v[0] < _time.monotonic():
+                _LIST_CACHE.pop(key, None)
+                return None
+            return v[1]
 
     def _list_stale_get(key):
-        return _LIST_STALE.get(key)
+        with _LIST_LOCK:
+            return _LIST_STALE.get(key)
 
     def _list_stale_put(key, value):
         _LIST_STALE[key] = value
@@ -1849,13 +1853,13 @@ def setup_email_routes():
     _LIST_REFRESHING = set()
 
     def _list_cache_put(key, value):
-        _LIST_CACHE[key] = (_time.monotonic() + _LIST_TTL, value)
-        # Also snapshot the last-good response for stale-while-revalidate.
-        _list_stale_put(key, value)
-        # Cap size
-        if len(_LIST_CACHE) > 64:
-            for k in list(_LIST_CACHE.keys())[:-32]:
-                _LIST_CACHE.pop(k, None)
+        with _LIST_LOCK:
+            _LIST_CACHE[key] = (_time.monotonic() + _LIST_TTL, value)
+            # Also snapshot the last-good response for stale-while-revalidate.
+            _list_stale_put(key, value)
+            if len(_LIST_CACHE) > 64:
+                for k in list(_LIST_CACHE.keys())[:-32]:
+                    _LIST_CACHE.pop(k, None)
 
     def _schedule_list_refresh(sync_args, cache_key, folder, account_id, owner):
         """Refresh a list snapshot off the event loop, at most once per key.
@@ -1863,15 +1867,20 @@ def setup_email_routes():
         Runs the blocking IMAP fetch in a daemon thread, then repopulates both
         the TTL cache and the stale snapshot so the next list view is warm.
         """
-        if cache_key in _LIST_REFRESHING:
-            return
-        _LIST_REFRESHING.add(cache_key)
+        with _LIST_LOCK:
+            if cache_key in _LIST_REFRESHING:
+                return
+            _LIST_REFRESHING.add(cache_key)
+            epoch = _LIST_EPOCH[0]
 
         def _run():
             try:
                 refreshed = _list_emails_sync(*sync_args)
                 if refreshed and not refreshed.get("error"):
-                    _list_cache_put(cache_key, refreshed)
+                    with _LIST_LOCK:
+                        if epoch != _LIST_EPOCH[0]:
+                            return
+                        _list_cache_put(cache_key, refreshed)
                     try:
                         _schedule_recent_email_warm(
                             refreshed.get("emails") or [], folder, account_id, owner)
@@ -1880,7 +1889,8 @@ def setup_email_routes():
             except Exception as exc:  # pragma: no cover - background best effort
                 logger.debug("email list background refresh failed: %s", exc)
             finally:
-                _LIST_REFRESHING.discard(cache_key)
+                with _LIST_LOCK:
+                    _LIST_REFRESHING.discard(cache_key)
 
         _threading.Thread(target=_run, daemon=True, name="email-list-refresh").start()
 
@@ -1917,37 +1927,64 @@ def setup_email_routes():
                 hook(account_id, folder)
             except Exception:
                 pass
-        if account_id is None and folder is None:
-            _LIST_CACHE.clear()
-            return
-        for k in list(_LIST_CACHE.keys()):
-            k_acct = k[0] if len(k) > 0 else ""
-            k_folder = k[1] if len(k) > 1 else ""
-            if (account_id is None or k_acct == (account_id or "")) and \
-               (folder is None or k_folder == folder):
-                _LIST_CACHE.pop(k, None)
+        with _LIST_LOCK:
+            _LIST_EPOCH[0] += 1
+            if account_id is None and folder is None:
+                _LIST_CACHE.clear()
+                _LIST_STALE.clear()
+                return
+            for cache in (_LIST_CACHE, _LIST_STALE):
+                for k in list(cache.keys()):
+                    k_acct = k[0] if len(k) > 0 else ""
+                    k_folder = k[1] if len(k) > 1 else ""
+                    if (account_id is None or k_acct == (account_id or "")) and \
+                       (folder is None or k_folder == folder):
+                        cache.pop(k, None)
 
     def _update_list_cache_seen(account_id, folder, uid, seen: bool):
         uid_s = str(uid)
-        for key, (expires_at, value) in list(_LIST_CACHE.items()):
-            if key[0] != (account_id or "") or key[1] != folder:
-                continue
-            emails = list((value or {}).get("emails") or [])
-            changed = False
-            if seen and key[2] == "unread":
-                kept = [e for e in emails if str((e or {}).get("uid") or "") != uid_s]
-                if len(kept) != len(emails):
-                    value = dict(value)
-                    value["emails"] = kept
-                    value["total"] = max(0, int(value.get("total") or 0) - (len(emails) - len(kept)))
-                    changed = True
-            else:
-                for e in emails:
-                    if str((e or {}).get("uid") or "") == uid_s:
-                        e["is_read"] = bool(seen)
+        with _LIST_LOCK:
+            for key, (expires_at, value) in list(_LIST_CACHE.items()):
+                if key[0] != (account_id or "") or key[1] != folder:
+                    continue
+                emails = list((value or {}).get("emails") or [])
+                changed = False
+                if seen and key[2] == "unread":
+                    kept = [e for e in emails if str((e or {}).get("uid") or "") != uid_s]
+                    if len(kept) != len(emails):
+                        value = dict(value)
+                        value["emails"] = kept
+                        value["total"] = max(0, int(value.get("total") or 0) - (len(emails) - len(kept)))
                         changed = True
-            if changed:
-                _LIST_CACHE[key] = (expires_at, value)
+                else:
+                    for e in emails:
+                        if str((e or {}).get("uid") or "") == uid_s:
+                            e["is_read"] = bool(seen)
+                            changed = True
+                if changed:
+                    _LIST_CACHE[key] = (expires_at, value)
+                    if key in _LIST_STALE:
+                        _LIST_STALE[key] = value
+
+            for key, value in list(_LIST_STALE.items()):
+                if key[0] != (account_id or "") or key[1] != folder:
+                    continue
+                emails = list((value or {}).get("emails") or [])
+                changed = False
+                if seen and key[2] == "unread":
+                    kept = [e for e in emails if str((e or {}).get("uid") or "") != uid_s]
+                    if len(kept) != len(emails):
+                        value = dict(value)
+                        value["emails"] = kept
+                        value["total"] = max(0, int(value.get("total") or 0) - (len(emails) - len(kept)))
+                        changed = True
+                else:
+                    for e in emails:
+                        if str((e or {}).get("uid") or "") == uid_s:
+                            e["is_read"] = bool(seen)
+                            changed = True
+                if changed:
+                    _LIST_STALE[key] = value
 
     def _read_cache_get(key):
         v = _READ_CACHE.get(key)
@@ -2915,7 +2952,7 @@ def setup_email_routes():
         # with a `stale` marker and refresh in the background so the next view
         # is warm. Blocking IMAP only remains for a genuine cold start with no
         # snapshot and no indexed rows (e.g. a brand-new account/folder).
-        if not from_addr and not has_attachments and not (date_from or date_to):
+        if not manual_refresh and not from_addr and not has_attachments and not (date_from or date_to):
             snapshot = _list_stale_get(ck)
             if snapshot is None:
                 try:

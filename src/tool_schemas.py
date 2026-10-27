@@ -1545,7 +1545,7 @@ FUNCTION_TOOL_SCHEMAS = [
                 "properties": {
                     "op": {"type": "string", "description": "Editor op name from the catalog, e.g. adjustments.applyMasked"},
                     "params": {"type": "object", "description": "Parameters for the op"},
-                    "session": {"type": "string", "description": "Editor session id (defaults to the open session)"},
+                    "session": {"type": "string", "description": "Editor session id when no turn-bound session is available; the bound session takes precedence"},
                     "wait": {"type": "boolean", "description": "Wait for the editor result (default true)"}
                 },
                 "required": ["op"]
@@ -1560,7 +1560,7 @@ FUNCTION_TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "session": {"type": "string", "description": "Editor session id (defaults to the open session)"}
+                    "session": {"type": "string", "description": "Editor session id when no turn-bound session is available; the bound session takes precedence"}
                 }
             }
         }
@@ -1583,7 +1583,7 @@ FUNCTION_TOOL_SCHEMAS = [
                     "steps": {"type": "integer", "description": "Optional sampler steps. Use 8 for removal/expand edits (default 4 is too weak for those)."},
                     "place": {"type": "boolean", "description": "Place the result as a new layer (default true)"},
                     "model": {"type": "string", "description": "Optional image model id to route this edit to (from GET /api/editor/image-models); omit to use the configured default"},
-                    "session": {"type": "string", "description": "Editor session id"}
+                    "session": {"type": "string", "description": "Editor session id when no turn-bound session is available; the bound session takes precedence"}
                 },
                 "required": ["op"]
             }

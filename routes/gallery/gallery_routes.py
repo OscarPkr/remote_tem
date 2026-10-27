@@ -779,14 +779,17 @@ async def _forward_seneca_image_op(
         except Exception:
             pass
         raise HTTPException(r.status_code if r.status_code in (400, 404, 422) else 502, detail)
-    result = r.json()
+    try:
+        result = r.json()
+    except ValueError as exc:
+        raise HTTPException(502, "Image endpoint returned invalid JSON") from exc
     raw_b64: Optional[str] = None
     used_model = ""
     if isinstance(result, dict):
         used_model = str(result.get("model") or "")
         data = result.get("data")
         if isinstance(data, list) and data:
-            item = data[0] or {}
+            item = data[0] if isinstance(data[0], dict) else {}
             raw_b64 = item.get("b64_json") or None
             if not raw_b64 and item.get("url"):
                 raw_b64 = await _fetch_result_image_b64(item["url"])
@@ -1842,8 +1845,8 @@ def setup_gallery_routes() -> APIRouter:
             headers = {"Authorization": f"Bearer {api_key}"}
             try:
                 logger.debug(
-                    "inpaint_proxy provider edit -> prompt=%r model=%r size=%r base=%s",
-                    body.get("prompt", ""), oa_model, size, base,
+                    "inpaint_proxy provider edit -> model=%r size=%r base=%s",
+                    oa_model, size, base,
                 )
                 async with httpx.AsyncClient(timeout=300) as client:
                     if is_openrouter:
@@ -1978,9 +1981,9 @@ def setup_gallery_routes() -> APIRouter:
                         finally:
                             _restore_ms[0] += (time.perf_counter() - _rs) * 1000.0
                     logger.debug(
-                        "inpaint_proxy self-hosted /images/edits -> prompt=%r model=%r "
+                        "inpaint_proxy self-hosted /images/edits -> model=%r "
                         "size=%r steps=%r endpoint=%s",
-                        data.get("prompt"), data.get("model"), data.get("size"),
+                        data.get("model"), data.get("size"),
                         data.get("steps"), base,
                     )
                     _prep_ms = (time.perf_counter() - _t0) * 1000.0

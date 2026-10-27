@@ -16,7 +16,9 @@ def png(image):
     return base64.b64encode(output.getvalue()).decode()
 
 
-def test_openrouter_inpaint_keeps_unmasked_pixels(monkeypatch):
+def test_openrouter_inpaint_keeps_unmasked_pixels(monkeypatch, caplog):
+    import logging
+    caplog.set_level(logging.DEBUG)
     endpoint = SimpleNamespace(base_url='https://openrouter.ai/api/v1', api_key='test')
 
     class Db:
@@ -46,7 +48,7 @@ def test_openrouter_inpaint_keeps_unmasked_pixels(monkeypatch):
     class Request:
         async def json(self):
             return {'_endpoint': endpoint.base_url, '_model': 'openai/gpt-5-image',
-                    'image': png(Image.new('RGB', (2, 1), 'red')), 'mask': png(mask), 'prompt': 'Make blue'}
+                    'image': png(Image.new('RGB', (2, 1), 'red')), 'mask': png(mask), 'prompt': 'private-cloud-prompt'}
 
     route = next(r for r in gallery.setup_gallery_routes().routes if r.path == '/api/image/inpaint')
     result = asyncio.run(route.endpoint(Request()))
@@ -54,6 +56,7 @@ def test_openrouter_inpaint_keeps_unmasked_pixels(monkeypatch):
     assert output.getpixel((0, 0)) == (255, 0, 0, 255)
     assert output.getpixel((1, 0)) == (0, 0, 255, 255)
     assert len(requests) == 1
+    assert 'private-cloud-prompt' not in caplog.text
 
 
 def test_mixed_endpoint_requires_configured_image_model(monkeypatch):
@@ -163,6 +166,19 @@ def test_self_hosted_inpaint_leaves_small_images_unchanged(monkeypatch):
     assert seen['size'] == '640x480'
     assert seen['steps'] == '4'
     assert Image.open(io.BytesIO(base64.b64decode(out['image']))).size == (640, 480)
+
+
+def test_inpaint_does_not_log_private_prompt_at_debug_level(monkeypatch, caplog):
+    import logging
+    caplog.set_level(logging.DEBUG)
+    secret = 'private-prompt-log-regression'
+
+    def respond(request):
+        return httpx.Response(200, json={'data': [{'b64_json': png(Image.new('RGB', (4, 4), 'blue'))}]})
+
+    _self_hosted_inpaint(monkeypatch, Image.new('RGB', (4, 4), 'red'),
+                         Image.new('L', (4, 4), 255), {'prompt': secret}, respond)
+    assert secret not in caplog.text
 
 
 def test_self_hosted_inpaint_without_mask_uses_a_full_white_mask(monkeypatch):

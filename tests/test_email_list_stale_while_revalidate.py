@@ -67,6 +67,66 @@ def test_cold_start_with_no_snapshot_and_no_index_is_not_marked_stale(monkeypatc
     assert not (result.get("sync") or {}).get("stale")
 
 
+def test_manual_refresh_does_not_serve_index_snapshot(monkeypatch):
+    endpoint = _list_endpoint()
+    monkeypatch.setattr(er, "_email_index_list", lambda *a, **k: ([{"uid": "11"}], 1, "now"))
+    attempts = []
+
+    def offline(*args, **kwargs):
+        attempts.append(True)
+        raise RuntimeError("offline test")
+
+    monkeypatch.setattr(er, "_imap_connect", offline)
+    result = _call(endpoint, refresh=1)
+    assert attempts
+    assert not (result.get("sync") or {}).get("stale")
+
+
+def test_list_invalidation_discards_stale_snapshot(monkeypatch):
+    endpoint = _list_endpoint()
+    state = dict(zip(endpoint.__code__.co_freevars, (cell.cell_contents for cell in endpoint.__closure__)))
+    key = ("account", "INBOX", "all", 50, 0, "", 0, "", "", "alice")
+    state["_list_cache_put"](key, {"emails": [{"uid": "11"}]})
+    state["_invalidate_list_cache"]("account", "INBOX")
+    monkeypatch.setattr(er, "_email_index_list", lambda *a, **k: ([], 0, None))
+    monkeypatch.setattr(er, "_imap_connect", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("offline")))
+    result = _call(endpoint, account_id="account", owner="alice")
+    assert not (result.get("sync") or {}).get("stale")
+
+
+def test_invalidation_prevents_inflight_refresh_from_restoring_stale_snapshot():
+    import threading
+    import time
+    endpoint = _list_endpoint()
+    state = dict(zip(endpoint.__code__.co_freevars, (cell.cell_contents for cell in endpoint.__closure__)))
+    schedule = state["_schedule_list_refresh"]
+    cells = dict(zip(schedule.__code__.co_freevars, schedule.__closure__))
+    started, release = threading.Event(), threading.Event()
+    original = cells["_list_emails_sync"].cell_contents
+
+    def fake_fetch(*args):
+        started.set()
+        assert release.wait(3)
+        return {"emails": [{"uid": "stale"}]}
+
+    cells["_list_emails_sync"].cell_contents = fake_fetch
+    key = ("account", "INBOX", "all", 50, 0, "", 0, "", "", "alice")
+    try:
+        schedule((), key, "INBOX", "account", "alice")
+        assert started.wait(3)
+        state["_invalidate_list_cache"]("account", "INBOX")
+        release.set()
+        refreshing = cells["_LIST_REFRESHING"].cell_contents
+        deadline = time.monotonic() + 3
+        while key in refreshing and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert key not in refreshing
+        assert state["_list_stale_get"](key) is None
+    finally:
+        release.set()
+        cells["_list_emails_sync"].cell_contents = original
+
+
 def test_swr_contract_is_wired_into_the_list_path():
     assert "_LIST_STALE" in SRC
     assert "def _list_stale_put" in SRC

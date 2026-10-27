@@ -21,11 +21,12 @@ import asyncio
 import inspect
 import json
 import logging
+import math
 import re
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src import editor_style_guide as style_guide
@@ -1169,16 +1170,66 @@ def _normalize_steps(body: Dict[str, Any]) -> List[Dict[str, Any]]:
         op = str(step.get("op") or "")
         if op not in _OP_SET:
             continue
-        out.append({"op": op, "params": step.get("params") or {}})
+        params = step.get("params")
+        out.append({"op": op, "params": params if isinstance(params, dict) else {}})
     return out
 
 
-def _user(request: Request) -> Optional[str]:
+async def _json_object(request: Request) -> Dict[str, Any]:
     try:
-        from src.auth_helpers import get_current_user
-        return get_current_user(request)
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        raise HTTPException(400, "Expected a JSON object")
+    if not isinstance(body, dict):
+        raise HTTPException(400, "Expected a JSON object")
+    return body
+
+
+def _prompt(value: Any) -> str:
+    text = str(value or "").strip()
+    if len(text) > 4096:
+        raise HTTPException(413, "Editor prompt is too long")
+    return text
+
+
+def _bridge_timeout(value: Any) -> float:
+    try:
+        timeout = float(value or _BRIDGE_DEFAULT_TIMEOUT)
+    except (TypeError, ValueError, OverflowError):
+        raise HTTPException(400, "Invalid bridge timeout")
+    if not math.isfinite(timeout) or timeout <= 0 or timeout > 900:
+        raise HTTPException(400, "Invalid bridge timeout")
+    return timeout
+
+
+def _is_admin(request: Request) -> bool:
+    try:
+        from core.middleware import require_admin
+        require_admin(request)
+        return True
     except Exception:
+        return False
+
+
+def _user(request: Request) -> Optional[str]:
+    # These owner-scoped editor APIs have no delegated-token scope contract.
+    # Do not collapse all bearer users into the shared "api" pseudo-owner.
+    if getattr(request.state, "api_token", False):
+        raise HTTPException(403, "API tokens must use a scope-aware API route")
+    from src.auth_helpers import get_current_user, _auth_disabled
+    u = get_current_user(request)
+    if u:
+        return u
+    if _auth_disabled():
         return None
+    auth_mgr = getattr(request.app.state, "auth_manager", None)
+    if auth_mgr is not None and getattr(auth_mgr, "is_configured", False):
+        raise HTTPException(401, "Not authenticated")
+    client = getattr(request, "client", None)
+    host = (client.host if client else "") or ""
+    if host in ("127.0.0.1", "::1", "localhost", "testclient") or not host:
+        return None
+    raise HTTPException(401, "Not authenticated")
 
 
 async def _default_editor_planner(messages: List[dict], owner: Optional[str]) -> Optional[str]:
@@ -1206,17 +1257,14 @@ def setup_editor_agent_routes() -> APIRouter:
     if _EDITOR_PLANNER is None:
         set_editor_planner(_default_editor_planner)
 
-    # Probe the local editor-agent model server (non-blocking) so the planner
-    # can use it for vision planning when reachable.
-    editor_agent_model.startup_probe()
-
     # scoped session -> list of that session's live subscriber queues; id -> result future.
     # A command is BROADCAST to every live subscriber (per-connection queue), never to a
     # single shared queue: EventSource reconnects overlap, and with one shared queue a
     # command could be consumed by a stale subscriber while the active page got nothing.
-    subscribers: Dict[str, List["asyncio.Queue[dict]"]] = {}
-    backlog: Dict[str, List[dict]] = {}
-    pending: Dict[str, asyncio.Future] = {}
+    subscribers: Dict[Tuple[Optional[str], str], List["asyncio.Queue[dict]"]] = {}
+    backlog: Dict[Tuple[Optional[str], str], List[dict]] = {}
+    pending: Dict[str, Tuple[Optional[str], asyncio.Future]] = {}
+    max_pending = 1024
 
     def _subscribe(session: str) -> "asyncio.Queue[dict]":
         q: "asyncio.Queue[dict]" = asyncio.Queue(maxsize=_QUEUE_MAX)
@@ -1253,17 +1301,30 @@ def setup_editor_agent_routes() -> APIRouter:
             del bl[0: len(bl) - _QUEUE_MAX]
         return 0
 
-    def _scoped(session: Optional[str], owner: Optional[str]) -> str:
-        return f"{owner or 'anon'}:{session or 'default'}"
+    def _expire_command(session, cid, fut):
+        entry = pending.get(cid)
+        if entry is not None and entry[1] is fut:
+            pending.pop(cid, None)
+            if not fut.done():
+                fut.cancel()
+        queued = backlog.get(session)
+        if queued:
+            backlog[session] = [cmd for cmd in queued if cmd.get("id") != cid]
+            if not backlog[session]:
+                backlog.pop(session, None)
+
+    def _scoped(session: Optional[str], owner: Optional[str]) -> Tuple[Optional[str], str]:
+        # Usernames and session ids may both contain colons.
+        return (owner, str(session or 'default'))
+
+    def _scope_label(scope: Tuple[Optional[str], str]) -> str:
+        return f"{scope[0] or 'anon'}:{scope[1]}"
 
     @router.post("/api/editor/plan")
     async def plan(request: Request) -> JSONResponse:
         owner = _user(request)
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        prompt = str(body.get("prompt") or "").strip()
+        body = await _json_object(request)
+        prompt = _prompt(body.get("prompt"))
         state = body.get("state") or {}
         mode = str(body.get("mode") or "plan").strip().lower()
         screenshot = body.get("screenshot")
@@ -1363,31 +1424,49 @@ def setup_editor_agent_routes() -> APIRouter:
     @router.post("/api/editor/bridge/command")
     async def bridge_command(request: Request) -> JSONResponse:
         owner = _user(request)
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
+        body = await _json_object(request)
         session = _scoped(body.get("session"), owner)
         steps = _normalize_steps(body)
         wait = bool(body.get("wait"))
-        timeout = float(body.get("timeout") or _BRIDGE_DEFAULT_TIMEOUT)
+        timeout = _bridge_timeout(body.get("timeout"))
         ids: List[str] = []
-        wait_ids: List[str] = []
+        if len(pending) + len(steps) > max_pending:
+            raise HTTPException(429, "Too many pending editor commands")
         for step in steps:
             cid = uuid.uuid4().hex
             ids.append(cid)
-            if wait:
-                pending[cid] = asyncio.get_event_loop().create_future()
-                wait_ids.append(cid)
+            fut = asyncio.get_event_loop().create_future()
+            pending[cid] = (owner, fut)
             _broadcast(session, {"id": cid, "op": step["op"], "params": step["params"]})
-        if wait and len(wait_ids) == 1:
+
+        if wait and len(steps) == 1:
+            cid = ids[0]
+            entry = pending.get(cid)
+            fut = entry[1]
             try:
-                result = await asyncio.wait_for(pending[wait_ids[0]], timeout=timeout)
-                return JSONResponse(result)
+                res = await asyncio.wait_for(fut, timeout=timeout)
+                if isinstance(res, dict):
+                    res.setdefault("status", "completed" if res.get("ok") else "failed")
+                    res.setdefault("completed", bool(res.get("ok")))
+                    return JSONResponse(res)
+                return JSONResponse({"id": cid, "ok": True, "status": "completed", "completed": True, "result": res})
             except asyncio.TimeoutError:
-                pending.pop(wait_ids[0], None)
-                return JSONResponse({"ok": False, "error": "timeout", "id": wait_ids[0]})
-        return JSONResponse({"queued": ids, "session": session})
+                return JSONResponse({"ok": False, "error": "timeout", "status": "timed_out", "completed": False, "id": cid}, status_code=504)
+            finally:
+                _expire_command(session, cid, fut)
+        else:
+            for cid in ids:
+                entry = pending.get(cid)
+                if entry is not None:
+                    asyncio.get_running_loop().call_later(timeout, _expire_command, session, cid, entry[1])
+
+        return JSONResponse({
+            "queued": ids,
+            "session": _scope_label(session),
+            "status": "queued",
+            "completed": False,
+            "ok": False,
+        })
 
     @router.get("/api/editor/bridge/events")
     async def bridge_events(request: Request, session: str = "default") -> StreamingResponse:
@@ -1412,38 +1491,50 @@ def setup_editor_agent_routes() -> APIRouter:
 
     @router.post("/api/editor/bridge/result")
     async def bridge_result(request: Request) -> JSONResponse:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
+        owner = _user(request)
+        body = await _json_object(request)
         cid = str(body.get("id") or "")
-        fut = pending.pop(cid, None)
+        entry = pending.get(cid)
+        if entry is None:
+            return JSONResponse({"ok": True})
+        if entry[0] != owner:
+            return JSONResponse({"ok": False, "error": "unknown command"}, status_code=404)
+        _, fut = entry
         if fut is not None and not fut.done():
+            is_ok = bool(body.get("ok"))
             fut.set_result({
-                "id": cid, "ok": bool(body.get("ok")),
-                "result": body.get("result"), "error": body.get("error"),
+                "id": cid,
+                "ok": is_ok,
+                "status": "completed" if is_ok else "failed",
+                "completed": is_ok,
+                "result": body.get("result"),
+                "error": body.get("error"),
                 "screenshot": body.get("screenshot"),
             })
         return JSONResponse({"ok": True})
 
     @router.post("/api/editor/bridge/await")
     async def bridge_await(request: Request) -> JSONResponse:
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
+        owner = _user(request)
+        body = await _json_object(request)
         cid = str(body.get("id") or "")
-        timeout = float(body.get("timeout") or _BRIDGE_DEFAULT_TIMEOUT)
-        fut = pending.get(cid)
-        if fut is None:
-            fut = asyncio.get_event_loop().create_future()
-            pending[cid] = fut
+        timeout = _bridge_timeout(body.get("timeout"))
+        entry = pending.get(cid)
+        if entry is None or entry[0] != owner:
+            return JSONResponse({"ok": False, "error": "unknown command", "status": "unknown", "completed": False}, status_code=404)
+        fut = entry[1]
         try:
-            result = await asyncio.wait_for(fut, timeout=timeout)
-            return JSONResponse(result)
+            result = await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+            if pending.get(cid) == (owner, fut):
+                pending.pop(cid, None)
+            res = dict(result) if isinstance(result, dict) else {"result": result, "ok": True}
+            res.setdefault("status", "completed" if res.get("ok") else "failed")
+            res["completed"] = bool(res.get("ok"))
+            return JSONResponse(res)
         except asyncio.TimeoutError:
-            pending.pop(cid, None)
-            return JSONResponse({"ok": False, "error": "timeout", "id": cid})
+            return JSONResponse({"ok": False, "error": "timeout", "status": "timed_out", "completed": False, "id": cid})
+        except asyncio.CancelledError:
+            return JSONResponse({"ok": False, "error": "cancelled", "status": "cancelled", "completed": False, "id": cid})
 
     _AGENT_SYSTEM_PROMPT = (
         "You are the photo editor agent. You drive the open image editor and "
@@ -1494,11 +1585,14 @@ def setup_editor_agent_routes() -> APIRouter:
         overwritten.
         """
         owner = _user(request)
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
-        prompt = str(body.get("prompt") or "").strip()
+        body = await _json_object(request)
+        from src.settings import get_setting
+        disabled = get_setting("disabled_tools", []) or []
+        if not isinstance(disabled, (list, tuple, set)):
+            disabled = []
+        if "plan_edit" in disabled:
+            raise HTTPException(403, "Editor tool is disabled")
+        prompt = _prompt(body.get("prompt"))
         session = str(body.get("editor_session") or body.get("session") or "default")
         state = body.get("state") if isinstance(body.get("state"), dict) else {}
         screenshot = body.get("screenshot")
@@ -1506,10 +1600,10 @@ def setup_editor_agent_routes() -> APIRouter:
         model_choice = str(body.get("model") or body.get("image_model") or "").strip()
         # Optional user-picked PLANNER model (the editor agent/planner model).
         agent_model = str(body.get("agent_model") or "").strip()
-        tools_offered = _scoped_editor_tools()
+        tools_offered = [tool for tool in _scoped_editor_tools() if tool not in disabled]
         scoped = _scoped(session, owner)
         trace: List[Dict[str, Any]] = [
-            {"type": "session", "session": scoped, "tools_offered": tools_offered},
+            {"type": "session", "session": _scope_label(scoped), "tools_offered": tools_offered},
         ]
         if not prompt:
             return JSONResponse({
@@ -1601,8 +1695,19 @@ def setup_editor_agent_routes() -> APIRouter:
                 "results": [],
                 "agent_model": model_used,
             })
+        # This route dispatches tools directly, outside execute_tool_block.
+        # Apply the same administrator tool switches before any step runs.
+        needed = {"plan_edit"}
+        for step in steps:
+            op = step.get("op")
+            needed.add(op if op in {"ai_edit_image", "generate_image"} else "run_editor_command")
+        if needed.intersection(disabled):
+            raise HTTPException(403, "Editor tool is disabled")
         # No image provider: stop before any edit runs and tell the user plainly
         # (zero canvas changes; nothing to roll back).
+        if _plan_uses_ai_content(steps):
+            from src.auth_helpers import require_privilege
+            require_privilege(request, "can_generate_images")
         if (kind or _plan_uses_ai_content(steps)) and not provider_available:
             trace.append({"type": "blocked", "reason": "image_provider_unavailable"})
             return JSONResponse({
@@ -1629,24 +1734,30 @@ def setup_editor_agent_routes() -> APIRouter:
                     results.append({"op": op, "ok": False, "error": "editor tools unavailable"})
                     break
                 tool_payload = dict(params)
-                tool_payload.setdefault("session", session)
+                # Planner output is untrusted: it cannot redirect this turn to
+                # another editor session or override an explicit model choice.
+                tool_payload["session"] = session
                 # Route to the user-picked model when one is selected.
                 if model_choice:
-                    tool_payload.setdefault("model", model_choice)
+                    tool_payload["model"] = model_choice
                 # Hand the AI step the canvas image the client already captured
                 # for this request. Without it the tool falls back to a separate
                 # bridge screenshot, which is not reliably answered right after a
                 # selection step (the masked path was losing the canvas image).
                 if isinstance(screenshot, str) and screenshot.startswith("data:image/"):
-                    tool_payload.setdefault("image", screenshot)
+                    tool_payload["image"] = screenshot
+                else:
+                    tool_payload.pop("image", None)
                 tool_cls = AiEditImageTool if op == "ai_edit_image" else GenerateImageLayerTool
                 try:
                     _desc, res = await tool_cls().execute(
                         json.dumps(tool_payload),
-                        {"owner": owner, "session_id": scoped},
+                        {"owner": owner, "session_id": _scope_label(scoped), "editor_session": session,
+                         "incognito": body.get("incognito") is True},
                     )
-                except Exception as exc:
-                    res = {"error": str(exc), "exit_code": 1}
+                except Exception:
+                    logger.exception("Editor image operation failed")
+                    res = {"error": "Editor image operation failed", "exit_code": 1}
                 res = res if isinstance(res, dict) else {}
                 ok = res.get("exit_code", 0) == 0
                 step_result = {
@@ -1664,15 +1775,17 @@ def setup_editor_agent_routes() -> APIRouter:
                     break
                 continue
             cid = uuid.uuid4().hex
-            pending[cid] = asyncio.get_event_loop().create_future()
+            fut = asyncio.get_event_loop().create_future()
+            pending[cid] = (owner, fut)
             _broadcast(scoped, {"id": cid, "op": op, "params": params})
             try:
-                res = await asyncio.wait_for(pending[cid], timeout=_BRIDGE_DEFAULT_TIMEOUT)
+                res = await asyncio.wait_for(pending[cid][1], timeout=_BRIDGE_DEFAULT_TIMEOUT)
             except asyncio.TimeoutError:
-                pending.pop(cid, None)
                 results.append({"op": op, "ok": False, "error": "timeout"})
                 trace.append({"type": "step", "op": op, "ok": False, "error": "timeout"})
                 break
+            finally:
+                _expire_command(scoped, cid, fut)
             results.append(res)
             trace.append({"type": "step", "op": op, "ok": res.get("ok"), "result": res.get("result")})
             if res.get("ok") is False:
@@ -1683,13 +1796,16 @@ def setup_editor_agent_routes() -> APIRouter:
         if steps and not any(r.get("ok") is False for r in results):
             try:
                 _info_id = uuid.uuid4().hex
-                pending[_info_id] = asyncio.get_event_loop().create_future()
+                _info_fut = asyncio.get_event_loop().create_future()
+                pending[_info_id] = (owner, _info_fut)
                 _broadcast(scoped, {"id": _info_id, "op": "document.info", "params": {}})
-                _info = await asyncio.wait_for(pending[_info_id], timeout=60)
+                _info = await asyncio.wait_for(pending[_info_id][1], timeout=60)
                 if isinstance(_info, dict) and isinstance(_info.get("result"), dict):
                     final_state = _info["result"]
             except Exception:
                 final_state = {}
+            finally:
+                _expire_command(scoped, _info_id, _info_fut)
         planned_reply = reply
         reply = _verified_reply(prompt, steps, results, final_state, planned_reply)
         if special_note and special_note.strip() not in reply:
@@ -1726,6 +1842,7 @@ def setup_editor_agent_routes() -> APIRouter:
         ``edit`` (editing/inpainting models) or ``generate`` (text-to-image).
         """
         owner = _user(request)
+        is_admin = _is_admin(request)
         models: List[Dict[str, Any]] = []
         seen: set = set()
         try:
@@ -1748,7 +1865,10 @@ def setup_editor_agent_routes() -> APIRouter:
                     # recognisably image-capable — the same test the request
                     # router uses.
                     image_endpoint = getattr(ep, "model_type", None) == "image"
-                    provider = getattr(ep, "name", None) or getattr(ep, "base_url", "") or "image"
+                    provider = getattr(ep, "name", None)
+                    if not provider:
+                        provider = getattr(ep, "base_url", "") if is_admin else "image"
+                    provider = provider or "image"
                     for name in _endpoint_enabled_models(ep):
                         if not image_endpoint and not looks_like_image_generation_model(name):
                             continue
@@ -1756,14 +1876,16 @@ def setup_editor_agent_routes() -> APIRouter:
                         if key in seen:
                             continue
                         seen.add(key)
-                        models.append({
+                        entry = {
                             "id": name,
                             "label": name,
                             "kind": "edit" if _EDIT_MODEL_RE.search(name) else "generate",
                             "provider": provider,
                             "endpoint_id": getattr(ep, "id", None),
-                            "base_url": getattr(ep, "base_url", "") or "",
-                        })
+                        }
+                        if is_admin:
+                            entry["base_url"] = getattr(ep, "base_url", "") or ""
+                        models.append(entry)
             finally:
                 db.close()
         except Exception:
@@ -1781,35 +1903,45 @@ def setup_editor_agent_routes() -> APIRouter:
         falls back to).
         """
         owner = _user(request)
+        is_admin = _is_admin(request)
         try:
             models = await editor_agent_model.list_editor_agent_models(owner)
+            if not is_admin:
+                sanitized = []
+                for m in models:
+                    m_copy = dict(m)
+                    m_copy.pop("base_url", None)
+                    sanitized.append(m_copy)
+                models = sanitized
         except Exception:
             logger.warning("editor agent-models lookup failed", exc_info=True)
             models = []
+        probe_info = {}
+        if is_admin:
+            probe_info = editor_agent_model.probe_status()
+            if not probe_info:
+                editor_agent_model.startup_probe()
+                probe_info = editor_agent_model.probe_status()
         return JSONResponse({
             "models": models,
-            "probe": editor_agent_model.probe_status(),
+            "probe": probe_info,
         })
 
     @router.post("/api/editor/self-check")
     async def editor_self_check(request: Request) -> JSONResponse:
         """Same-origin VL self-check: compare BEFORE/AFTER against the intent.
 
-        The local VL server (seneca :8097) sends no CORS headers, so the browser
-        cannot call it directly and the self-check silently "passed". This route
+        A configured vision server may not provide browser CORS headers. This route
         proxies the two images + intent to the agent VLM and returns
         ``{done, issues, retry_hint, text}`` (``done=True`` with
         ``reason="unavailable"`` on any failure so the client never loops).
         """
         owner = _user(request)
-        try:
-            body = await request.json()
-        except Exception:
-            body = {}
+        body = await _json_object(request)
         result = await editor_agent_model.self_check(
             body.get("before"),
             body.get("after"),
-            str(body.get("prompt") or body.get("intent") or ""),
+            _prompt(body.get("prompt") or body.get("intent")),
             model=str(body.get("model") or "").strip() or None,
             owner=owner,
         )

@@ -129,6 +129,29 @@ def test_replace_background_502_when_provider_returns_no_image(monkeypatch):
         raise AssertionError("expected a 502 when the provider returns no image")
 
 
+def test_provider_timeout_is_reported_as_gateway_timeout(monkeypatch):
+    def timeout(_request):
+        raise httpx.ReadTimeout("local test timeout")
+
+    _setup(monkeypatch, timeout)
+    try:
+        asyncio.run(_route("/api/image/replace-background").endpoint(_Req({"image": _IMG_B64})))
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 504
+    else:
+        raise AssertionError("expected a 504 for a provider timeout")
+
+
+def test_malformed_provider_reply_is_a_gateway_error(monkeypatch):
+    _setup(monkeypatch, lambda _req: httpx.Response(200, content=b'not-json'))
+    try:
+        asyncio.run(_route("/api/image/replace-background").endpoint(_Req({"image": _IMG_B64})))
+    except Exception as exc:
+        assert getattr(exc, "status_code", None) == 502
+    else:
+        raise AssertionError("expected a 502 for malformed provider JSON")
+
+
 async def _async_return(value):
     return value
 
