@@ -21061,6 +21061,103 @@ from src.agent_runtime.authority import MISSING_AUTHORITY, active_request_author
 
 
 
+def _apply_spec_decision_to_contract(turn_contract, picks, decided, disabled_tools, tool_policy):
+    from src.turn_contract import _ACTIVE_CONTRACT as _spec_active_contract
+    disabled = set(disabled_tools or ())
+    from src.spec_router import latest_decision
+    _spec_decision = latest_decision() or {}
+    _spec_choice = _spec_decision.get("choice")
+    _spec_direct = (os.getenv("ODYSSEUS_SPEC_MODE", "strict").strip().lower() == "strict"
+                                           and decided and _spec_choice == "answer_directly")
+    try:
+        _mgr = get_mcp_manager()
+        mcp_schemas = _mgr.get_all_openai_schemas(_load_mcp_disabled_map()) if _mgr else []
+    except Exception:
+        mcp_schemas = []
+    mcp_names = {(sc.get("function") or {}).get("name") for sc in mcp_schemas}
+    if _spec_choice == "ask_user":
+        # ask_user = a tool is needed but a detail may be missing: offer Spec's top tool too, so the model
+        # can act when the detail is there or ask when it is not.
+        _top = _spec_decision.get("top") or []
+        if _top:
+            picks = set(picks) | {_top[0][0]}
+    picks = {(f"mcp__email__{n}" if f"mcp__email__{n}" in mcp_names else n) for n in picks}
+    strict = os.getenv("ODYSSEUS_SPEC_MODE", "strict").strip().lower() == "strict"
+    base_offered = set(turn_contract.offered)
+    # The router sees the full catalog, while this request's policy may
+    # deny a tool (for example, a browser turn with Web access switched
+    # off). Preserve that conflict as an unavailable contract. Keeping the
+    # old empty menu instead lets the model invent a tool result in prose.
+    _top = _spec_decision.get("top") or []
+    _primary = str(_top[0][0]) if _spec_choice and str(_spec_choice).startswith("t") and _top else ""
+    if _primary and f"mcp__email__{_primary}" in mcp_names:
+        _primary = f"mcp__email__{_primary}"
+    # A policy denial is surfaced even if the router chose outside the
+    # base inventory; it never grants access to that tool.
+    def _denied(name):
+        return (name in disabled
+                or (tool_policy is not None and (
+                    tool_policy.blocks(name)
+                    or (tool_policy.disable_mcp and name.startswith("mcp__")))))
+    _unavailable_pick = ""
+    if _primary in picks and _denied(_primary):
+        _unavailable_pick = _primary
+    elif picks and all(_denied(name) for name in picks):
+        _unavailable_pick = sorted(picks)[0]
+    if _unavailable_pick:
+        blocked = replace(
+            turn_contract, required=frozenset(), offered=frozenset(),
+            unavailable=frozenset({_unavailable_pick}), schema_json=(),
+            required_read_operation=None, routing_experiment="spec-policy-denied",
+        )
+        _spec_active_contract.set(blocked)
+        logger.info("[spec-harness] router pick %s unavailable under request policy", _unavailable_pick)
+        return blocked
+    want = set(picks) - disabled
+    # Always-on basics only when the base turn offers them, so the Spec
+    # arm never offers a tool the base arm would not.
+    if not _spec_direct:
+        want |= {"ask_user", "update_plan"} & base_offered
+    if not (strict and decided):
+        want |= base_offered
+    want &= base_offered
+    if not want:
+        logger.info("[spec-harness] router picks %s outside base offered %s; base contract kept",
+                    sorted(picks), sorted(base_offered))
+        return turn_contract
+    offer = want & base_offered & set(turn_contract.executable)
+    # A router may narrow the menu only when every existing obligation
+    # remains satisfiable. It cannot redefine the user's requested work.
+    required_read = getattr(turn_contract, "required_read_operation", None)
+    if (not set(turn_contract.required) <= offer or turn_contract.unavailable
+            or (required_read is not None and required_read.tool not in offer)):
+        return turn_contract
+    by_name = {}
+    for sc in list(FUNCTION_TOOL_SCHEMAS) + list(mcp_schemas):
+        nm = (sc.get("function") or {}).get("name")
+        if nm in offer and nm not in by_name:
+            by_name[nm] = sc
+    for sc in turn_contract.schemas():
+        nm = (sc.get("function") or {}).get("name")
+        if nm in offer:
+            by_name[nm] = sc
+    if not by_name and not _spec_direct:
+        logger.info("[spec-harness] router picks %s not executable this turn; contract kept", sorted(picks))
+        return turn_contract
+    # Required tools and the required read carry over unchanged: harness
+    # completion logic keys on them (e.g. a calendar list is a read, not an
+    # effect that may end with "Done."). If one lost its schema, contract
+    # validation fails and the original contract is retained below.
+    new = replace(
+        turn_contract, offered=frozenset(by_name),
+        schema_json=tuple(json.dumps(by_name[n], ensure_ascii=False, sort_keys=True) for n in sorted(by_name)),
+        routing_experiment="spec-router")
+    _spec_active_contract.set(new)
+    logger.info("[spec-harness] contract replaced by router: offered=%s (was %s, decided=%s)",
+                sorted(by_name), sorted(turn_contract.offered), decided)
+    return new
+
+
 def _spec_router_contract(turn_contract, messages, disabled_tools, endpoint_url, model, owner, headers,
                           tool_policy=None):
     """Ajax Spec: return a copy of the turn contract whose offered tools are the
@@ -21069,9 +21166,16 @@ def _spec_router_contract(turn_contract, messages, disabled_tools, endpoint_url,
     Runs before any runtime dispatch so the compact preview runtime and the
     main loop both serve the router's set; only the offered tools change.
     """
+    # Contexts can be inherited by a child task; a turn must never inherit a
+    # previous turn's decision when routing is disabled or unavailable.
+    from src import spec_router as _router_context
+    if hasattr(_router_context, "clear_decision"):
+        _router_context.clear_decision()
     if (turn_contract is None
             or getattr(turn_contract, "routing_experiment", "") in {"spec-router", "spec-policy-denied"}
             or (tool_policy is not None and tool_policy.block_all_tool_calls)):
+        return turn_contract
+    if os.getenv("ODYSSEUS_SPEC_MODE", "strict").strip().lower() not in {"strict", "additive"}:
         return turn_contract
     try:
         if _configured_model_tool_surface_raw(endpoint_url, model, owner, headers=headers) != "spec":
@@ -21080,105 +21184,38 @@ def _spec_router_contract(turn_contract, messages, disabled_tools, endpoint_url,
         return turn_contract
     try:
         from src.spec_router import spec_route_tools as _spec_route_tools_early
-        from src.turn_contract import _ACTIVE_CONTRACT as _spec_active_contract
-        disabled = set(disabled_tools or ())
         picks, decided = _spec_route_tools_early(
             _extract_last_user_message(messages), FUNCTION_TOOL_SCHEMAS, set(), messages, return_decision=True)
-        from src.spec_router import LAST_DECISIONS as _spec_decisions
-        _spec_choice = (_spec_decisions[-1] if _spec_decisions else {}).get("choice")
-        _spec_direct = (os.getenv("ODYSSEUS_SPEC_MODE", "strict").strip().lower() == "strict"
-                                               and decided and _spec_choice == "answer_directly")
-        try:
-            _mgr = get_mcp_manager()
-            mcp_schemas = _mgr.get_all_openai_schemas(_load_mcp_disabled_map()) if _mgr else []
-        except Exception:
-            mcp_schemas = []
-        mcp_names = {(sc.get("function") or {}).get("name") for sc in mcp_schemas}
-        if _spec_choice == "ask_user":
-            # ask_user = a tool is needed but a detail may be missing: offer Spec's top tool too, so the model
-            # can act when the detail is there or ask when it is not.
-            _top = ((_spec_decisions[-1] if _spec_decisions else {}).get("top") or [])
-            if _top:
-                picks = set(picks) | {_top[0][0]}
-        picks = {(f"mcp__email__{n}" if f"mcp__email__{n}" in mcp_names else n) for n in picks}
-        strict = os.getenv("ODYSSEUS_SPEC_MODE", "strict").strip().lower() == "strict"
-        base_offered = set(turn_contract.offered)
-        subset_of_base = os.getenv("ODYSSEUS_SPEC_SUBSET_OF_BASE", "1").strip().lower() not in {"0", "false", "no", "off"}
-        # The router sees the full catalog, while this request's policy may
-        # deny a tool (for example, a browser turn with Web access switched
-        # off). Preserve that conflict as an unavailable contract. Keeping the
-        # old empty menu instead lets the model invent a tool result in prose.
-        _top = ((_spec_decisions[-1] if _spec_decisions else {}).get("top") or [])
-        _primary = str(_top[0][0]) if _spec_choice and str(_spec_choice).startswith("t") and _top else ""
-        if _primary and f"mcp__email__{_primary}" in mcp_names:
-            _primary = f"mcp__email__{_primary}"
-        # `executable` belongs to the base contract. In subset=0, Spec may
-        # legitimately add a policy-permitted tool that the base inventory did
-        # not include. Only an explicit request-policy denial blocks the pick.
-        def _denied(name):
-            return (name in disabled
-                    or (tool_policy is not None and (
-                        tool_policy.blocks(name)
-                        or (tool_policy.disable_mcp and name.startswith("mcp__")))))
-        _unavailable_pick = ""
-        if _primary in picks and _denied(_primary):
-            _unavailable_pick = _primary
-        elif picks and all(_denied(name) for name in picks):
-            _unavailable_pick = sorted(picks)[0]
-        if _unavailable_pick:
-            blocked = replace(
-                turn_contract, required=frozenset(), offered=frozenset(),
-                unavailable=frozenset({_unavailable_pick}), schema_json=(),
-                required_read_operation=None, routing_experiment="spec-policy-denied",
-            )
-            _spec_active_contract.set(blocked)
-            logger.info("[spec-harness] router pick %s unavailable under request policy", _unavailable_pick)
-            return blocked
-        want = set(picks) - disabled
-        # Always-on basics only when the base turn offers them, so the Spec
-        # arm never offers a tool the base arm would not.
-        if not _spec_direct:
-            want |= {"ask_user", "update_plan"} & base_offered
-        if not (strict and decided):
-            want |= base_offered
-        if subset_of_base:
-            # A/B control: Spec offered set is a subset of the base offered set
-            # (measures narrowing only). Empty intersection keeps the base set.
-            want &= base_offered
-            if not want:
-                logger.info("[spec-harness] router picks %s outside base offered %s; base contract kept",
-                            sorted(picks), sorted(base_offered))
-                return turn_contract
-        offer = want if strict else (want & set(turn_contract.executable))
-        by_name = {}
-        for sc in list(FUNCTION_TOOL_SCHEMAS) + list(mcp_schemas):
-            nm = (sc.get("function") or {}).get("name")
-            if nm in offer and nm not in by_name:
-                by_name[nm] = sc
-        for sc in turn_contract.schemas():
-            nm = (sc.get("function") or {}).get("name")
-            if nm in offer:
-                by_name[nm] = sc
-        if not by_name and not _spec_direct:
-            logger.info("[spec-harness] router picks %s not executable this turn; contract kept", sorted(picks))
-            return turn_contract
-        # Keep the contract's required tools and required read whenever they
-        # are still offered: harness completion logic keys on them (e.g. a
-        # calendar list is a read, not an effect that may end with "Done.").
-        _rro = getattr(turn_contract, "required_read_operation", None)
-        _keep_rro = _rro if (_rro is not None and getattr(_rro, "tool", None) in by_name) else None
-        new = replace(
-            turn_contract, required=frozenset(n for n in (turn_contract.required or ()) if n in by_name),
-            offered=frozenset(by_name),
-            executable=frozenset(set(turn_contract.executable) | set(by_name)),
-            schema_json=tuple(json.dumps(by_name[n], ensure_ascii=False, sort_keys=True) for n in sorted(by_name)),
-            unavailable=(frozenset() if os.getenv("ODYSSEUS_SPEC_MODE", "strict").strip().lower() == "strict" else turn_contract.unavailable), required_read_operation=_keep_rro, routing_experiment="spec-router")
-        _spec_active_contract.set(new)
-        logger.info("[spec-harness] contract replaced by router: offered=%s (was %s, decided=%s)",
-                    sorted(by_name), sorted(turn_contract.offered), decided)
-        return new
+        return _apply_spec_decision_to_contract(turn_contract, picks, decided, disabled_tools, tool_policy)
     except Exception as exc:
-        logger.warning("[spec-harness] router contract replacement failed open: %s", exc)
+        logger.warning("[spec-harness] router failed; retaining original contract: %s", exc)
+        return turn_contract
+
+
+async def _spec_router_contract_async(turn_contract, messages, disabled_tools, endpoint_url, model, owner, headers,
+                                      tool_policy=None):
+    """Asynchronous non-blocking turn contract routing."""
+    from src import spec_router as _router_context
+    if hasattr(_router_context, "clear_decision"):
+        _router_context.clear_decision()
+    if (turn_contract is None
+            or getattr(turn_contract, "routing_experiment", "") in {"spec-router", "spec-policy-denied"}
+            or (tool_policy is not None and tool_policy.block_all_tool_calls)):
+        return turn_contract
+    if os.getenv("ODYSSEUS_SPEC_MODE", "strict").strip().lower() not in {"strict", "additive"}:
+        return turn_contract
+    try:
+        if _configured_model_tool_surface_raw(endpoint_url, model, owner, headers=headers) != "spec":
+            return turn_contract
+    except Exception:
+        return turn_contract
+    try:
+        from src.spec_router import spec_route_tools_async as _spec_route_tools_early_async
+        picks, decided = await _spec_route_tools_early_async(
+            _extract_last_user_message(messages), FUNCTION_TOOL_SCHEMAS, set(), messages, return_decision=True)
+        return _apply_spec_decision_to_contract(turn_contract, picks, decided, disabled_tools, tool_policy)
+    except Exception as exc:
+        logger.warning("[spec-harness] router failed; retaining original contract: %s", exc)
         return turn_contract
 
 
@@ -21263,20 +21300,11 @@ async def stream_agent_loop(
     if (os.getenv("ODYSSEUS_SPEC_MODE", "").strip().lower() == "driver"
             and not (tool_policy and tool_policy.block_all_tool_calls)
             and _configured_model_tool_surface_raw(endpoint_url, model, owner, headers=headers) == "spec"):
-        from src.spec_driver import stream_spec_turn
-        async for chunk in stream_spec_turn(
-            endpoint_url=endpoint_url, model=model, messages=messages, headers=headers,
-            session_id=session_id, owner=owner, disabled_tools=disabled_tools,
-            tool_policy=tool_policy, workspace=workspace, active_document=active_document,
-            client_runtime_context=client_runtime_context,
-            external_untrusted_context_seen=external_untrusted_context_seen,
-            max_tokens=max(1024, min(int(max_tokens or 1024), 4096)), max_rounds=8,
-            temperature=0.0, request_authority=request_authority,
-        ):
-            yield chunk
+        yield 'data: ' + json.dumps({"delta": "Spec driver mode is unavailable because its authority and completion checks are not supported. No action was performed."}) + '\n\n'
+        yield 'data: [DONE]\n\n'
         return
 
-    turn_contract = _spec_router_contract(
+    turn_contract = await _spec_router_contract_async(
         turn_contract, messages, disabled_tools, endpoint_url, model, owner, headers,
         tool_policy=tool_policy)
     if (turn_contract is not None
@@ -21286,6 +21314,20 @@ async def stream_agent_loop(
         reply = _spec_unavailable_reply(turn_contract.unavailable)
         yield 'data: ' + json.dumps({"type": "turn_contract", **turn_contract.audit()}) + '\n\n'
         yield 'data: ' + json.dumps({"delta": reply}) + '\n\n'
+        yield 'data: [DONE]\n\n'
+        return
+
+    try:
+        _spec_turn = _configured_model_tool_surface_raw(endpoint_url, model, owner, headers=headers) == "spec"
+    except Exception:
+        _spec_turn = False
+    # Without a turn contract (scheduled, skill and monitor runs) no Spec
+    # routing applies; the turn runs on the compact surface as usual.
+    if _spec_turn and _blocks_before_inference(turn_contract):
+        unavailable = ", ".join(sorted(turn_contract.unavailable))
+        yield 'data: ' + json.dumps({"type": "turn_contract", **turn_contract.audit()}) + '\n\n'
+        yield 'data: ' + json.dumps({"delta": "I can’t perform this request with the currently permitted tools "
+                                   f"(unavailable: {unavailable}). I haven’t substituted another tool."}) + '\n\n'
         yield 'data: [DONE]\n\n'
         return
 
@@ -21314,26 +21356,9 @@ async def stream_agent_loop(
             yield chunk
         return
 
-    _spec_turn = False
-    try:
-        _spec_turn = _configured_model_tool_surface_raw(endpoint_url, model, owner, headers=headers) == "spec"
-    except Exception:
-        _spec_turn = False
-    if _spec_turn and turn_contract is not None and getattr(turn_contract, "routing_experiment", "") != "spec-router":
-        # Ajax Spec: the router, not the regex turn contract, decides the tools.
-        # Drop the contract here and in the dispatcher's context so neither the
-        # route build nor execute_tool_block enforces its offered set.
-        logger.info("[spec-harness] dropping turn contract on spec turn: offered=%s unavailable=%s",
-                    sorted(turn_contract.offered), sorted(turn_contract.unavailable))
-        turn_contract = None
-        try:
-            from src.turn_contract import _ACTIVE_CONTRACT as _spec_active_contract
-            _spec_active_contract.set(None)
-        except Exception as _exc:
-            logger.warning("[spec-harness] could not clear active turn contract: %s", _exc)
     if turn_contract is not None:
         yield 'data: ' + json.dumps({"type": "turn_contract", **turn_contract.audit()}) + '\n\n'
-        if not _spec_turn and _blocks_before_inference(turn_contract):
+        if _blocks_before_inference(turn_contract):
             unavailable = ", ".join(sorted(turn_contract.unavailable))
             clarification = (
                 "I can’t perform this request with the currently permitted tools "
@@ -24336,7 +24361,7 @@ async def stream_agent_loop(
         # "spec" = compact tools plus a small-model router; the harness-facing
         # surface already reads "compact", so detect spec from the raw mode.
         try:
-            _spec_surface = _configured_model_tool_surface_raw(
+            _spec_surface = getattr(turn_contract, "routing_experiment", "") == "spec-router" and _configured_model_tool_surface_raw(
                 candidate_url, candidate_model, owner, headers=candidate_headers,
                 endpoint_id=(route_descriptor or {}).get("endpoint_id")) == "spec"
         except Exception:
@@ -24410,7 +24435,7 @@ async def stream_agent_loop(
                 if _spec_mode == "strict" and _spec_decided:
                     # The router decides which tools are injected: its pick(s),
                     # tools already used in this chat, and the always-on basics.
-                    _spec_strict = (_spec_added | {"ask_user", "update_plan"}) - set(disabled_tools)
+                    _spec_strict = (_spec_added | {"ask_user", "update_plan"}) & set(turn_contract.offered) - set(disabled_tools)
                     if _spec_strict:
                         route_tools = _spec_strict
                         _spec_offered = frozenset(route_tools)
@@ -25360,15 +25385,6 @@ async def stream_agent_loop(
                     schema for schema in contract_schemas
                     if (schema.get("function", {}).get("name") or schema.get("name"))
                     in _spec_names
-                ]
-                _have = {
-                    (schema.get("function", {}).get("name") or schema.get("name"))
-                    for schema in contract_schemas
-                }
-                contract_schemas += [
-                    schema for schema in list(FUNCTION_TOOL_SCHEMAS) + list(route_mcp_schemas)
-                    if schema.get("function", {}).get("name") in (set(_spec_names) - _have)
-                    and schema.get("function", {}).get("name") not in disabled_tools
                 ]
             return _filter_route_tool_schemas(_apply_tool_surface_to_schemas(contract_schemas, tool_surface))
         if route_state["is_api_model"]:
@@ -26321,7 +26337,7 @@ async def stream_agent_loop(
         _tool_names_sent = [t.get("function", {}).get("name") for t in (all_tool_schemas or []) if t.get("function")]
         if round_num == 1:
             try:
-                logger.info("[spec-debug] prompt composition (chars): %s", [(m.get("role"), len(str(m.get("content") or "")), (m.get("metadata") or {}).get("source"), str(m.get("content") or "")[:40].replace("\n", " ")) for m in messages])
+                logger.info("[spec-debug] prompt composition (chars): %s", [(m.get("role"), len(str(m.get("content") or ""))) for m in messages])
             except Exception:
                 pass
         logger.info(f"[agent-debug] round={round_num} model={model} _is_api_model={_is_api_model} tools_sent={len(_tool_names_sent)} tool_names={_tool_names_sent} relevant_tools={sorted(_relevant_tools)[:50] if _relevant_tools else 'ALL'}")
@@ -33925,7 +33941,6 @@ async def stream_agent_loop(
                     "mutation_epoch": _workspace_mutation_epoch,
                     "error": _failure_text[:600],
                 }
-                logger.info("[spec-debug] tool failure text: %s", _failure_text[:400])
                 logger.info(
                     "[agent] recorded failed call %s in round %s at mutation epoch %s",
                     _call_signature,

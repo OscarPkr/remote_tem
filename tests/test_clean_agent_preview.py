@@ -7351,6 +7351,7 @@ def test_spec_direct_no_tools_decision(monkeypatch):
     fake.LAST_DECISIONS = [
         {'message': 'Yo', 'choice': 'answer_directly', 'answer_directly': 0.971},
     ]
+    fake.latest_decision = lambda: fake.LAST_DECISIONS[-1]
     monkeypatch.setitem(sys.modules, 'src.spec_router', fake)
     monkeypatch.setattr(
         'src.agent_loop._configured_model_tool_surface_raw',
@@ -7407,8 +7408,7 @@ def test_spec_direct_no_tools_decision(monkeypatch):
     )
 
     class _Boom:
-        @property
-        def LAST_DECISIONS(self):
+        def latest_decision(self):
             raise RuntimeError('router down')
     monkeypatch.setitem(sys.modules, 'src.spec_router', _Boom())
     assert spec_direct_no_tools_p('Yo', 'u', 'm', 'o', {}) is None

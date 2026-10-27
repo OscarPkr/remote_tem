@@ -37,6 +37,13 @@ def test_score_value_and_choice_of():
     assert jd.choice_of(None) is None
 
 
+def test_non_finite_score_falls_back(monkeypatch):
+    for bad in (float("nan"), float("inf"), "nan"):
+        assert jd.score_value({"type": "score", "score": bad}) is None
+        _enable(monkeypatch, bad)
+        assert _run(ba._spec_triage_email_urgency({"subject": "x", "body": "y"}, triage_version=11)) is None
+
+
 def test_disabled_job_does_not_call_adapter(monkeypatch):
     monkeypatch.setenv("ODYSSEUS_JEFF_EMAIL_URGENCY", "0")
     calls = {"n": 0}

@@ -34,6 +34,7 @@ def _install_spec_router(monkeypatch, *, p):
     fake.LAST_DECISIONS = [
         {'message': PROMPT, 'choice': 'answer_directly', 'answer_directly': p},
     ]
+    fake.latest_decision = lambda: fake.LAST_DECISIONS[-1]
     monkeypatch.setitem(sys.modules, 'src.spec_router', fake)
     monkeypatch.setattr(
         'src.agent_loop._configured_model_tool_surface_raw',
@@ -133,8 +134,7 @@ async def test_spec_direct_router_error_is_unchanged(monkeypatch):
     monkeypatch.setenv('ODYSSEUS_SPEC_DIRECT_NOTOOLS', '1')
 
     class _Boom:
-        @property
-        def LAST_DECISIONS(self):
+        def latest_decision(self):
             raise RuntimeError('router down')
     monkeypatch.setitem(sys.modules, 'src.spec_router', _Boom())
     monkeypatch.setattr(

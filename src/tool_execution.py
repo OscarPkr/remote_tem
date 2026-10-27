@@ -1559,7 +1559,7 @@ def _agent_subprocess_env() -> dict:
 
 
 def _legacy_private_browser_enabled() -> bool:
-    return os.getenv("ODYSSEUS_PRIVATE_BROWSER_LEGACY", "0").strip().lower() not in {"0", "false", "no", "off"}
+    return os.getenv("ODYSSEUS_PRIVATE_BROWSER_LEGACY", "0").strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 async def _legacy_private_browser(operation, transport, *, progress_cb=None, session_id=None, owner=None):
@@ -1757,11 +1757,13 @@ async def execute_tool_block(
 
     transport = operation.transport_tool
     if operation.tool == "private_browser" and _legacy_private_browser_enabled():
-        # Restored pre-Wave-3 private_browser (agent-browser CLI). The Wave 3
-        # producer in src.browser_identity refuses every page action in this
-        # build. This compatibility transport requires an explicit opt-in.
-        return await _legacy_private_browser(
-            operation, transport, progress_cb=progress_cb, session_id=session_id, owner=owner)
+        # The legacy process cannot establish the sealed browser/page identity
+        # required by the current runtime. Never execute it ahead of resource
+        # binding and the untrusted-context approval gate, even when opted in.
+        return f"{transport}: UNSUPPORTED", {
+            **page_unavailable(),
+            "error": "Legacy browser transport cannot establish the required browser authority.",
+        }
     if operation.tool == "private_browser":
         try:
             _, browser_args = parse_browser_operation(operation.input)

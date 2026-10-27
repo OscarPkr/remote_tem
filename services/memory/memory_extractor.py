@@ -628,6 +628,14 @@ async def extract_and_store(
             if not fact_text or len(fact_text) < 5:
                 continue
 
+            # A fuller owner-specific name must not rewrite a shared legacy
+            # entry, but that less-specific entry must not suppress it either.
+            legacy_refinements = {
+                id(entry) for entry in existing
+                if _owner and entry.get("owner") is None
+                and _name_enrichment_target(fact_text, [entry]) is entry
+            }
+
             # Dedup: check vector similarity first (fast), then exact text match.
             # A runtime embedding/ChromaDB failure (backend OOM, model evicted,
             # remote endpoint down) must not abort the whole batch — fall through
@@ -649,18 +657,25 @@ async def extract_and_store(
                     # silently dropped. Mirror the owner predicate used by the
                     # text dedup below; cross-tenant/stale matches fall through.
                     _match = next((e for e in existing if e.get("id") == existing_id), None)
-                    if _match is not None and (_match.get("owner") == _owner or _match.get("owner") is None):
+                    if (_match is not None and id(_match) not in legacy_refinements
+                            and (_match.get("owner") == _owner or _match.get("owner") is None)):
                         logger.debug(f"Memory dedup (vector): '{fact_text[:50]}' matches {existing_id}")
                         continue
 
             # Text dedup fallback: exact match + fuzzy similarity
-            user_existing = [e for e in existing if e.get("owner") == _owner or e.get("owner") is None] if _owner else existing
+            user_existing = [e for e in existing
+                             if (e.get("owner") == _owner or e.get("owner") is None)
+                             and id(e) not in legacy_refinements] if _owner else existing
 
             # Name enrichment: if an existing name fact is a strict prefix of
             # this more complete one, upgrade it in place instead of adding a
             # near-duplicate ("name is Felix" -> "name is Felix Arvid Ulf
             # Kjellberg"). The vector store upserts by id, so re-adding is safe.
-            _enrich = _name_enrichment_target(fact_text, user_existing)
+            # Legacy unowned entries may be visible to multiple owners; never
+            # rewrite one with a private fact from the current owner.
+            _enrich = _name_enrichment_target(
+                fact_text, [e for e in user_existing if e.get("owner") == _owner]
+            )
             if _enrich is not None:
                 _enrich["text"] = fact_text
                 _enrich["timestamp"] = int(time.time())

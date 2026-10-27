@@ -17,6 +17,7 @@ Env:
 from __future__ import annotations
 
 import logging
+import math
 import os
 from typing import Any, Dict, Optional
 
@@ -98,18 +99,18 @@ def score_value(answer: Optional[Dict[str, Any]]) -> Optional[float]:
     """Expected value (0..n-1) of a jeff ``score`` answer, or None."""
     if not isinstance(answer, dict):
         return None
-    if answer.get("type") == "score":
-        try:
-            return float(answer.get("score"))
-        except Exception:
+    try:
+        if answer.get("type") == "score":
+            value = float(answer.get("score"))
+        elif answer.get("type") == "choice":
+            probs = answer.get("probabilities") or {}
+            value = float(sum(i * float(p) for i, p in enumerate(probs.values())))
+        else:
             return None
-    if answer.get("type") == "choice":
-        probs = answer.get("probabilities") or {}
-        try:
-            return float(sum(i * float(p) for i, p in enumerate(probs.values())))
-        except Exception:
-            return None
-    return None
+    except Exception:
+        return None
+    # A malformed adapter reply must fall back like any other failure.
+    return value if math.isfinite(value) else None
 
 
 def choice_of(answer: Optional[Dict[str, Any]]) -> Optional[str]:

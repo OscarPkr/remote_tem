@@ -92,7 +92,7 @@ def prune_multimodal_images(
     return pruned
 
 
-_IMAGE_TURN_LABEL_RE = re.compile(r"\[Image(?:s)?(?:\s+attached)?:\s*([^\]]+)\]", re.IGNORECASE)
+_IMAGE_TURN_LABEL_RE = re.compile(r"\[Image(?:s)?(?:[ \t]{1,64}attached)?:[ \t]{0,64}([^\]]{1,512})\]", re.IGNORECASE)
 
 
 def _image_turn_label(message: Dict) -> str:
@@ -102,7 +102,8 @@ def _image_turn_label(message: Dict) -> str:
     if isinstance(content, list):
         for item in content:
             if isinstance(item, dict) and item.get("type") in _MULTIMODAL_IMAGE_TYPES:
-                candidate = item.get("name") or (item.get("image_url") or {}).get("name")
+                image_url = item.get("image_url")
+                candidate = item.get("name") or (image_url.get("name") if isinstance(image_url, dict) else None)
                 if candidate:
                     name = str(candidate)
                     break
@@ -146,7 +147,7 @@ def keep_recent_image_turns(messages: List[Dict], *, keep: int = 2) -> List[Dict
             trimmed.append(message)
             continue
         kept_blocks = [
-            item for item in content
+            dict(item) if isinstance(item, dict) else item for item in content
             if not (isinstance(item, dict) and item.get("type") in _MULTIMODAL_IMAGE_TYPES)
         ]
         if len(kept_blocks) == len(content):

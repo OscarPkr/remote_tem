@@ -162,3 +162,23 @@ def test_identity_auto_pin_stops_after_first_five_for_owner(monkeypatch):
     assert added.get("category") == "identity"
     assert added.get("pinned") is not True
     assert sum(1 for r in rows if r.get("category") == "identity" and r.get("pinned")) == 5
+
+
+@pytest.mark.parametrize('vector_match', [False, True])
+def test_name_refinement_never_rewrites_shared_legacy_memory(monkeypatch, vector_match):
+    class NameSession(FakeSession):
+        def get_context_messages(self):
+            return [{'role': 'user', 'content': 'My name is Alex Morgan.'},
+                    {'role': 'assistant', 'content': 'Noted.'}]
+
+    mm = FakeMemoryManager([
+        {'id': 'legacy', 'text': 'Name is Alex', 'owner': None},
+    ])
+    _install_llm_stub(monkeypatch, '[{"text":"Name is Alex Morgan","evidence":"My name is Alex Morgan"}]')
+    module = _load_extractor()
+    vector = FakeVector('legacy') if vector_match else NoMatchVector()
+    asyncio.run(module.extract_and_store(NameSession('userB'), mm, vector,
+                                         endpoint_url='http://fixture', model='fixture'))
+    assert next(row for row in mm.rows if row['id'] == 'legacy')['text'] == 'Name is Alex'
+    assert any(row.get('owner') == 'userB' and row.get('text') == 'Name is Alex Morgan'
+               for row in mm.rows)

@@ -290,14 +290,9 @@ def setup_research_routes(research_handler, session_manager=None) -> APIRouter:
         # (most sessions have none), not an error. Return HTTP 200 with an
         # explicit empty status so loading a session does not log a spurious
         # 404; every client treats a non-"running" status as idle anyway.
-        # A session whose research exists but belongs to ANOTHER user stays a
-        # 404, so we do not leak the existence of someone else's research.
+        # Research owned by ANOTHER user answers identically, so the response
+        # does not reveal whether that research exists.
         if not _owns_in_memory(session_id, user):
-            exists = session_id in getattr(research_handler, "_active_tasks", {})
-            if not exists:
-                exists = _find_research_path(session_id) is not None
-            if exists:
-                raise HTTPException(404, "No research found for this session")
             return {"status": "none"}
         status = research_handler.get_status(session_id)
         if status is None:

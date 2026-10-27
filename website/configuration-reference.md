@@ -21,7 +21,7 @@ described as a switch that turns something off, the read rejects `0`, `false`,
 `no` and `off` and treats everything else as on. The `Default` column is the
 value the code falls back to when the variable is unset, quoted from the source.
 
-The source tree reads **149** `ODYSSEUS_*` variables: 90 an operator may want to set, and 59 that are internal - sentinels, fixture switches, capture hooks and development tooling. The internal ones are listed too, in their own section, so this page can be checked against the source mechanically.
+The source tree reads **147** `ODYSSEUS_*` variables: 90 an operator may want to set, and 57 that are internal - sentinels, fixture switches, capture hooks and development tooling. The internal ones are listed too, in their own section, so this page can be checked against the source mechanically.
 
 > This page is generated. Edit `scripts/generate_env_reference.py` and
 > re-run it; `tests/test_env_reference.py` enforces that the committed page
@@ -222,14 +222,12 @@ Listed for completeness. Setting one of these on a real install is either a no-o
 | `ODYSSEUS_SPEC_DIRECT_MIN_P` | `'0.9'` | `src/clean_agent_preview.py` | Minimum confidence probability a spec-router direct-answer decision must reach before the no-tools path is taken. |
 | `ODYSSEUS_SPEC_DIRECT_MODE` | `'tool_choice_none'` | `src/clean_agent_preview.py` | Controls how the spec router answers high-confidence direct-answer turns; either tool_choice_none (default) or empty_menu. |
 | `ODYSSEUS_SPEC_DIRECT_NOTOOLS` | `''` | `src/clean_agent_preview.py` | Set to 1, true, yes or on to enable the spec router's direct-answer no-tools path for high-confidence answer_directly decisions. |
-| `ODYSSEUS_SPEC_DRIVER_TOPK` | `'1'` | `src/spec_driver.py` | Number of router-selected tool candidates exposed in a driver round. |
 | `ODYSSEUS_SPEC_MODE` | `'strict'` | `src/agent_loop.py` (+1 more) | Spec routing mode for explicitly configured models, including strict and driver. |
 | `ODYSSEUS_SPEC_ROUTER_MIN_CONF` | `'0.3'` | `src/spec_router.py` | Minimum tool-selection confidence accepted from the router. |
 | `ODYSSEUS_SPEC_ROUTER_MODEL` | `'odysseus-s60'` | `src/spec_router.py` | Decision adapter model used for tool routing. |
 | `ODYSSEUS_SPEC_ROUTER_SECOND` | `'0.25'` | `src/spec_router.py` | Minimum confidence for adding a secondary tool candidate. |
 | `ODYSSEUS_SPEC_ROUTER_TIMEOUT` | `'0.5'` | `src/spec_router.py` | Time budget in seconds for a router decision. |
 | `ODYSSEUS_SPEC_ROUTER_URL` | `''` | `src/spec_router.py` | Base URL of the optional Spec router; an empty URL disables requests. |
-| `ODYSSEUS_SPEC_SUBSET_OF_BASE` | `'1'` | `src/agent_loop.py` | Limit Spec tool selections to the existing request inventory by default. |
 | `ODYSSEUS_SPEC_THINK_MIN_P` | `'0.5'` | `src/spec_router.py` | Minimum router confidence for enabling thinking. |
 | `ODYSSEUS_SPEC_THINK_MODEL` | `os.getenv('ODYSSEUS_SPEC_ROUTER_MODEL', 'odysseus-s60')` | `src/spec_router.py` | Optional thinking decision adapter model, falling back to the tool router model. |
 | `ODYSSEUS_SPEC_THINK_QUESTION` | `'binary'` | `src/spec_router.py` | Thinking classifier question format: binary or kind5. |
@@ -302,7 +300,7 @@ reads three ways, because no single pattern covers the codebase:
   lines, so one read lives inside a string literal.
 
 The three passes are not redundancy. A line-based grep for a direct
-`os.environ.get("ODYSSEUS_...` call finds 119 of the 149 variables on this
+`os.environ.get("ODYSSEUS_...` call finds 117 of the 147 variables on this
 page. What it misses is reads through an env-reader helper, reads whose call
 spans more than one line, reads whose variable name is held in a module
 constant, and reads through a mapping passed in as an argument - which is the

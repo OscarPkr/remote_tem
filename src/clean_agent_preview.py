@@ -1466,6 +1466,29 @@ def spec_router_thinking_decision(endpoint_url, model, owner, headers, direct_us
         return None
 
 
+async def spec_router_thinking_decision_async(endpoint_url, model, owner, headers, direct_user_text):
+    """Async env-gated router decision for spec tool-surface turns. Fail open (None)."""
+    try:
+        import sys as _sys
+        spec_router = _sys.modules.get('src.spec_router')
+        if spec_router is None:
+            from src import spec_router  # noqa: F401
+        if not spec_router.think_router_enabled():
+            return None
+        from src.agent_loop import _configured_model_tool_surface_raw
+        if _configured_model_tool_surface_raw(
+            endpoint_url, model, owner, headers=headers
+        ) != 'spec':
+            return None
+        if hasattr(spec_router, 'route_thinking_async'):
+            return await spec_router.route_thinking_async(direct_user_text)
+        return spec_router.route_thinking(direct_user_text)
+    except Exception:
+        logging.getLogger(__name__).warning(
+            'spec think router decision failed; using rules only', exc_info=True)
+        return None
+
+
 def spec_router_think_reason(round_number, decision, existing_deliberate):
     """Add 'router_think' on round 1 when the router asked for thinking and no
     other rule already selected a deliberate reason."""
@@ -1508,10 +1531,7 @@ def spec_direct_no_tools_p(user_message, endpoint_url, model, owner, headers):
         spec_router = _sys.modules.get('src.spec_router')
         if spec_router is None:
             from src import spec_router  # noqa: F401
-        decisions = getattr(spec_router, 'LAST_DECISIONS', None) or []
-        if not decisions:
-            return None
-        decision = decisions[-1]
+        decision = spec_router.latest_decision()
         if not isinstance(decision, dict):
             return None
         # Guard against a stale decision from a previous turn.
@@ -1573,8 +1593,7 @@ def spec_driver_pick(conversation, disabled_tools, user_text, schemas=None):
             set(disabled_tools or ()), list(conversation or []),
             return_decision=True,
         )
-        decisions = getattr(spec_router, 'LAST_DECISIONS', None) or []
-        decision = decisions[-1] if decisions else {}
+        decision = spec_router.latest_decision() or {}
         if not isinstance(decision, dict) or decision.get('error'):
             return None
         choice = decision.get('choice')
@@ -5600,6 +5619,10 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                          external_tool_schemas=None, temperature=0.0,
                          context_resolution=None,
                          request_authority=MISSING_AUTHORITY, **ignored):
+    if spec_driver_active(endpoint_url, model, owner, headers):
+        yield event({'delta': 'Spec driver mode is unavailable because its authority and completion checks are not supported. No action was performed.'})
+        yield 'data: [DONE]\n\n'
+        return
     from src.generation_sampling import validate_temperature
     temperature = validate_temperature(temperature)
     # This path sends requests directly with httpx and therefore bypasses
@@ -6095,7 +6118,7 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
                 has_real_usage = intent_accounting.get('usage_source') == 'real'
             # Optional env-gated router decision (spec surface only). Computed
             # once per user turn; disabled/None leaves behaviour unchanged.
-            _spec_route_think = spec_router_thinking_decision(
+            _spec_route_think = await spec_router_thinking_decision_async(
                 endpoint_url, model, owner, headers, direct_user_text)
             if _spec_route_think is not None:
                 logging.getLogger(__name__).info(
@@ -6108,12 +6131,17 @@ async def stream_preview(*, endpoint_url, model, messages, headers, turn_contrac
             # round 1 is sent with tool_choice 'none' (same tools list).
             _spec_direct_p = spec_direct_no_tools_p(
                 direct_user_text, endpoint_url, model, owner, headers)
+            if (turn_contract.required or turn_contract.unavailable
+                    or turn_contract.required_read_operation is not None):
+                _spec_direct_p = None
             # Option B: send round 1 with no tools at all for a direct answer.
             _spec_direct_empty_menu = (
                 _spec_direct_p is not None and spec_direct_mode() == 'empty_menu')
             # ODYSSEUS_SPEC_MODE=driver: the router (not the 9B) picks the tool
             # every round; the 9B only writes the arguments or the answer.
-            _spec_driver_on = spec_driver_active(endpoint_url, model, owner, headers)
+            # Driver execution is refused at entry. Keep this false even if
+            # configuration changes while the stream is already in progress.
+            _spec_driver_on = False
             # Driver mode narrows the contract per round to the Spec pick.
             # Rebuild each round from this frozen base so the narrowing does
             # not accumulate/mutate across rounds.

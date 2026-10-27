@@ -2000,7 +2000,7 @@ FUNCTION_TOOL_SCHEMAS = [
     },
 ]
 
-if os.getenv("ODYSSEUS_PRIVATE_BROWSER_LEGACY", "0").strip().lower() not in {"0", "false", "no", "off"}:
+if os.getenv("ODYSSEUS_PRIVATE_BROWSER_LEGACY", "0").strip().lower() not in {"", "0", "false", "no", "off"}:
     # Restored pre-Wave-3 private_browser (see src.tool_execution._legacy_private_browser).
     from src.private_browser_legacy_schema import PRIVATE_BROWSER_SCHEMA as _PB_LEGACY
 

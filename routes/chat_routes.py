@@ -331,6 +331,7 @@ def _is_external_discovery_request(text: str) -> bool:
 
 _URL_SCHEME_RE = re.compile(r"https?://", re.I)
 _PDF_URL_TAIL_RE = re.compile(r"\.pdf\b|/pdf/", re.I)
+_EDITOR_SESSION_RE = re.compile(r"[A-Za-z0-9@._:-]{1,128}")
 
 
 def _mentions_pdf_url(value: str) -> bool:
@@ -2693,11 +2694,15 @@ def setup_chat_routes(
         # Scoped photo_editor agent context: the Quick Edit popup (and any
         # image-edit chat turn) may carry the open image-editor session id and a
         # canvas snapshot so the editor tool family can drive it in-process.
-        editor_session = (
+        # The id is quoted into a system message, so accept only an
+        # identifier; any other value is treated as no open editor.
+        editor_session = str(
             form_data.get("editor_session")
             or form_data.get("editor_session_id")
             or ""
         ).strip()
+        if not _EDITOR_SESSION_RE.fullmatch(editor_session):
+            editor_session = ""
         photo_editor_requested = (
             str(form_data.get("photo_editor") or "").strip().lower()
             in {"1", "true", "yes", "on"}

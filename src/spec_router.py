@@ -1,9 +1,9 @@
 """Odysseus spec: small-model tool router (JEFF-style) for the agent harness.
 
 The router (a 0.8B decision model served by jeff-serve) reads the user's
-message and scores every offered tool in one forward pass.  The harness only
-ever ADDS tools from its answer, never removes any, and fails open: on any
-error, timeout or low-confidence answer the compact tool set is unchanged.
+message and scores offered tools in one forward pass. The harness may narrow
+the existing turn contract, but cannot add authority or drop its obligations.
+On an error, timeout or low-confidence answer it retains the existing contract.
 
 Env:
   ODYSSEUS_SPEC_ROUTER_URL    jeff-serve base URL, e.g. http://ajax:8765  (unset = disabled)
@@ -17,11 +17,16 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
+import asyncio
 import urllib.request
 import urllib.error
+from contextvars import ContextVar
 from typing import Any, Dict, Iterable, List, Optional, Set
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +40,16 @@ _INSTRUCTIONS = (
     "If a tool is needed but information it requires is missing, choose ask the user."
 )
 _AGENT = "Odysseus, a personal tool-using assistant."
-# Recent decisions, for debugging in the UI/logs: most recent last.
-LAST_DECISIONS: List[Dict[str, Any]] = []
+_LAST_DECISION: ContextVar[Optional[Dict[str, Any]]] = ContextVar('spec_router_decision', default=None)
+
+
+def latest_decision() -> Optional[Dict[str, Any]]:
+    """Return the router decision in the current request context."""
+    return _LAST_DECISION.get()
+
+
+def clear_decision() -> None:
+    _LAST_DECISION.set(None)
 _MCP_BROWSER_TOOLS = (
     "mcp__builtin_browser__browser_navigate",
     "mcp__builtin_browser__browser_snapshot",
@@ -105,6 +118,7 @@ def spec_route_tools(
     the router answered confidently (a tool pick, or answer_directly)."""
     added: Set[str] = set(prior_tool_names(messages))
     decided = False
+    clear_decision()
     url = os.getenv("ODYSSEUS_SPEC_ROUTER_URL", "").strip().rstrip("/")
     if not url or not (user_message or "").strip():
         return (added, False) if return_decision else added
@@ -143,6 +157,15 @@ def spec_route_tools(
                 time.sleep(0.1)
         probs = out.get("probabilities") or {}
         choice = out.get("choice")
+        if not isinstance(probs, dict) or choice not in criteria:
+            raise ValueError("invalid router choice")
+        for key, probability in probs.items():
+            if key not in criteria or isinstance(probability, bool):
+                raise ValueError("invalid router probability key")
+            number = float(probability)
+            if not math.isfinite(number) or not 0 <= number <= 1:
+                raise ValueError("invalid router probability")
+        probs = {key: float(value) for key, value in probs.items()}
         min_conf = float(os.getenv("ODYSSEUS_SPEC_ROUTER_MIN_CONF", "0.3"))
         second_min = float(os.getenv("ODYSSEUS_SPEC_ROUTER_SECOND", "0.25"))
         ranked = sorted(
@@ -172,11 +195,133 @@ def spec_route_tools(
                         answer_directly=round(float(probs.get("answer_directly", 0.0)), 3),
                         ask_user=round(float(probs.get("ask_user", 0.0)), 3))
     except Exception as exc:  # fail open
+        added = set(prior_tool_names(messages))
+        decided = False
         decision.update(error=str(exc)[:200], ms=round((time.time() - t0) * 1000, 1))
         logger.warning("spec router failed open: %s", exc)
-    LAST_DECISIONS.append(decision)
-    del LAST_DECISIONS[:-50]
     decision["decided"] = decided
+    _LAST_DECISION.set(decision)
+    logger.info("spec router: %s", {key: value for key, value in decision.items() if key != "message"})
+    return (added, decided) if return_decision else added
+
+
+_ORIGINAL_SPEC_ROUTE_TOOLS = spec_route_tools
+
+
+async def spec_route_tools_async(
+    user_message: str,
+    schemas: Iterable[Dict[str, Any]],
+    disabled_tools: Optional[Set[str]] = None,
+    messages: Optional[Iterable[Dict[str, Any]]] = None,
+    return_decision: bool = False,
+):
+    """Asynchronous non-blocking tool routing.
+
+    Preserves request-local ContextVar semantics, decision propagation,
+    cancellation behavior, timeout limits, and safe fallback on router failure.
+    """
+    if spec_route_tools is not _ORIGINAL_SPEC_ROUTE_TOOLS:
+        return spec_route_tools(
+            user_message,
+            schemas,
+            disabled_tools=disabled_tools,
+            messages=messages,
+            return_decision=return_decision,
+        )
+
+    added: Set[str] = set(prior_tool_names(messages))
+    decided = False
+    clear_decision()
+    url = os.getenv("ODYSSEUS_SPEC_ROUTER_URL", "").strip().rstrip("/")
+    if not url or not (user_message or "").strip():
+        return (added, False) if return_decision else added
+    t0 = time.time()
+    decision: Dict[str, Any] = {"ts": time.time(), "message": user_message[:160], "sticky": sorted(added)}
+    try:
+        disabled = set(disabled_tools or ())
+        lines: Dict[str, str] = {}
+        for s in schemas:
+            n = str(_fn(s).get("name") or "")
+            if n and n not in disabled and n != "ask_user" and n not in lines:
+                lines[n] = tool_line(s)
+        names = sorted(lines)
+        criteria = dict(_HEAD)
+        for i, n in enumerate(names, 1):
+            criteria[f"t{i}"] = lines[n]
+        req = {
+            "model": os.getenv("ODYSSEUS_SPEC_ROUTER_MODEL", "odysseus-s60"),
+            "state": {"agent": _AGENT, "conversation": _conversation(messages), "user_message": user_message},
+            "questions": {"tool": {"type": "choice", "instructions": _INSTRUCTIONS, "criteria": criteria}},
+        }
+        timeout = float(os.getenv("ODYSSEUS_SPEC_ROUTER_TIMEOUT", "0.5"))
+        deadline = time.time() + timeout
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            while True:
+                remaining = max(0.2, deadline - time.time())
+                try:
+                    resp = await client.post(
+                        url + "/v1/systemone",
+                        json=req,
+                        headers={"content-type": "application/json"},
+                        timeout=remaining,
+                    )
+                    if resp.status_code == 529:
+                        if time.time() + 0.15 >= deadline:
+                            resp.raise_for_status()
+                        decision["retries"] = decision.get("retries", 0) + 1
+                        await asyncio.sleep(0.1)
+                        continue
+                    resp.raise_for_status()
+                    out = resp.json()["answers"]["tool"]
+                    break
+                except httpx.HTTPStatusError as busy:
+                    if busy.response.status_code != 529 or time.time() + 0.15 >= deadline:
+                        raise
+                    decision["retries"] = decision.get("retries", 0) + 1
+                    await asyncio.sleep(0.1)
+        probs = out.get("probabilities") or {}
+        choice = out.get("choice")
+        if not isinstance(probs, dict) or choice not in criteria:
+            raise ValueError("invalid router choice")
+        for key, probability in probs.items():
+            if key not in criteria or isinstance(probability, bool):
+                raise ValueError("invalid router probability key")
+            number = float(probability)
+            if not math.isfinite(number) or not 0 <= number <= 1:
+                raise ValueError("invalid router probability")
+        probs = {key: float(value) for key, value in probs.items()}
+        min_conf = float(os.getenv("ODYSSEUS_SPEC_ROUTER_MIN_CONF", "0.3"))
+        second_min = float(os.getenv("ODYSSEUS_SPEC_ROUTER_SECOND", "0.25"))
+        ranked = sorted(
+            ((p, k) for k, p in probs.items() if k.startswith("t") and k[1:].isdigit()), reverse=True
+        )
+        picks: List[str] = []
+        if choice and choice.startswith("t") and choice[1:].isdigit() and float(probs.get(choice, 0.0)) >= min_conf:
+            picks.append(names[int(choice[1:]) - 1])
+            for p, k in ranked[:3]:
+                nm = names[int(k[1:]) - 1]
+                if nm not in picks and p >= second_min:
+                    picks.append(nm)
+        _bmode = os.getenv("ODYSSEUS_SPEC_BROWSER_FALLBACK", "0")
+        if _bmode != "0" and "private_browser" in picks:
+            picks = [n for n in picks if n != "private_browser"]
+            extra = list(_MCP_BROWSER_TOOLS) if _bmode == "mcp" else []
+            for n in extra + ["web_search", "web_fetch"]:
+                if n not in picks:
+                    picks.append(n)
+        added.update(picks)
+        decided = bool(picks) or (choice == "answer_directly" and float(probs.get("answer_directly", 0.0)) >= min_conf)
+        decision.update(choice=choice, tools=picks, ms=round((time.time() - t0) * 1000, 1),
+                        top=[(names[int(k[1:]) - 1], round(p, 3)) for p, k in ranked[:3]],
+                        answer_directly=round(float(probs.get("answer_directly", 0.0)), 3),
+                        ask_user=round(float(probs.get("ask_user", 0.0)), 3))
+    except Exception as exc:  # fail open
+        added = set(prior_tool_names(messages))
+        decided = False
+        decision.update(error=str(exc)[:200], ms=round((time.time() - t0) * 1000, 1))
+        logger.warning("spec router failed open: %s", exc)
+    decision["decided"] = decided
+    _LAST_DECISION.set(decision)
     logger.info("spec router: %s", {key: value for key, value in decision.items() if key != "message"})
     return (added, decided) if return_decision else added
 
@@ -328,9 +473,55 @@ def route_thinking(user_message: str) -> Optional[Dict[str, Any]]:
         out = {"think": p >= min_p, "p_think": round(p, 4), "ms": round((time.time() - t0) * 1000, 1)}
         if kind5:
             out["kind"] = ans.get("choice")
-        logger.info("spec think router: %s msg=%r", out, text[:120])
+        logger.info("spec think router: %s", out)
         return out
     except Exception as exc:  # fail open: the existing progressive-thinking rules still apply
+        logger.warning("spec think router failed (%s); falling back to rule-based thinking", exc)
+        return None
+
+
+_ORIGINAL_ROUTE_THINKING = route_thinking
+
+
+async def route_thinking_async(user_message: str) -> Optional[Dict[str, Any]]:
+    """Asynchronous non-blocking route_thinking."""
+    if route_thinking is not _ORIGINAL_ROUTE_THINKING:
+        return route_thinking(user_message)
+    if not think_router_enabled():
+        return None
+    url = os.getenv("ODYSSEUS_SPEC_ROUTER_URL", "").strip().rstrip("/")
+    text = (user_message or "").strip()
+    if not url or not text:
+        return None
+    kind5 = os.getenv("ODYSSEUS_SPEC_THINK_QUESTION", "binary").strip().lower() == "kind5"
+    question = _KIND5_QUESTION if kind5 else {"type": "choice", "instructions": _THINK_INSTRUCTIONS,
+                                              "criteria": {"think": _THINK_DEF, "direct": _DIRECT_DEF}}
+    req = {
+        "model": os.getenv("ODYSSEUS_SPEC_THINK_MODEL", os.getenv("ODYSSEUS_SPEC_ROUTER_MODEL", "odysseus-s60")),
+        "state": {"agent": _AGENT, "conversation": [], "user_message": text[:4000]},
+        "questions": {"thinking": question},
+    }
+    t0 = time.time()
+    try:
+        timeout = float(os.getenv("ODYSSEUS_SPEC_ROUTER_TIMEOUT", "3.0"))
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                url + "/v1/systemone",
+                json=req,
+                headers={"content-type": "application/json"},
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            ans = resp.json()["answers"]["thinking"]
+        probs = ans.get("probabilities") or {}
+        p = float(1.0 - probs.get("direct", 1.0)) if kind5 else float(probs.get("think", 0.0))
+        min_p = float(os.getenv("ODYSSEUS_SPEC_THINK_MIN_P", "0.5"))
+        out = {"think": p >= min_p, "p_think": round(p, 4), "ms": round((time.time() - t0) * 1000, 1)}
+        if kind5:
+            out["kind"] = ans.get("choice")
+        logger.info("spec think router: %s", out)
+        return out
+    except Exception as exc:
         logger.warning("spec think router failed (%s); falling back to rule-based thinking", exc)
         return None
 
@@ -389,7 +580,81 @@ def next_action(user_message: str, latest_result: str, schemas: Iterable[Dict[st
         ranked = sorted(((float(v), k) for k, v in probs.items() if k.startswith("t") and k[1:].isdigit()), reverse=True)
         action.update(p=round(float(probs.get(choice, 0.0)), 3), ms=round((time.time() - t0) * 1000, 1),
                       top=[(names[int(k[1:]) - 1], round(v, 3)) for v, k in ranked[:6]])
-        logger.info("spec next action: %s msg=%r", action, (user_message or "")[:80])
+        logger.info("spec next action: %s", action)
+        return action
+    except Exception as exc:
+        logger.warning("spec next action failed: %s", exc)
+        return None
+
+
+_ORIGINAL_NEXT_ACTION = next_action
+
+
+async def next_action_async(user_message: str, latest_result: str, schemas: Iterable[Dict[str, Any]],
+                            messages: Optional[Iterable[Dict[str, Any]]] = None,
+                            disabled_tools: Optional[Set[str]] = None) -> Optional[Dict[str, Any]]:
+    """Asynchronous non-blocking next_action."""
+    if next_action is not _ORIGINAL_NEXT_ACTION:
+        return next_action(user_message, latest_result, schemas, messages=messages, disabled_tools=disabled_tools)
+    url = os.getenv("ODYSSEUS_SPEC_ROUTER_URL", "").strip().rstrip("/")
+    if not url:
+        return None
+    t0 = time.time()
+    disabled = set(disabled_tools or ())
+    lines: Dict[str, str] = {}
+    for s in schemas:
+        n = str(_fn(s).get("name") or "")
+        if n and n not in disabled and n != "ask_user" and n not in lines:
+            lines[n] = tool_line(s)
+    names = sorted(lines)
+    criteria = dict(_HEAD)
+    for i, n in enumerate(names, 1):
+        criteria[f"t{i}"] = lines[n]
+    um = (user_message or "")[-3000:]
+    if latest_result:
+        um += "\n\nLatest tool result:\n" + latest_result[-1500:]
+    req = {
+        "model": os.getenv("ODYSSEUS_SPEC_ROUTER_MODEL", "odysseus-agentic-v4"),
+        "state": {"agent": _AGENT, "conversation": _conversation(messages), "user_message": um},
+        "questions": {"tool": {"type": "choice", "instructions": _INSTRUCTIONS, "criteria": criteria}},
+    }
+    try:
+        timeout = float(os.getenv("ODYSSEUS_SPEC_ROUTER_TIMEOUT", "3.0"))
+        deadline = time.time() + timeout
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            while True:
+                remaining = max(0.2, deadline - time.time())
+                try:
+                    resp = await client.post(
+                        url + "/v1/systemone",
+                        json=req,
+                        headers={"content-type": "application/json"},
+                        timeout=remaining,
+                    )
+                    if resp.status_code == 529:
+                        if time.time() + 0.15 >= deadline:
+                            resp.raise_for_status()
+                        await asyncio.sleep(0.1)
+                        continue
+                    resp.raise_for_status()
+                    out = resp.json()["answers"]["tool"]
+                    break
+                except httpx.HTTPStatusError as busy:
+                    if busy.response.status_code != 529 or time.time() + 0.15 >= deadline:
+                        raise
+                    await asyncio.sleep(0.1)
+        probs = out.get("probabilities") or {}
+        choice = str(out.get("choice") or "")
+        if choice.startswith("t") and choice[1:].isdigit():
+            action = {"kind": "tool", "name": names[int(choice[1:]) - 1]}
+        elif choice in ("answer_directly", "ask_user"):
+            action = {"kind": choice, "name": choice}
+        else:
+            return None
+        ranked = sorted(((float(v), k) for k, v in probs.items() if k.startswith("t") and k[1:].isdigit()), reverse=True)
+        action.update(p=round(float(probs.get(choice, 0.0)), 3), ms=round((time.time() - t0) * 1000, 1),
+                      top=[(names[int(k[1:]) - 1], round(v, 3)) for v, k in ranked[:6]])
+        logger.info("spec next action: %s", action)
         return action
     except Exception as exc:
         logger.warning("spec next action failed: %s", exc)

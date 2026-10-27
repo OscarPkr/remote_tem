@@ -31,10 +31,11 @@ def _contract(prompt=PROMPT):
 
 
 def _install_driver_router(monkeypatch, decision, picks=None):
-    """Fake src.spec_router exposing spec_route_tools + LAST_DECISIONS."""
+    """Fake the router's request-local decision."""
     fake = types.ModuleType('src.spec_router')
     fake.think_router_enabled = lambda: False
     fake.LAST_DECISIONS = [decision]
+    fake.latest_decision = lambda: fake.LAST_DECISIONS[-1]
 
     def _spec_route_tools(user_message, schemas, disabled_tools=None,
                           messages=None, return_decision=False):
@@ -168,130 +169,37 @@ def test_spec_driver_pick_shapes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_spec_driver_tool_pick_sends_only_that_tool(monkeypatch):
+@pytest.mark.parametrize('decision,picks', [
+    ({'choice': 't1', 'top': [('web_fetch', 0.9)]}, ['web_fetch']),
+    ({'choice': 'answer_directly', 'top': []}, []),
+    ({'choice': None, 'error': 'timeout'}, []),
+    ({'choice': 't1', 'top': [('manage_calendar', 0.9)]}, ['manage_calendar']),
+    ({'choice': 't1', 'top': [('totally_missing_tool', 0.9)]}, ['totally_missing_tool']),
+])
+async def test_spec_driver_refuses_before_router_model_or_tools(monkeypatch, decision, picks):
     monkeypatch.setenv('ODYSSEUS_SPEC_MODE', 'driver')
-    _install_driver_router(monkeypatch, {
-        'message': PROMPT, 'choice': 't1', 'tools': ['web_fetch'],
-        'top': [('web_fetch', 0.11)], 'answer_directly': 0.2, 'ask_user': 0.1,
-    }, picks=['web_fetch'])
-    captured = []
-    await _run(monkeypatch, captured)
-
-    assert captured, 'stream_preview made a provider round'
-    first = captured[0]
-    names = [(s.get('function') or {}).get('name') for s in (first.get('tools') or [])]
-    assert names == ['web_fetch']
-    assert first.get('tool_choice') == {
-        'type': 'function', 'function': {'name': 'web_fetch'}}
-
-
-@pytest.mark.asyncio
-async def test_spec_driver_answer_directly_omits_tools(monkeypatch):
-    monkeypatch.setenv('ODYSSEUS_SPEC_MODE', 'driver')
-    _install_driver_router(monkeypatch, {
-        'message': PROMPT, 'choice': 'answer_directly', 'tools': [],
-        'top': [('answer_directly', 0.35)], 'answer_directly': 0.35, 'ask_user': 0.05,
-    }, picks=[])
-    captured = []
-    await _run(monkeypatch, captured)
-
-    assert captured
-    assert 'tools' not in captured[0]  # vLLM rejects an empty array
-
-
-@pytest.mark.asyncio
-async def test_spec_driver_router_error_keeps_the_normal_menu(monkeypatch):
-    monkeypatch.setenv('ODYSSEUS_SPEC_MODE', 'driver')
-    _install_driver_router(monkeypatch, {
-        'message': PROMPT, 'choice': None, 'tools': [],
-        'top': [], 'answer_directly': 0.0, 'ask_user': 0.0, 'error': 'boom',
-    }, picks=[])
-    captured = []
-    contract, _events = await _run(monkeypatch, captured)
-
-    assert captured
-    sent = {(s.get('function') or {}).get('name')
-            for s in (captured[0].get('tools') or [])}
-    assert sent == set(contract.offered)  # unchanged normal menu
-    assert sent
-
-
-@pytest.mark.asyncio
-async def test_spec_driver_pick_uses_the_full_spec_surface(monkeypatch):
-    """m3518: Spec picks from the FULL surface (not the compact round menu) and
-    the pick is admitted/executable that round (sent as the single tool)."""
-    monkeypatch.setenv('ODYSSEUS_SPEC_MODE', 'driver')
-    _install_driver_router(monkeypatch, {
-        'message': PROMPT, 'choice': 't1', 'tools': ['manage_calendar'],
-        'top': [('manage_calendar', 0.9)], 'answer_directly': 0.05, 'ask_user': 0.05,
-    }, picks=['manage_calendar'])
-    captured = []
-    await _run(monkeypatch, captured)
-
-    assert captured
-    names = [(s.get('function') or {}).get('name')
-             for s in (captured[0].get('tools') or [])]
-    assert names == ['manage_calendar']
-
-
-@pytest.mark.asyncio
-async def test_spec_driver_pick_not_on_the_surface_keeps_the_normal_menu(monkeypatch):
-    """Only a pick that is truly not executable falls back for the round."""
-    monkeypatch.setenv('ODYSSEUS_SPEC_MODE', 'driver')
-    _install_driver_router(monkeypatch, {
-        'message': PROMPT, 'choice': 't1', 'tools': ['totally_missing_tool'],
-        'top': [('totally_missing_tool', 0.9)], 'answer_directly': 0.05, 'ask_user': 0.05,
-    }, picks=['totally_missing_tool'])
-    captured = []
-    contract, _events = await _run(monkeypatch, captured)
-
-    assert captured
-    sent = {(s.get('function') or {}).get('name')
-            for s in (captured[0].get('tools') or [])}
-    assert 'totally_missing_tool' not in sent
-    assert sent == set(contract.offered)  # normal menu retained
-
-
-@pytest.mark.asyncio
-async def test_spec_driver_drops_off_pick_native_call(monkeypatch):
-    """m3517: execute ONLY the Spec pick; drop any other native call."""
-    monkeypatch.setenv('ODYSSEUS_SPEC_MODE', 'driver')
-    _install_driver_router(monkeypatch, {
-        'message': PROMPT, 'choice': 't1', 'tools': ['web_fetch'],
-        'top': [('web_fetch', 0.7)], 'answer_directly': 0.1, 'ask_user': 0.1,
-    }, picks=['web_fetch'])
+    _install_driver_router(monkeypatch, decision, picks=picks)
+    router = sys.modules['src.spec_router']
+    router.spec_route_tools = lambda *a, **k: pytest.fail('driver called router')
     executed = _install_recorder(monkeypatch)
-    scripts = [
-        {'tool_calls': [
-            {'name': 'web_search', 'arguments': '{"query": "x"}'},
-            {'name': 'web_fetch', 'arguments': '{"url": "http://x"}'},
-        ]},
-        {'content': 'done'},
-    ]
     captured = []
-    await _run(monkeypatch, captured, scripts=scripts, max_rounds=2)
-
-    assert executed == ['web_fetch'], executed
-
-
-@pytest.mark.asyncio
-async def test_spec_driver_answer_directly_strips_markup_and_executes_nothing(monkeypatch):
-    monkeypatch.setenv('ODYSSEUS_SPEC_MODE', 'driver')
-    _install_driver_router(monkeypatch, {
-        'message': PROMPT, 'choice': 'answer_directly', 'tools': [],
-        'top': [('answer_directly', 0.9)], 'answer_directly': 0.9, 'ask_user': 0.05,
-    }, picks=[])
-    executed = _install_recorder(monkeypatch)
-    scripts = [{
-        'content': 'Hello <tool_call>{"name": "web_search", "arguments": {}}</tool_call> world',
-    }]
-    captured = []
-    _contract_, events = await _run(monkeypatch, captured, scripts=scripts)
-
+    _, events = await _run(monkeypatch, captured)
+    assert captured == []
     assert executed == []
-    finals = [e.get('content', '') for e in events if e.get('type') == 'final_response']
-    assert finals, events
-    assert 'Hello' in finals[-1] and '<tool_call' not in finals[-1]
+    assert any('unavailable' in event.get('delta', '') for event in events)
+
+
+@pytest.mark.asyncio
+async def test_driver_configuration_is_not_rechecked_mid_turn(monkeypatch):
+    calls = []
+    def active(*args):
+        calls.append(True)
+        return len(calls) > 1
+    monkeypatch.setattr(runner, 'spec_driver_active', active)
+    captured = []
+    await _run(monkeypatch, captured)
+    assert captured
+    assert len(calls) == 1
 
 
 def test_spec_driver_wired_in_stream_preview():
