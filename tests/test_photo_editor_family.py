@@ -322,12 +322,14 @@ def test_image_provider_respects_disabled_setting(monkeypatch):
     assert image_editing_provider_available(None) is False
 
 
-def _agent_client():
+def _agent_client(monkeypatch=None):
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
 
     import routes.editor_agent_routes as eaar
 
+    if monkeypatch is not None:
+        monkeypatch.setenv("AUTH_ENABLED", "false")
     app = FastAPI()
     app.include_router(eaar.setup_editor_agent_routes())
     return eaar, TestClient(app)
@@ -339,7 +341,7 @@ def _agent_client():
 )
 def test_editor_agent_blocks_generative_without_provider(monkeypatch, prompt):
     """No image provider -> zero canvas changes + a plain provider message."""
-    eaar, client = _agent_client()
+    eaar, client = _agent_client(monkeypatch)
     # Planner proposes an unrelated deterministic edit, as the buggy run did.
     eaar.set_editor_planner(
         lambda messages, owner: {"reply": "done", "steps": [
@@ -370,7 +372,7 @@ def test_editor_agent_blocks_generative_without_provider(monkeypatch, prompt):
 
 
 def test_editor_agent_prefers_ai_op_over_deterministic_when_provider_present(monkeypatch):
-    eaar, client = _agent_client()
+    eaar, client = _agent_client(monkeypatch)
     eaar.set_editor_planner(
         lambda messages, owner: {"reply": "done", "steps": [
             {"op": "selection.rectangle", "params": {}},

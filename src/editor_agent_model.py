@@ -341,12 +341,6 @@ async def self_check(
 
 def _candidates(owner: Optional[str], override: Optional[str]) -> List[Dict[str, Any]]:
     cands: List[Dict[str, Any]] = []
-    if override:
-        base, model = _split_override(override)
-        if model:
-            cands.append(
-                {"base": base or local_bases()[0], "model": model, "headers": None, "source": "override"}
-            )
     for base in local_bases():
         cands.append({"base": base, "model": local_model(), "headers": None, "source": "local"})
     try:
@@ -362,6 +356,17 @@ def _candidates(owner: Optional[str], override: Optional[str]) -> List[Dict[str,
                 break
     except Exception:
         pass
+    if override:
+        base, model = _split_override(override)
+        # A request may choose a configured endpoint, never introduce a URL.
+        # Prefer an exact model match (including hosted credentials) over the
+        # first local endpoint when a bare model id is supplied.
+        matching = [c for c in cands if not base or str(c["base"]).rstrip("/") == base.rstrip("/")]
+        selected = next((c for c in matching if c["model"] == model), None)
+        if selected is None and model and matching and matching[0]["source"] == "local":
+            selected = {**matching[0], "model": model}
+        if selected is not None:
+            cands.insert(0, {**selected, "source": "override"})
     return cands
 
 

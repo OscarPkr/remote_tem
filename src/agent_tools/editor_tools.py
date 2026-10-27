@@ -78,7 +78,16 @@ def _parse(content: Any) -> Dict[str, Any]:
 
 
 def _session(args: Dict[str, Any], ctx: Dict[str, Any]) -> str:
-    return str(args.get("session") or args.get("editor_session") or ctx.get("session_id") or "default")
+    # Explicit editor session bound in context is authoritative;
+    # otherwise fallback to caller/tool args, then default.
+    # Note: ctx.get("session_id") is the chat/turn UUID, NOT the editor canvas session.
+    return str(ctx.get("editor_session") or args.get("session") or args.get("editor_session") or "default")
+
+
+def _incognito(ctx: Dict[str, Any]) -> bool:
+    runtime = ctx.get("client_runtime_context")
+    state = runtime.get("web_ui_state") if isinstance(runtime, dict) else None
+    return ctx.get("incognito") is True or (isinstance(state, dict) and state.get("incognito") is True)
 
 
 async def _post(path: str, payload: Dict[str, Any], owner: Optional[str], timeout: float = _EDITOR_TIMEOUT) -> Dict[str, Any]:
@@ -107,17 +116,26 @@ def _data_url_bytes(data_url: str) -> bytes:
     return base64.b64decode(b64)
 
 
+def _image_reference_path(value: str) -> bool:
+    # Never use the internal tool credential to fetch an arbitrary app route.
+    generated = re.fullmatch(r"/api/generated-image/[a-f0-9]{8,64}\.(?:png|jpg|jpeg|webp|gif)", value)
+    upload = re.fullmatch(r"/api/upload/[a-fA-F0-9]{32}(?:\.[A-Za-z0-9]+)?", value)
+    return bool(generated or upload)
+
+
 def _persist_png(image_bytes: bytes, owner: Optional[str], session_id: Optional[str], prompt: str, model: str) -> Dict[str, Any]:
     """Save an edited/generated PNG and return {image_id, image_url, image_size}."""
     from core.database import GalleryImage, SessionLocal
     from src.constants import GENERATED_IMAGES_DIR
 
     db = SessionLocal()
+    image_path = None
     try:
         root = Path(GENERATED_IMAGES_DIR).resolve()
         root.mkdir(parents=True, exist_ok=True)
         filename = f"{uuid.uuid4().hex[:12]}.png"
-        (root / filename).write_bytes(image_bytes)
+        image_path = root / filename
+        image_path.write_bytes(image_bytes)
         new_id = str(uuid.uuid4())
         width = height = 0
         try:
@@ -163,6 +181,11 @@ def _persist_png(image_bytes: bytes, owner: Optional[str], session_id: Optional[
         return {"image_id": new_id, "image_url": f"/api/generated-image/{filename}", "image_size": size or None}
     except Exception:
         db.rollback()
+        if image_path is not None:
+            try:
+                image_path.unlink(missing_ok=True)
+            except OSError:
+                logger.warning("Failed to remove uncommitted editor image", exc_info=True)
         raise
     finally:
         db.close()
@@ -198,7 +221,7 @@ async def _place_layer(data_url: str, name: str, owner: Optional[str], session: 
     }
     try:
         data = await _post("/api/editor/bridge/command", payload, owner, timeout=90)
-        return data.get("ok") is not False
+        return bool(data.get("ok") is True and data.get("completed", True) is not False)
     except Exception as exc:  # pragma: no cover - defensive
         logger.warning("editor layer placement failed: %s", exc)
         return False
@@ -367,28 +390,46 @@ class RunEditorCommandTool:
         args = _parse(content)
         op = str(args.get("op") or "").strip()
         if not op:
-            return "run_editor_command: invalid", {"error": "run_editor_command needs `op`.", "exit_code": 1}
+            return "run_editor_command: invalid", {"error": "run_editor_command needs `op`.", "exit_code": 1, "completed": False}
         params = args.get("params") if isinstance(args.get("params"), dict) else {}
+        wait = bool(args.get("wait", True))
         payload = {
             "session": _session(args, ctx),
             "op": op,
             "params": params,
-            "wait": bool(args.get("wait", True)),
+            "wait": wait,
             "timeout": float(args.get("timeout") or 60),
         }
         try:
             data = await _post("/api/editor/bridge/command", payload, ctx.get("owner"))
         except Exception as exc:
-            return f"run_editor_command: {op}", {"error": f"run_editor_command failed: {exc}", "exit_code": 1}
-        ok = data.get("ok")
+            return f"run_editor_command: {op}", {"error": f"run_editor_command failed: {exc}", "exit_code": 1, "completed": False, "status": "failed"}
+
+        is_queued = bool(data.get("queued")) or data.get("status") == "queued"
+        if is_queued and (not wait or not data.get("ok")):
+            summary = json.dumps({"status": "queued", "queued": data.get("queued"), "session": data.get("session")}, ensure_ascii=False)
+            return f"run_editor_command: {op}", {
+                "output": summary,
+                "queued": data.get("queued"),
+                "status": "queued",
+                "pending": True,
+                "completed": False,
+                "ok": False,
+                "exit_code": 1,
+            }
+
+        ok = bool(data.get("ok") is True and data.get("completed", True) is not False)
+        status = data.get("status") or ("completed" if ok else "failed")
         result = data.get("result")
-        summary = json.dumps({"ok": ok, "error": data.get("error"), "result": result}, ensure_ascii=False)
+        summary = json.dumps({"ok": ok, "status": status, "error": data.get("error"), "result": result}, ensure_ascii=False)
         return f"run_editor_command: {op}", {
             "output": summary[:4000],
             "result": result,
             "screenshot": data.get("screenshot"),
+            "status": status,
+            "completed": ok,
             "ok": ok,
-            "exit_code": 0 if ok is not False else 1,
+            "exit_code": 0 if ok else 1,
         }
 
 
@@ -442,10 +483,14 @@ class AiEditImageTool:
         image = _as_data_url(args.get("image"))
         if image is None and isinstance(args.get("image"), str) and args["image"].startswith("/"):
             # A same-origin gallery/attachment URL: fetch it (owner-scoped) as bytes.
+            if not _image_reference_path(args["image"]):
+                return "ai_edit_image: invalid image", {"error": "Invalid image reference.", "exit_code": 1}
             try:
                 async with httpx.AsyncClient(timeout=60) as client:
                     resp = await client.get(f"{_INTERNAL_BASE}{args['image']}", headers=_internal_headers(owner))
                     resp.raise_for_status()
+                    if not resp.headers.get("content-type", "").lower().startswith("image/"):
+                        return "ai_edit_image: invalid image", {"error": "Image reference is not an image.", "exit_code": 1}
                     image = _as_data_url("data:image/png;base64," + base64.b64encode(resp.content).decode())
             except Exception:
                 image = None
@@ -550,10 +595,13 @@ class AiEditImageTool:
             "model": data.get("model") or model_choice or "",
             "exit_code": 0,
         }
-        try:
-            info.update(_persist_png(_data_url_bytes(data_url), owner, ctx.get("session_id"), f"ai_edit_image:{op}", f"ai_edit_image:{op}"))
-        except Exception as exc:
-            logger.warning("ai_edit_image persist failed: %s", exc)
+        if _incognito(ctx):
+            info["image_url"] = data_url
+        else:
+            try:
+                info.update(_persist_png(_data_url_bytes(data_url), owner, ctx.get("session_id"), f"ai_edit_image:{op}", f"ai_edit_image:{op}"))
+            except Exception as exc:
+                logger.warning("ai_edit_image persist failed: %s", exc)
         _t["persist"] = time.perf_counter()
         if bool(args.get("place", True)):
             placed = await _place_layer(
@@ -626,10 +674,13 @@ class GenerateImageLayerTool:
             "model": data.get("image_model") or str(args.get("model") or ""),
             "exit_code": 0,
         }
-        try:
-            info.update(_persist_png(_data_url_bytes(data_url), owner, ctx.get("session_id"), prompt, "generate_image"))
-        except Exception as exc:
-            logger.warning("generate_image persist failed: %s", exc)
+        if _incognito(ctx):
+            info["image_url"] = data_url
+        else:
+            try:
+                info.update(_persist_png(_data_url_bytes(data_url), owner, ctx.get("session_id"), prompt, "generate_image"))
+            except Exception as exc:
+                logger.warning("generate_image persist failed: %s", exc)
         if bool(args.get("place", True)):
             placed = await _place_layer(
                 data_url,

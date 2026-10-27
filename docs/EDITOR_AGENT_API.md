@@ -119,19 +119,26 @@ Enabled automatically when the editor opens (`window.__geEditorBridge`).
 - The page runs the op via the control API and replies:
   `POST /api/editor/bridge/result {id,ok,result,error,screenshot,ms}`.
 - Enqueue a command (server side): `POST /api/editor/bridge/command {session, op|steps, wait, timeout}`.
-  With `wait:true` the call blocks and returns the editor's result.
+  With `wait:true` and one step the call blocks and returns the editor's result.
+  Otherwise use `POST /api/editor/bridge/await {id, timeout}` for each queued id.
+  Timeouts are seconds, greater than zero and at most 900. Pending results expire
+  after the command timeout; an unknown or another owner's id returns 404.
 
 Round-trip example (authenticated; `<session>` = `window.__geEditorBridge.session`):
 
 ```bash
 curl -s -X POST http://127.0.0.1:7011/api/editor/bridge/command \
   -H 'Content-Type: application/json' -b "odysseus_session=$TOKEN" \
-  -d '{"session":"default","op":"layers.addRaster","wait":true,"timeout":8000}'
+  -d '{"session":"default","op":"layers.addRaster","wait":true,"timeout":8}'
 # -> {"id":"...","ok":true,"result":{...},"screenshot":"data:image/png;base64,..."}
 ```
 
-Session scoping is `owner:session`, so an agent can only drive editors owned by the
-same user. The bridge is a **browser-only** flow: it requires an editor page to be open.
+Session scoping uses the authenticated owner and session as separate values. A
+bound editor-tool turn uses its server-owned session, not a model-selected one.
+The bridge is a **browser-only** flow: it requires an editor page to be open.
+For `/api/editor/agent`, clients must send `incognito: true` for private image
+results; omitted or false requests use normal gallery persistence. These
+owner-scoped routes do not accept delegated API tokens without a scope contract.
 
 ---
 

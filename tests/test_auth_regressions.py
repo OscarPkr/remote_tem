@@ -83,6 +83,7 @@ def _auth_regressions_stubs(monkeypatch):
         build_chat_url=MagicMock(),
         build_models_url=MagicMock(),
         build_headers=MagicMock(),
+        resolve_owner_registered_endpoint_url=MagicMock(),
     )
     # _ensure_stub now registers each stub through monkeypatch itself, so the
     # whole set is undone at teardown. Re-setting them here would capture the

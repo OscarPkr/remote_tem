@@ -15,7 +15,9 @@ from routes import editor_agent_routes as eaar
 
 
 @pytest.fixture(autouse=True)
-def _reset_planner():
+def _reset_planner(monkeypatch):
+    # Minimal router fixtures have no authentication middleware.
+    monkeypatch.setenv("AUTH_ENABLED", "false")
     eaar.set_editor_planner(None)
     yield
     eaar.set_editor_planner(None)
@@ -25,7 +27,8 @@ def _reset_planner():
 def client():
     app = FastAPI()
     app.include_router(eaar.setup_editor_agent_routes())
-    return TestClient(app)
+    with TestClient(app) as client:
+        yield client
 
 
 def test_plan_uses_injected_planner_and_parses_steps(client):
@@ -159,6 +162,22 @@ def test_bridge_command_accepts_selection_export_mask(client):
         json={"session": "s", "op": "selection.exportMask", "wait": False},
     ).json()
     assert ok["queued"], ok
+
+
+@pytest.mark.parametrize("path", ["/api/editor/plan", "/api/editor/agent", "/api/editor/bridge/command",
+                                "/api/editor/bridge/result", "/api/editor/bridge/await", "/api/editor/self-check"])
+def test_editor_routes_reject_non_object_json(client, path):
+    assert client.post(path, json=[]).status_code == 400
+
+
+@pytest.mark.parametrize("path", ["/api/editor/plan", "/api/editor/agent"])
+def test_editor_routes_bound_prompt_before_planning(client, path):
+    assert client.post(path, json={"prompt": "x" * 4097}).status_code == 413
+
+
+@pytest.mark.parametrize("value", ["abc", "NaN", "Infinity", -1, 901])
+def test_bridge_rejects_invalid_timeout(client, value):
+    assert client.post("/api/editor/bridge/command", json={"op": "screenshot", "timeout": value}).status_code == 400
 
 
 def test_set_editor_planner_is_used_by_setup_when_set():
@@ -838,6 +857,225 @@ def test_bridge_roundtrip_subscribe_command_result():
     asyncio.run(scenario())
 
 
+def test_bridge_rejects_result_from_other_owner(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from httpx import ASGITransport, AsyncClient
+
+    monkeypatch.setattr(eaar, "_user", lambda request: request.headers.get("x-test-owner"))
+    monkeypatch.setattr(eaar.editor_agent_model, "startup_probe", lambda: None)
+    monkeypatch.setattr(eaar.uuid, "uuid4", lambda: SimpleNamespace(hex="known-command-id"))
+    app = FastAPI()
+    app.include_router(eaar.setup_editor_agent_routes())
+
+    async def scenario():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            pending = asyncio.create_task(client.post(
+                "/api/editor/bridge/command", headers={"x-test-owner": "alice"},
+                json={"session": "s", "op": "screenshot", "wait": True, "timeout": 2},
+            ))
+            await asyncio.sleep(0.05)
+            payload = {"id": "known-command-id", "ok": True, "result": {"value": "legitimate"}}
+            denied = await client.post("/api/editor/bridge/result", headers={"x-test-owner": "bob"}, json=payload)
+            assert denied.status_code == 404
+            denied_await = await client.post("/api/editor/bridge/await", headers={"x-test-owner": "bob"}, json=payload)
+            assert denied_await.status_code == 404
+            accepted = await client.post("/api/editor/bridge/result", headers={"x-test-owner": "alice"}, json=payload)
+            assert accepted.status_code == 200
+            assert (await pending).json()["result"] == {"value": "legitimate"}
+
+    asyncio.run(scenario())
+
+
+def test_bridge_session_keys_do_not_collide_on_colons(monkeypatch):
+    import asyncio
+
+    monkeypatch.setattr(eaar, "_user", lambda request: request.headers.get("x-owner"))
+    monkeypatch.setattr(eaar.editor_agent_model, "startup_probe", lambda: None)
+    app = FastAPI()
+    app.include_router(eaar.setup_editor_agent_routes())
+
+    async def scenario():
+        received = []
+        stop = asyncio.Event()
+
+        async def receive():
+            await stop.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            if message["type"] == "http.response.body":
+                received.append(message.get("body", b""))
+
+        subscriber = asyncio.create_task(app({
+            "type": "http", "method": "GET", "path": "/api/editor/bridge/events",
+            "query_string": b"session=b%3Ac", "headers": [(b"x-owner", b"a")],
+        }, receive, send))
+        for _ in range(100):
+            if any(b"connected" in item for item in received):
+                break
+            await asyncio.sleep(0.01)
+        from httpx import ASGITransport, AsyncClient
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            await client.post("/api/editor/bridge/command", headers={"x-owner": "a:b"},
+                              json={"session": "c", "op": "screenshot"})
+            await asyncio.sleep(0.05)
+            assert not any(b"data:" in item for item in received)
+            await client.post("/api/editor/bridge/command", headers={"x-owner": "a"},
+                              json={"session": "b:c", "op": "document.info"})
+            for _ in range(100):
+                if any(b"document.info" in item for item in received):
+                    break
+                await asyncio.sleep(0.01)
+            assert any(b"document.info" in item for item in received)
+        stop.set()
+        await asyncio.wait_for(subscriber, 2)
+
+    asyncio.run(scenario())
+
+
+def test_bridge_no_wait_result_can_be_awaited_after_it_arrives(client):
+    queued = client.post("/api/editor/bridge/command", json={
+        "session": "s", "op": "document.info", "wait": False,
+    }).json()
+    command_id = queued["queued"][0]
+    client.post("/api/editor/bridge/result", json={"id": command_id, "ok": True, "result": {"width": 10}})
+    result = client.post("/api/editor/bridge/await", json={"id": command_id, "timeout": 0.01}).json()
+    assert result.get("result") == {"width": 10}
+
+
+def test_bridge_multiple_results_remain_independent(client):
+    queued = client.post("/api/editor/bridge/command", json={
+        "session": "s", "steps": [{"op": "document.info"}, {"op": "screenshot"}], "wait": True,
+    }).json()["queued"]
+    assert len(queued) == 2
+    for command_id, value in zip(reversed(queued), (2, 1)):
+        client.post("/api/editor/bridge/result", json={"id": command_id, "ok": True, "result": {"value": value}})
+    for command_id, value in zip(queued, (1, 2)):
+        result = client.post("/api/editor/bridge/await", json={"id": command_id, "timeout": 0.1}).json()
+        assert result["result"] == {"value": value}
+
+
+def test_timed_out_bridge_command_is_not_replayed():
+    import asyncio
+    from httpx import ASGITransport, AsyncClient
+    app = _bridge_app()
+
+    async def scenario():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post("/api/editor/bridge/command", json={
+                "session": "late", "op": "text.add", "wait": True, "timeout": 0.01,
+            })
+            assert response.json()["error"] == "timeout"
+            received = []
+            stop = asyncio.Event()
+
+            async def receive():
+                await stop.wait()
+                return {"type": "http.disconnect"}
+
+            async def send(message):
+                if message["type"] == "http.response.body":
+                    received.append(message.get("body", b""))
+
+            subscriber = asyncio.create_task(app({"type": "http", "method": "GET",
+                "path": "/api/editor/bridge/events", "query_string": b"session=late", "headers": []}, receive, send))
+            await asyncio.sleep(0.05)
+            await client.post("/api/editor/bridge/command", json={"session": "late", "op": "document.info"})
+            await asyncio.sleep(0.05)
+            assert any(b"document.info" in item for item in received)
+            assert not any(b"text.add" in item for item in received)
+            stop.set()
+            await asyncio.wait_for(subscriber, 2)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_bridge_command_is_not_pending(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from httpx import ASGITransport, AsyncClient
+
+    monkeypatch.setattr(eaar.uuid, "uuid4", lambda: SimpleNamespace(hex="cancelled-id"))
+    app = _bridge_app()
+
+    async def scenario():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            task = asyncio.create_task(client.post("/api/editor/bridge/command", json={
+                "session": "late", "op": "text.add", "wait": True, "timeout": 2,
+            }))
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            result = await client.post("/api/editor/bridge/result", json={"id": "cancelled-id", "ok": True})
+            assert result.json() == {"ok": True}
+
+    asyncio.run(scenario())
+
+
+def test_editor_agent_denies_image_generation_without_privilege(monkeypatch):
+    class Auth:
+        is_configured = True
+
+        def get_privileges(self, user):
+            return {"can_generate_images": False}
+
+    app = FastAPI()
+    app.state.auth_manager = Auth()
+
+    @app.middleware("http")
+    async def identity(request, call_next):
+        request.state.current_user = "alice"
+        return await call_next(request)
+
+    app.include_router(eaar.setup_editor_agent_routes())
+    eaar.set_editor_planner(lambda messages, owner: {
+        "reply": "generate", "steps": [{"op": "generate_image", "params": {"prompt": "a tree"}}]
+    })
+    monkeypatch.setattr(eaar, "_image_provider_available", lambda owner: True)
+    with TestClient(app) as client:
+        response = client.post("/api/editor/agent", json={"prompt": "generate an image of a tree"})
+    assert response.status_code == 403
+
+
+def test_editor_owner_routes_reject_delegated_token():
+    app = FastAPI()
+
+    @app.middleware("http")
+    async def identity(request, call_next):
+        request.state.current_user = "api"
+        request.state.api_token = True
+        request.state.api_token_owner = "alice"
+        return await call_next(request)
+
+    app.include_router(eaar.setup_editor_agent_routes())
+    with TestClient(app) as client:
+        for path in ("/api/editor/plan", "/api/editor/bridge/command", "/api/editor/agent"):
+            assert client.post(path, json={"prompt": "hello"}).status_code == 403
+
+
+def test_editor_tool_session_uses_bound_turn_not_model_arguments():
+    from src.agent_tools.editor_tools import _session
+    args = {"session": "other-editor", "editor_session": "also-other"}
+    # Explicit editor_session bound in ctx takes precedence over args
+    assert _session(args, {"editor_session": "authorized-editor"}) == "authorized-editor"
+    # When no explicit editor_session is bound, tool/caller argument is used (chat turns have chat session_id)
+    assert _session(args, {"session_id": "chat-uuid"}) == "other-editor"
+    assert _session({}, {}) == "default"
+
+
+def test_editor_agent_honors_disabled_image_tool_before_dispatch(client, monkeypatch):
+    import src.settings as settings
+    from src.agent_tools import editor_tools
+
+    monkeypatch.setattr(settings, "get_setting", lambda name, default=None: ["ai_edit_image"] if name == "disabled_tools" else default)
+    monkeypatch.setattr(eaar, "_image_provider_available", lambda owner: True)
+    monkeypatch.setattr(editor_tools.AiEditImageTool, "execute", lambda *args: pytest.fail("disabled tool ran"))
+    eaar.set_editor_planner(lambda messages, owner: {"steps": [{"op": "ai_edit_image", "params": {"op": "denoise"}}]})
+    assert client.post("/api/editor/agent", json={"prompt": "do this"}).status_code == 403
+
+
 def test_bridge_broadcasts_to_every_subscriber():
     """URGENT regression: with two live subscribers on the same session (EventSource
     reconnects overlap), a command must reach BOTH, never be eaten by one."""
@@ -943,6 +1181,129 @@ def test_ai_edit_image_tool_forwards_and_reports_model(monkeypatch):
     assert res.get("model") == "qwen-image-edit-2511", res
 
 
+def test_ai_editor_tool_incognito_does_not_persist(monkeypatch):
+    import asyncio
+    import base64
+    import io
+    from PIL import Image
+    import src.agent_tools.editor_tools as et
+
+    buf = io.BytesIO()
+    Image.new("RGB", (32, 32), (10, 20, 30)).save(buf, "PNG")
+    image = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    saved = []
+
+    async def fake_post(*args, **kwargs):
+        return {"image": image}
+
+    monkeypatch.setattr(et, "_post", fake_post)
+    monkeypatch.setattr(et, "_persist_png", lambda *args: saved.append(args) or {})
+    _, result = asyncio.run(et.AiEditImageTool().execute(
+        {"op": "denoise", "image": image, "place": False},
+        {"owner": "u", "client_runtime_context": {"web_ui_state": {"incognito": True}}},
+    ))
+    assert result["exit_code"] == 0
+    assert not saved
+    assert result["image_url"] == image
+
+
+def test_ai_editor_tool_rejects_unrelated_internal_url(monkeypatch):
+    import asyncio
+    import src.agent_tools.editor_tools as et
+
+    class NeverFetch:
+        def __init__(self, *args, **kwargs):
+            pytest.fail("unrelated internal route must not be fetched")
+
+    monkeypatch.setattr(et.httpx, "AsyncClient", NeverFetch)
+    _, result = asyncio.run(et.AiEditImageTool().execute(
+        {"op": "denoise", "image": "/api/email/messages?folder=INBOX", "place": False},
+        {"owner": "alice", "session_id": "authorized"},
+    ))
+    assert result["exit_code"] == 1
+
+
+def test_ai_editor_tool_accepts_owned_generated_image_reference(monkeypatch):
+    import asyncio
+    import base64
+    import io
+    from PIL import Image
+    import src.agent_tools.editor_tools as et
+
+    buf = io.BytesIO()
+    Image.new("RGB", (16, 16), (10, 20, 30)).save(buf, "PNG")
+    image = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    seen = []
+
+    class Client:
+        def __init__(self, *args, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get(self, url, **kwargs):
+            seen.append(url)
+            return __import__('httpx').Response(200, content=buf.getvalue(),
+                headers={"content-type": "image/png"}, request=__import__('httpx').Request('GET', url))
+
+    async def fake_post(*args, **kwargs): return {"image": image}
+    monkeypatch.setattr(et.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(et, "_post", fake_post)
+    _, result = asyncio.run(et.AiEditImageTool().execute(
+        {"op": "denoise", "image": "/api/generated-image/abcdef123456.png", "place": False},
+        {"owner": "alice", "session_id": "authorized", "incognito": True},
+    ))
+    assert result["exit_code"] == 0
+    assert seen and seen[0].endswith('/api/generated-image/abcdef123456.png')
+
+
+def test_generate_editor_tool_incognito_does_not_persist(monkeypatch):
+    import asyncio
+    import src.agent_tools.editor_tools as et
+    import src.ai_interaction as ai
+
+    image = "data:image/png;base64,YWJj"
+    saved = []
+
+    async def fake_generate(*args, **kwargs):
+        assert kwargs["incognito"] is True
+        return {"image_url": image}
+
+    monkeypatch.setattr(et, "_provider_available", lambda owner: True)
+    monkeypatch.setattr(et, "_persist_png", lambda *args: saved.append(args) or {})
+    monkeypatch.setattr(ai, "do_generate_image", fake_generate)
+    _, result = asyncio.run(et.GenerateImageLayerTool().execute(
+        json.dumps({"prompt": "a tree", "place": False}),
+        {"owner": "u", "incognito": True},
+    ))
+    assert result["exit_code"] == 0
+    assert not saved
+    assert result["image_url"] == image
+
+
+def test_editor_image_is_removed_if_gallery_commit_fails(monkeypatch, tmp_path):
+    import core.database as db_module
+    import src.constants as constants
+    import src.agent_tools.editor_tools as et
+
+    class FailingSession:
+        def add(self, row):
+            pass
+
+        def commit(self):
+            raise RuntimeError("commit failed")
+
+        def rollback(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(db_module, "SessionLocal", FailingSession)
+    monkeypatch.setattr(constants, "GENERATED_IMAGES_DIR", str(tmp_path))
+    with pytest.raises(RuntimeError, match="commit failed"):
+        et._persist_png(b"test image", "alice", None, "test", "test")
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_agent_path_injects_selected_model_into_ai_step(client, monkeypatch):
     """The /api/editor/agent body `model` reaches the AI step tool payload."""
     monkeypatch.setattr(eaar, "_image_provider_available", lambda owner: True)
@@ -971,6 +1332,32 @@ def test_agent_path_injects_selected_model_into_ai_step(client, monkeypatch):
     assert captured.get("content", {}).get("model") == "qwen-image-edit-2511", captured
     data = r.json()
     assert data["results"][-1]["result"].get("model") == "qwen-image-edit-2511", data
+
+
+def test_agent_request_controls_session_model_and_screenshot(client, monkeypatch):
+    from src.agent_tools import editor_tools
+    captured = {}
+
+    class Capture:
+        async def execute(self, content, ctx):
+            captured.update(json.loads(content))
+            return "ai_edit_image", {"exit_code": 1, "error": "stopped"}
+
+    monkeypatch.setattr(editor_tools, "AiEditImageTool", Capture)
+    monkeypatch.setattr(eaar, "_image_provider_available", lambda owner: True)
+    eaar.set_editor_planner(lambda messages, owner: {"steps": [{"op": "ai_edit_image", "params": {
+        "op": "generative", "session": "other", "model": "other", "image": "other"
+    }}]})
+    response = client.post("/api/editor/agent", json={"prompt": "do this", "session": "current",
+        "model": "chosen", "screenshot": "data:image/png;base64,AAAA"})
+    assert response.status_code == 200
+    assert captured["session"] == "current"
+    assert captured["model"] == "chosen"
+    assert captured["image"] == "data:image/png;base64,AAAA"
+    captured.clear()
+    response = client.post("/api/editor/agent", json={"prompt": "do this", "session": "current"})
+    assert response.status_code == 200
+    assert "image" not in captured
 
 
 # ---------------------------------------------------------------------------
@@ -1043,8 +1430,8 @@ def test_editor_agent_model_override_is_first_candidate(monkeypatch):
 
     monkeypatch.setattr(eam, "local_bases", lambda: ["http://local1"])
     monkeypatch.setattr(eam, "local_model", lambda: "LMODEL")
-    cands = eam._candidates(None, "http://ovr::OVERRIDE")
-    assert cands[0] == {"base": "http://ovr", "model": "OVERRIDE", "headers": None,
+    cands = eam._candidates(None, "http://local1::OVERRIDE")
+    assert cands[0] == {"base": "http://local1", "model": "OVERRIDE", "headers": None,
                         "source": "override"}
     assert any(c["source"] == "local" and c["base"] == "http://local1" for c in cands)
 
@@ -1492,3 +1879,110 @@ def test_editor_agent_plan_response_format_only_sent_to_local(monkeypatch):
     assert calls and calls[0][0] == "http://100.69.120.65:8097/v1"
     assert calls[0][1] is fmt
     assert all(base != "https://api.deepseek.com/v1" for base, _ in calls)
+
+
+def test_run_editor_command_queued_never_reports_success(monkeypatch):
+    import asyncio
+    from src.agent_tools import editor_tools
+
+    async def fake_post(path, payload, owner, timeout=60):
+        return {"queued": ["cmd-123"], "session": "anon:default", "status": "queued", "completed": False, "ok": False}
+
+    monkeypatch.setattr(editor_tools, "_post", fake_post)
+    tool = editor_tools.RunEditorCommandTool()
+    label, result = asyncio.run(tool.execute(json.dumps({"op": "document.info", "wait": False}), {}))
+
+    assert result["status"] == "queued"
+    assert result["completed"] is False
+    assert result["ok"] is False
+    assert result["exit_code"] == 1
+    assert result["pending"] is True
+
+
+def test_run_editor_command_completed_reports_success(monkeypatch):
+    import asyncio
+    from src.agent_tools import editor_tools
+
+    async def fake_post(path, payload, owner, timeout=60):
+        return {"ok": True, "status": "completed", "completed": True, "result": {"info": "ok"}}
+
+    monkeypatch.setattr(editor_tools, "_post", fake_post)
+    tool = editor_tools.RunEditorCommandTool()
+    label, result = asyncio.run(tool.execute(json.dumps({"op": "document.info", "wait": True}), {}))
+
+    assert result["status"] == "completed"
+    assert result["completed"] is True
+    assert result["ok"] is True
+    assert result["exit_code"] == 0
+    assert result["result"] == {"info": "ok"}
+
+
+def test_place_layer_reports_false_on_queued_response(monkeypatch):
+    import asyncio
+    from src.agent_tools import editor_tools
+
+    async def fake_post(path, payload, owner, timeout=90):
+        return {"queued": ["place-123"], "session": "anon:default", "status": "queued", "completed": False, "ok": False}
+
+    monkeypatch.setattr(editor_tools, "_post", fake_post)
+    placed = asyncio.run(editor_tools._place_layer("data:image/png;base64,abc", "layer1", "owner", "default"))
+    assert placed is False
+
+
+def test_bridge_await_cancellation_handled_cleanly():
+    import asyncio
+    from httpx import ASGITransport, AsyncClient
+    app = _bridge_app()
+
+    async def scenario():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            cmd_resp = await c.post("/api/editor/bridge/command", json={"session": "cancel-sess", "op": "document.info", "wait": False})
+            cid = cmd_resp.json()["queued"][0]
+
+            await_task = asyncio.create_task(c.post("/api/editor/bridge/await", json={"id": cid, "timeout": 30}))
+            await asyncio.sleep(0.05)
+            await_task.cancel()
+            try:
+                await await_task
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+
+def test_unauthenticated_editor_routes_fail_closed_when_auth_configured(client, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv("AUTH_ENABLED", "true")
+    client.app.state.auth_manager = SimpleNamespace(is_configured=True)
+    r = client.post("/api/editor/bridge/command", json={"op": "document.info"})
+    assert r.status_code == 401
+
+
+def test_auth_disabled_mode_allows_single_user_access(client, monkeypatch):
+    import src.auth_helpers as auth_helpers
+    monkeypatch.setattr(auth_helpers, "_auth_disabled", lambda: True)
+    r = client.post("/api/editor/bridge/command", json={"op": "document.info", "wait": False})
+    assert r.status_code == 200
+
+
+def test_editor_models_redact_base_url_for_non_admins(client, monkeypatch):
+    import core.middleware as core_middleware
+    from fastapi import HTTPException
+
+    def fake_require_admin(request):
+        raise HTTPException(403, "Admin required")
+
+    monkeypatch.setattr(core_middleware, "require_admin", fake_require_admin)
+
+    r_agent = client.get("/api/editor/agent-models")
+    assert r_agent.status_code == 200
+    agent_data = r_agent.json()
+    assert agent_data.get("probe") == {}
+    for m in agent_data.get("models", []):
+        assert "base_url" not in m
+
+    r_img = client.get("/api/editor/image-models")
+    assert r_img.status_code == 200
+    img_data = r_img.json()
+    for m in img_data.get("models", []):
+        assert "base_url" not in m

@@ -81,3 +81,11 @@ def test_unconfigured_editor_helpers_do_not_probe_private_hosts(monkeypatch):
     assert asyncio.run(eam.caption_image("data:image/png;base64,AAAA")) is None
     result = asyncio.run(eam.self_check("data:image/png;base64,AAAA", "data:image/png;base64,BBBB", "brighter"))
     assert result["reason"] == "unavailable"
+
+
+def test_unconfigured_or_untrusted_override_never_becomes_endpoint(monkeypatch):
+    monkeypatch.setattr(eam, "local_bases", lambda: [])
+    import src.endpoint_resolver as resolver
+    monkeypatch.setattr(resolver, "resolve_endpoint", lambda *a, **k: (None, None, None))
+    assert eam._candidates("alice", "chosen-model") == []
+    assert eam._candidates("alice", "http://169.254.169.254::model") == []

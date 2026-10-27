@@ -119,12 +119,6 @@ def execute_fixture_email(tool: str, args: dict[str, Any], owner: str | None = N
 
     bare = tool.removeprefix("mcp__email__")
     if bare == "list_email_accounts":
-        accounts = {}
-        for index, message in enumerate(messages):
-            row = _row(index, message)
-            identity = (row["account_id"], row["account"], row["account_email"])
-            accounts.setdefault(identity, {"id": row["account_id"], "name": row["account"],
-                                            "email": row["account_email"], "default": not accounts})
         return {
             "accounts": [{"id": "fixture", "name": "Fixture mailbox", "default": True}],
             "output": "Fixture mailbox (default)",

@@ -486,11 +486,11 @@ _RECOLOR_EXCLUDE_RE = re.compile(
 )
 
 
-_RECOLOR_TRAILING_ADJ = re.compile(
-    r"\s+\b(?:bright|brighter|vivid|vibrant|dark|darker|light|lighter|deep|"
-    r"pale|more|less|very|really|slightly|totally|completely)\b\s*$",
-    re.I,
-)
+_RECOLOR_TRAILING_ADJECTIVES = frozenset({
+    "bright", "brighter", "vivid", "vibrant", "dark", "darker", "light",
+    "lighter", "deep", "pale", "more", "less", "very", "really",
+    "slightly", "totally", "completely",
+})
 
 
 def _hex_rgb01(hex_color: str):
@@ -557,9 +557,9 @@ def _recolor_object_phrase(prompt: str, target_word: str) -> str:
         words.pop(0)
     if len(words) > 1 and words[-1].casefold() in {"to", "into"}:
         words.pop()
+    while len(words) > 1 and words[-1].lower() in _RECOLOR_TRAILING_ADJECTIVES:
+        words.pop()
     phrase = " ".join(words)
-    while phrase and _RECOLOR_TRAILING_ADJ.search(phrase):
-        phrase = _RECOLOR_TRAILING_ADJ.sub("", phrase).strip()
     return phrase or "the subject"
 
 
