@@ -27,7 +27,8 @@ def _reset_planner(monkeypatch):
 def client():
     app = FastAPI()
     app.include_router(eaar.setup_editor_agent_routes())
-    return TestClient(app)
+    with TestClient(app) as client:
+        yield client
 
 
 def test_plan_uses_injected_planner_and_parses_steps(client):
