@@ -2997,6 +2997,18 @@ def _natural_safe_inventory_operation(message: str, maximum: int | None = None) 
     return RequiredReadOperation(tool, {"action": action} if action else {}, maximum)
 
 
+def note_read_intent(user_text: str) -> tuple[str, bool]:
+    """Return a quoted mention query and whether the note body is needed."""
+    text = str(user_text or "")
+    mention = re.search(r"\bmentions?\s+(['\"])([^'\"]{1,120})\1", text, re.I)
+    query = mention.group(2).strip() if mention else ""
+    needs_body = bool(
+        re.search(r"\b(?:summari[sz]e|summary|main\s+topics)\b", text, re.I)
+        or re.search(r"\b(?:show|open|read|view)\b.{0,80}\b(?:first|newest|most\s+recent)\s+note\b", text, re.I)
+    )
+    return query, needs_body
+
+
 def required_read_operation_for_request(message: str, history: Iterable = ()) -> RequiredReadOperation | None:
     """Resolve complete list/read requests, or repeat an exact prior read.
 
