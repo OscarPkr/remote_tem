@@ -47,9 +47,8 @@ DEFAULT_SETTINGS = {
     "image_gen_enabled": False,
     "image_model": "",
     "image_quality": "medium",
-    # Local editor-agent/planner model (Quick Edit NL planner). When empty the
-    # server auto-detects the local Qwen3.5-9B vision server on seneca and falls
-    # back to the hosted chat model. See src/editor_agent_model.py.
+    # Optional editor planner/caption endpoints. Empty uses configured chat
+    # fallback without probing a developer-specific host.
     "editor_agent_base_url": "",
     "editor_agent_model": "",
     "editor_caption_base_url": "",

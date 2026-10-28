@@ -8635,6 +8635,13 @@ body.ge-editor-open .toast.toast-transform-hint {
     position: relative;
     align-items: stretch;
   }
+  .ge-toolbar-wrap.ge-flyout-open {
+    z-index: 250;
+  }
+  .ge-toolbar.ge-flyout-open .ge-toolbar-scroll {
+    -webkit-mask-image: none !important;
+    mask-image: none !important;
+  }
   .ge-toolbar-wrap > .ge-toolbar { flex: 1 1 auto; min-width: 0; }
   .ge-tool-more {
     display: none;

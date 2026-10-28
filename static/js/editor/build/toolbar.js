@@ -109,6 +109,8 @@ export function buildToolbar({ currentTool, onSelectTool, onClearSelection }) {
 
   const closeAllFlyouts = () => {
     toolbar.querySelectorAll('.ge-tool-slot.open').forEach(s => s.classList.remove('open'));
+    toolbar.classList.remove('ge-flyout-open');
+    toolbar.closest('.ge-toolbar-wrap')?.classList.remove('ge-flyout-open');
   };
 
   const openFlyout = (slotEl, face) => {
@@ -116,6 +118,8 @@ export function buildToolbar({ currentTool, onSelectTool, onClearSelection }) {
     closeAllFlyouts();
     if (isOpen) return;
     slotEl.classList.add('open');
+    toolbar.classList.add('ge-flyout-open');
+    toolbar.closest('.ge-toolbar-wrap')?.classList.add('ge-flyout-open');
     const flyout = slotEl.querySelector('.ge-tool-flyout');
     if (!flyout) return;
     const r = face.getBoundingClientRect();

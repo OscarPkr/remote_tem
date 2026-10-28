@@ -1292,14 +1292,14 @@ FUNCTION_TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "manage_settings",
-            "description": "Manage user preferences and settings. Use `disable_tool`/`enable_tool`/`list_tools` to turn individual tools on or off globally (e.g. shell, search, browser, documents, memory, skills, images, tasks, notes, calendar, email). Use list/get/set/delete for free-form preferences.",
+            "description": "Manage user preferences and settings. Use `disable_tool`/`list_tools` to turn individual tools off globally or list what is disabled (e.g. shell, search, browser, documents, memory, skills, images, tasks, notes, calendar, email). Disabled tools can only be re-enabled by the user in Settings > Agent Tools, never from chat. Use list/get/set/delete for free-form preferences.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["list", "get", "set", "delete", "disable_tool", "enable_tool", "list_tools"]},
+                    "action": {"type": "string", "enum": ["list", "get", "set", "delete", "disable_tool", "list_tools"]},
                     "key": {"type": "string", "description": "Setting key (for get/set/delete)"},
                     "value": {"description": "Setting value (for set) — can be string, number, boolean, or object"},
-                    "tool": {"type": "string", "description": "Tool name to disable/enable (for disable_tool/enable_tool). Accepts aliases: shell, search, browser, documents, memory, skills, images, tasks, notes, calendar, email — or a raw tool name like 'bash' or 'web_search'."}
+                    "tool": {"type": "string", "description": "Tool name to disable (for disable_tool). Accepts aliases: shell, search, browser, documents, memory, skills, images, tasks, notes, calendar, email — or a raw tool name like 'bash' or 'web_search'."}
                 },
                 "required": ["action"]
             }
@@ -1545,7 +1545,7 @@ FUNCTION_TOOL_SCHEMAS = [
                 "properties": {
                     "op": {"type": "string", "description": "Editor op name from the catalog, e.g. adjustments.applyMasked"},
                     "params": {"type": "object", "description": "Parameters for the op"},
-                    "session": {"type": "string", "description": "Editor session id (defaults to the open session)"},
+                    "session": {"type": "string", "description": "Editor session id when no turn-bound session is available; the bound session takes precedence"},
                     "wait": {"type": "boolean", "description": "Wait for the editor result (default true)"}
                 },
                 "required": ["op"]
@@ -1560,7 +1560,7 @@ FUNCTION_TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "session": {"type": "string", "description": "Editor session id (defaults to the open session)"}
+                    "session": {"type": "string", "description": "Editor session id when no turn-bound session is available; the bound session takes precedence"}
                 }
             }
         }
@@ -1583,7 +1583,7 @@ FUNCTION_TOOL_SCHEMAS = [
                     "steps": {"type": "integer", "description": "Optional sampler steps. Use 8 for removal/expand edits (default 4 is too weak for those)."},
                     "place": {"type": "boolean", "description": "Place the result as a new layer (default true)"},
                     "model": {"type": "string", "description": "Optional image model id to route this edit to (from GET /api/editor/image-models); omit to use the configured default"},
-                    "session": {"type": "string", "description": "Editor session id"}
+                    "session": {"type": "string", "description": "Editor session id when no turn-bound session is available; the bound session takes precedence"}
                 },
                 "required": ["op"]
             }
@@ -2000,6 +2000,14 @@ FUNCTION_TOOL_SCHEMAS = [
     },
 ]
 
+if os.getenv("ODYSSEUS_PRIVATE_BROWSER_LEGACY", "0").strip().lower() not in {"", "0", "false", "no", "off"}:
+    # Restored pre-Wave-3 private_browser (see src.tool_execution._legacy_private_browser).
+    from src.private_browser_legacy_schema import PRIVATE_BROWSER_SCHEMA as _PB_LEGACY
+
+    FUNCTION_TOOL_SCHEMAS[:] = [
+        _PB_LEGACY if (schema.get("function") or {}).get("name") == "private_browser" else schema
+        for schema in FUNCTION_TOOL_SCHEMAS
+    ]
 
 
 # ---------------------------------------------------------------------------

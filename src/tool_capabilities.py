@@ -227,8 +227,16 @@ _register(
     ToolEffect.READ_PRIVATE,
 )
 _register(
-    {"plan_edit", "run_editor_command"},
+    {"plan_edit"},
+    ToolEffect.NETWORK_EGRESS,
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
+)
+_register(
+    {"run_editor_command"},
+    ToolEffect.READ_PRIVATE,
+    ToolEffect.WRITE_PRIVATE,
     ToolEffect.UI_SIDE_EFFECT,
+    result_integrity=ResultIntegrity.EXTERNAL_UNTRUSTED,
 )
 _register(
     {
@@ -402,7 +410,7 @@ _PRIVATE_ACTION_WRITES: Mapping[str, frozenset[str]] = MappingProxyType(
         "manage_endpoints": frozenset({"add", "delete", "enable", "disable"}),
         "manage_mcp": frozenset({"add", "delete", "enable", "disable", "reconnect"}),
         "manage_settings": frozenset(
-            {"set", "delete", "reset", "disable_tool", "enable_tool"}
+            {"set", "delete", "reset", "disable_tool"}
         ),
         "manage_tokens": frozenset({"create", "delete"}),
         "manage_webhooks": frozenset({"add", "delete", "enable", "disable"}),

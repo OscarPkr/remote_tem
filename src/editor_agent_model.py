@@ -382,24 +382,33 @@ def _resolve_override_candidate(override: str, owner: Optional[str]) -> Optional
             }
 
     # 2. Explicit hosted fallback selection
-    if target in ("default", "hosted"):
-        try:
-            from src.endpoint_resolver import resolve_endpoint
+    try:
+        from src.endpoint_resolver import resolve_endpoint
 
-            for prefix in ("utility", "default"):
-                try:
-                    url, model, headers = resolve_endpoint(prefix, owner=owner)
-                except Exception:
-                    continue
-                if url and model:
+        for prefix in ("utility", "default"):
+            try:
+                url, model, headers = resolve_endpoint(prefix, owner=owner)
+            except Exception:
+                continue
+            if url and model:
+                if target in ("default", "hosted"):
                     return {
                         "base": url,
                         "model": requested_model or model,
                         "headers": headers,
                         "source": "hosted",
                     }
-        except Exception:
-            pass
+                if target and target.rstrip("/") == url.rstrip("/"):
+                    if not requested_model or requested_model == model:
+                        return {
+                            "base": url,
+                            "model": requested_model or model,
+                            "headers": headers,
+                            "source": "hosted",
+                        }
+    except Exception:
+        pass
+    if target in ("default", "hosted"):
         return None
 
     # 3. Bare model id without endpoint prefix
@@ -570,7 +579,6 @@ def _candidates(owner: Optional[str], override: Optional[str]) -> List[Dict[str,
                 break
     except Exception:
         pass
-
     if override:
         cand = _resolve_override_candidate(override, owner)
         if cand is not None:
@@ -579,7 +587,6 @@ def _candidates(owner: Optional[str], override: Optional[str]) -> List[Dict[str,
         # Unauthorized, invalid, foreign, disabled, or forged override:
         # Fail closed! Never silently dispatch sensitive user images/state to an unexpected fallback.
         return []
-
     return cands
 
 

@@ -22,6 +22,14 @@ def test_recolor_phrase_cleanup_handles_long_whitespace(prompt, target, expected
     assert guide._recolor_object_phrase(prompt, target) == expected
 
 
+def test_recolor_phrase_cleanup_handles_many_trailing_adjectives():
+    # Repeated regex substitutions previously rescanned the whole string for
+    # every adjective; this input would take minutes rather than linear time.
+    prompt = 'make the red car blue ' + 'bright ' * 100_000
+    assert guide._recolor_object_phrase(prompt, 'blue') == 'red car'
+    assert guide._recolor_object_phrase('make bright', '') == 'bright'
+
+
 @pytest.fixture(autouse=True)
 def _reset_planner():
     eaar.set_editor_planner(None)
