@@ -40,7 +40,10 @@ def test_flyout_triangle_css_is_visible():
 def test_brush_preset_rows_have_a_tip_icon():
     assert "const soft = typeof preset.softness === 'number' ? preset.softness : 100;" in TOOLBAR
     assert "const presetIcon = preset.pixel" in TOOLBAR
-    assert '<span class="ge-tool-icon">${presetIcon}</span><span class="ge-tool-flyout-label">${preset.name}</span>' in TOOLBAR
+    assert "icon.className = 'ge-tool-icon';" in TOOLBAR
+    assert 'icon.innerHTML = presetIcon;' in TOOLBAR
+    assert "label.className = 'ge-tool-flyout-label';" in TOOLBAR
+    assert 'label.textContent = preset.name;' in TOOLBAR
 
 
 def test_flyout_is_clamped_inside_the_viewport():

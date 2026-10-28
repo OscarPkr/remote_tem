@@ -25,7 +25,7 @@ import re
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from src import editor_style_guide as style_guide
@@ -1173,12 +1173,35 @@ def _normalize_steps(body: Dict[str, Any]) -> List[Dict[str, Any]]:
     return out
 
 
-def _user(request: Request) -> Optional[str]:
+def _is_admin(request: Request) -> bool:
     try:
-        from src.auth_helpers import get_current_user
-        return get_current_user(request)
+        from core.middleware import require_admin
+        require_admin(request)
+        return True
     except Exception:
+        return False
+
+
+def _user(request: Request) -> Optional[str]:
+    # Handle API bearer tokens explicitly: require 'chat' scope and attribute to real owner
+    if getattr(request.state, "api_token", False):
+        from src.auth_helpers import require_api_token_scope
+        return require_api_token_scope(request, "chat")
+
+    from src.auth_helpers import get_current_user, _auth_disabled
+    u = get_current_user(request)
+    if u:
+        return u
+    if _auth_disabled():
         return None
+    auth_mgr = getattr(request.app.state, "auth_manager", None)
+    if auth_mgr is not None and getattr(auth_mgr, "is_configured", False):
+        raise HTTPException(401, "Not authenticated")
+    client = getattr(request, "client", None)
+    host = (client.host if client else "") or ""
+    if host in ("127.0.0.1", "::1", "localhost", "testclient") or not host:
+        return None
+    raise HTTPException(401, "Not authenticated")
 
 
 async def _default_editor_planner(messages: List[dict], owner: Optional[str]) -> Optional[str]:
@@ -1297,9 +1320,13 @@ def setup_editor_agent_routes() -> APIRouter:
             except Exception:
                 raw = None
         _used = editor_agent_model.get_last_model()
-        model_used = (_used[0] if _used and _used[0]
-                      else (agent_model or editor_agent_model.local_model()))
         parsed = _parse_plan(raw)
+        if _used and _used[0]:
+            model_used = _used[0]
+        elif parsed:
+            model_used = agent_model or editor_agent_model.local_model()
+        else:
+            model_used = "fallback" if agent_model else editor_agent_model.local_model()
         if isinstance(parsed, dict):
             parsed["agent_model"] = model_used
         if mode != "check":
@@ -1494,6 +1521,12 @@ def setup_editor_agent_routes() -> APIRouter:
         overwritten.
         """
         owner = _user(request)
+        from src.settings import get_setting
+        disabled = get_setting("disabled_tools", []) or []
+        if not isinstance(disabled, (list, tuple, set)):
+            disabled = []
+        if "plan_edit" in disabled:
+            raise HTTPException(403, "Editor tool is disabled")
         try:
             body = await request.json()
         except Exception:
@@ -1506,7 +1539,7 @@ def setup_editor_agent_routes() -> APIRouter:
         model_choice = str(body.get("model") or body.get("image_model") or "").strip()
         # Optional user-picked PLANNER model (the editor agent/planner model).
         agent_model = str(body.get("agent_model") or "").strip()
-        tools_offered = _scoped_editor_tools()
+        tools_offered = [tool for tool in _scoped_editor_tools() if tool not in disabled]
         scoped = _scoped(session, owner)
         trace: List[Dict[str, Any]] = [
             {"type": "session", "session": scoped, "tools_offered": tools_offered},
@@ -1540,9 +1573,14 @@ def setup_editor_agent_routes() -> APIRouter:
             except Exception:
                 raw = None
         _used = editor_agent_model.get_last_model()
-        model_used = (_used[0] if _used and _used[0]
-                      else (agent_model or editor_agent_model.local_model()))
-        plan = _parse_plan(raw) or _fallback_plan(prompt)
+        parsed = _parse_plan(raw)
+        if _used and _used[0]:
+            model_used = _used[0]
+        elif parsed:
+            model_used = agent_model or editor_agent_model.local_model()
+        else:
+            model_used = "fallback" if agent_model else editor_agent_model.local_model()
+        plan = parsed or _fallback_plan(prompt)
         _strengthened = style_guide.strengthen(prompt, list(plan.get("steps") or []))
         if _strengthened != plan.get("steps"):
             plan = {**plan, "steps": _strengthened,
@@ -1618,6 +1656,12 @@ def setup_editor_agent_routes() -> APIRouter:
                 "results": [],
                 "agent_model": model_used,
             })
+        needed = {"plan_edit"}
+        for step in steps:
+            op = step.get("op")
+            needed.add(op if op in {"ai_edit_image", "generate_image"} else "run_editor_command")
+        if needed.intersection(disabled):
+            raise HTTPException(403, "Editor tool is disabled")
         results: List[Dict[str, Any]] = []
         for step in steps:
             op = step.get("op")
@@ -1726,6 +1770,8 @@ def setup_editor_agent_routes() -> APIRouter:
         ``edit`` (editing/inpainting models) or ``generate`` (text-to-image).
         """
         owner = _user(request)
+        from src.tool_security import owner_is_admin_or_single_user
+        is_admin = owner_is_admin_or_single_user(owner)
         models: List[Dict[str, Any]] = []
         seen: set = set()
         try:
@@ -1748,22 +1794,25 @@ def setup_editor_agent_routes() -> APIRouter:
                     # recognisably image-capable — the same test the request
                     # router uses.
                     image_endpoint = getattr(ep, "model_type", None) == "image"
-                    provider = getattr(ep, "name", None) or getattr(ep, "base_url", "") or "image"
+                    endpoint_id = getattr(ep, "id", None)
+                    provider = getattr(ep, "name", None) or (f"Endpoint {endpoint_id}" if endpoint_id else "image")
                     for name in _endpoint_enabled_models(ep):
                         if not image_endpoint and not looks_like_image_generation_model(name):
                             continue
-                        key = (provider, name)
+                        key = (str(endpoint_id), name)
                         if key in seen:
                             continue
                         seen.add(key)
-                        models.append({
+                        entry = {
                             "id": name,
                             "label": name,
                             "kind": "edit" if _EDIT_MODEL_RE.search(name) else "generate",
                             "provider": provider,
-                            "endpoint_id": getattr(ep, "id", None),
-                            "base_url": getattr(ep, "base_url", "") or "",
-                        })
+                            "endpoint_id": endpoint_id,
+                        }
+                        if is_admin:
+                            entry["base_url"] = getattr(ep, "base_url", "") or ""
+                        models.append(entry)
             finally:
                 db.close()
         except Exception:
@@ -1774,21 +1823,39 @@ def setup_editor_agent_routes() -> APIRouter:
     async def editor_agent_models(request: Request) -> JSONResponse:
         """List the models the editor agent/planner can run on.
 
-        Each entry is ``{id, label, source, vision, base_url}`` where ``id`` is
+        Each entry is ``{id, label, source, vision}`` where ``id`` is
         passed as ``agent_model`` to /api/editor/plan or /api/editor/agent, and
         ``source`` is ``local`` (the local Qwen3.5-9B vision server) or
         ``hosted`` (the configured default/utility chat model that the planner
         falls back to).
+        For non-admin users, private URLs and internal probe status are omitted.
         """
         owner = _user(request)
+        from src.tool_security import owner_is_admin_or_single_user
+        is_admin = owner_is_admin_or_single_user(owner)
         try:
             models = await editor_agent_model.list_editor_agent_models(owner)
         except Exception:
             logger.warning("editor agent-models lookup failed", exc_info=True)
             models = []
+
+        safe_models = []
+        for m in models:
+            entry = dict(m)
+            if not is_admin:
+                entry.pop("base_url", None)
+            safe_models.append(entry)
+
+        probe_info = {}
+        if is_admin:
+            probe_info = editor_agent_model.probe_status()
+            if not probe_info:
+                editor_agent_model.startup_probe()
+                probe_info = editor_agent_model.probe_status()
+
         return JSONResponse({
-            "models": models,
-            "probe": editor_agent_model.probe_status(),
+            "models": safe_models,
+            "probe": probe_info,
         })
 
     @router.post("/api/editor/self-check")

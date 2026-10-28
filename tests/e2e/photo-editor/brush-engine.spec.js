@@ -54,7 +54,8 @@ test('long sampled strokes stay responsive and undo atomically', async ({ page }
   await page.mouse.down();
   await page.mouse.move(end.x, end.y, { steps: 240 });
   await page.mouse.up();
-  expect(Date.now() - startedAt).toBeLessThan(5000);
+  const strokeDuration = Date.now() - startedAt;
+  expect(strokeDuration).toBeLessThan(5000);
   const after = await flattenedPixelDigest(page);
   expect(after).not.toEqual(before);
   await expect(thumb).toHaveAttribute('width', '68');
@@ -78,14 +79,17 @@ test('eyedropper and retouch tools use the editor stroke lifecycle', async ({ pa
   await selectTool(page, 'eyedropper');
   await expect(page.locator('#ge-eyedropper-section')).toBeVisible();
   await page.locator('#ge-eyedropper-sample').selectOption('composite');
-  await page.mouse.move(sample.x, sample.y);
+  // The options strip height differs per tool, which re-centres the canvas a
+  // few pixels; hover the same image point that was painted.
+  const painted = await canvasPoint(page, 0.3, 0.3);
+  await page.mouse.move(painted.x, painted.y);
   await expect(page.locator('#ge-eyedropper-live-value')).toHaveText('#33aa55');
   await expect(page.locator('#ge-eyedropper-live-rgb')).toHaveText('RGB 51 170 85');
   await expect(page.locator('#ge-eyedropper-live-hsl')).toHaveText('HSL 137 54% 43%');
   await expect(page.locator('#ge-eyedropper-live-swatch')).not.toHaveClass(/empty/);
   await expect(page.locator('#ge-eyedropper-loupe')).toBeVisible();
   expect((await page.locator('#ge-eyedropper-loupe').evaluate(canvas => canvas.getContext('2d').getImageData(42, 42, 1, 1).data[3]))).toBe(255);
-  await page.mouse.click(sample.x, sample.y);
+  await page.mouse.click(painted.x, painted.y);
   await expect(page.locator('.ge-color-picker').first()).toHaveValue('#33aa55');
 
   for (const tool of ['dodge', 'burn']) {
@@ -178,7 +182,11 @@ test('smudge carries nearby pixels along a stroke and undoes atomically', async 
     return [...canvas.getContext('2d').getImageData(x, y, 1, 1).data];
   });
   await selectTool(page, 'smudge');
+  // Smudge strength lives in the brush-family "More" menu with the other
+  // per-tool stroke modifiers.
+  await page.locator('#ge-brush-more').click();
   await expect(page.locator('#ge-smudge-strength-row')).toBeVisible();
+  await page.keyboard.press('Escape');
   await page.mouse.move(source.x, source.y);
   await page.mouse.down();
   await page.mouse.move(target.x, target.y, { steps: 20 });

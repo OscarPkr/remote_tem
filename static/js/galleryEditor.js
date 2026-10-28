@@ -7,7 +7,7 @@ import dragSortModule from './dragSort.js';
 import spinnerModule from './spinner.js';
 import { attachColorPicker } from './colorPicker.js?v=20260910eyedropper1';
 import modalManager from './modalManager.js';
-import { canvasCoords as _canvasCoords } from './editor/canvas-coords.js';
+import { canvasCoords as _canvasCoords, invalidateCanvasCoordsCache } from './editor/canvas-coords.js';
 import { pickTopmostLayerAt as _pickTopmostLayerAt } from './editor/layer-hit-test.js';
 import { drawCheckerboard as _drawCheckerboard } from './editor/checkerboard.js';
 import { dilateMask as _dilateMask, applyInpaintFeather as _applyInpaintFeather } from './editor/mask-utils.js';
@@ -854,11 +854,13 @@ function _setAiProgress(frac, label) {
   if (lbl) lbl.textContent = label || '';
 }
 function _startAiProgress(requestId) {
+  const endpointId = arguments[1] || '';
   _stopAiProgress();
   if (!requestId) return;
   const tick = async () => {
     try {
-      const r = await fetch(`/api/image/edit-progress?request_id=${encodeURIComponent(requestId)}`, { credentials: 'same-origin' });
+      const epQuery = endpointId ? `&endpoint_id=${encodeURIComponent(endpointId)}` : '';
+      const r = await fetch(`/api/image/edit-progress?request_id=${encodeURIComponent(requestId)}` + epQuery, { credentials: 'same-origin' });
       if (!r.ok) return;
       const p = await r.json();
       const st = p.stage || '';
@@ -1112,6 +1114,68 @@ function _matchAiCommandSuggestions(query) {
     .slice(0, 4)
     .map(hit => hit.item);
 }
+
+// On phones the layers panel is a bottom sheet that can cover the editor
+// footer (zoom / setup). Float the footer just above the sheet's top edge so
+// its controls stay tappable; restore it to normal flow when the sheet is
+// collapsed or on desktop.
+let _lastFooterDelta = 0;
+const _placeMobileFooter = () => {
+  const footer = document.querySelector('.ge-editor-footer');
+  if (!footer) return;
+  const area = document.querySelector('.ge-canvas-area');
+  const _clear = () => {
+    footer.classList.remove('ge-footer-floating');
+    footer.style.position = ''; footer.style.left = ''; footer.style.right = '';
+    footer.style.bottom = ''; footer.style.zIndex = '';
+    document.body.classList.remove('ge-footer-docked');
+    state._footerDocked = false;
+    if (area && (area.style.marginBottom || area.style.height || area.style.flex || area.style.minHeight)) {
+      area.style.marginBottom = ''; area.style.height = ''; area.style.flex = ''; area.style.minHeight = '';
+      _lastFooterDelta = 0;
+      // The sheet may have squeezed fit view to a few pixels. Restore fit
+      // after releasing that constraint, while retaining an explicit zoom.
+      if (state.zoomViewMode === 'fit') {
+        try { _fitZoom(); } catch (_) {}
+      }
+    }
+  };
+  if (window.innerWidth > 700) { _clear(); return; }
+  const sheet = document.querySelector('.ge-right-panel');
+  if (!sheet || sheet.classList.contains('minimized') || sheet.classList.contains('expanded')) { _clear(); return; }
+  const r = sheet.getBoundingClientRect();
+  const vh = window.innerHeight;
+  if (r.height <= 0 || r.top >= vh || r.top <= 140) { _clear(); return; }
+  footer.classList.add('ge-footer-floating');
+  footer.style.position = 'fixed';
+  footer.style.left = '0';
+  footer.style.right = '0';
+  footer.style.zIndex = '60';
+  // Dock the footer flush to the sheet top: no seam / dead space between them.
+  footer.style.bottom = Math.max(0, Math.round(vh - r.top)) + 'px';
+  document.body.classList.add('ge-footer-docked');
+  // Dock the canvas image flush too: with the dock padding off, the image
+  // fills the region so its bottom meets the footer top (no dead space).
+  state._footerDocked = true;
+  // Size the canvas region so it ends exactly where the footer begins:
+  // canvas bottom == footer top == sheet top. (Its mobile min-height:40vh
+  // would otherwise keep it running under the footer and the sheet.) The
+  // ge-footer-docked class also hides the sheet grab handle.
+  if (area) {
+    const footerH = footer.getBoundingClientRect().height || 0;
+    const desiredBottom = Math.round(r.top - footerH);
+    const want = Math.max(0, Math.round(desiredBottom - area.getBoundingClientRect().top));
+    if (want !== _lastFooterDelta) {
+      area.style.flex = want ? '0 0 auto' : '';
+      area.style.minHeight = want ? '0px' : '';
+      area.style.height = want ? want + 'px' : '';
+      _lastFooterDelta = want;
+      if (state.zoomViewMode === 'fit') {
+        try { _fitZoom(); } catch (_) {}
+      }
+    }
+  }
+};
 
 function _wireAiCommandBox() {
   const wrap = document.getElementById('ge-ai-command');
@@ -1368,60 +1432,6 @@ function _wireAiCommandBox() {
   input.addEventListener('click', _trackLift);
   wrap.addEventListener('focusin', _trackLift);
   requestAnimationFrame(() => requestAnimationFrame(_liftQuickEdit));
-  // On phones the layers panel is a bottom sheet that can cover the editor
-  // footer (zoom / setup). Float the footer just above the sheet's top edge so
-  // its controls stay tappable; restore it to normal flow when the sheet is
-  // collapsed or on desktop.
-  let _lastFooterDelta = 0;
-  const _placeMobileFooter = () => {
-    const footer = document.querySelector('.ge-editor-footer');
-    if (!footer) return;
-    const area = document.querySelector('.ge-canvas-area');
-    const _clear = () => {
-      footer.classList.remove('ge-footer-floating');
-      footer.style.position = ''; footer.style.left = ''; footer.style.right = '';
-      footer.style.bottom = ''; footer.style.zIndex = '';
-      document.body.classList.remove('ge-footer-docked');
-      state._footerDocked = false;
-      if (area && (area.style.marginBottom || area.style.height || area.style.flex || area.style.minHeight)) {
-        area.style.marginBottom = ''; area.style.height = ''; area.style.flex = ''; area.style.minHeight = '';
-        _lastFooterDelta = 0;
-      }
-    };
-    if (window.innerWidth > 700) { _clear(); return; }
-    const sheet = document.querySelector('.ge-right-panel');
-    if (!sheet || sheet.classList.contains('minimized')) { _clear(); return; }
-    const r = sheet.getBoundingClientRect();
-    const vh = window.innerHeight;
-    if (r.height <= 0 || r.top >= vh) { _clear(); return; }
-    footer.classList.add('ge-footer-floating');
-    footer.style.position = 'fixed';
-    footer.style.left = '0';
-    footer.style.right = '0';
-    footer.style.zIndex = '60';
-    // Dock the footer flush to the sheet top: no seam / dead space between them.
-    footer.style.bottom = Math.max(0, Math.round(vh - r.top)) + 'px';
-    document.body.classList.add('ge-footer-docked');
-    // Dock the canvas image flush too: with the dock padding off, the image
-    // fills the region so its bottom meets the footer top (no dead space).
-    state._footerDocked = true;
-    // Size the canvas region so it ends exactly where the footer begins:
-    // canvas bottom == footer top == sheet top. (Its mobile min-height:40vh
-    // would otherwise keep it running under the footer and the sheet.) The
-    // ge-footer-docked class also hides the sheet grab handle.
-    if (area) {
-      const footerH = footer.getBoundingClientRect().height || 0;
-      const desiredBottom = Math.round(r.top - footerH);
-      const want = Math.max(0, Math.round(desiredBottom - area.getBoundingClientRect().top));
-      if (want !== _lastFooterDelta) {
-        area.style.flex = want ? '0 0 auto' : '';
-        area.style.minHeight = want ? '0px' : '';
-        area.style.height = want ? want + 'px' : '';
-        _lastFooterDelta = want;
-        try { _fitZoom(); } catch (_) {}
-      }
-    }
-  };
   // The layers sheet expands/collapses (and its peek height grows as layers
   // render) independently of the keyboard; watch it so the bar and the footer
   // keep clear of the sheet's top edge as it moves.
@@ -2592,8 +2602,8 @@ function _wireAiCommandBox() {
   // done vs retry. The caller enforces a single retry (max 1).
   const _vlJudgeAfter = async (prompt, before, after) => {
     if (!before || !after) return { done: true };
-    let ep = 'http://100.69.120.65:8097/v1';
-    let model = 'Qwen3.5-9B-MLX-8bit';
+    let ep = '';
+    let model = 'Qwen3.5-9B';
     try {
       const info = _getSelectedQuickEditAgentModel();
       if (info && info.endpoint) ep = info.endpoint;
@@ -2637,6 +2647,7 @@ function _wireAiCommandBox() {
         { type: 'image_url', image_url: { url: after } },
       ] }],
     };
+    if (!ep) return { done: true };
     try {
       const resp = await fetch(ep.replace(/\/$/, '') + '/chat/completions', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -3295,6 +3306,7 @@ const _adjPopupSystem = createAdjPopupSystem({
   saveState: _saveState,
   renderLayerPanel: () => _renderLayerPanel(),
   getAdjustmentSource: layer => _adjustmentSourceCanvas(layer),
+  schedulePersist: () => _schedulePersist(),
 });
 const _closeFxPopup                     = _adjPopupSystem.closeFxPopup;
 const _ensureAdjustments                = _adjPopupSystem.ensureAdjustments;
@@ -3948,13 +3960,13 @@ function _finishComposite(render, documentCanvas) {
   if (state.transformActive) _drawTransformHandles();
   else if (state.transformOverlay) state.transformOverlay.style.display = 'none';
   if (state.marqueeActive && state.marqueeRect) _drawMarqueeOverlay();
-  _penTool.draw();
+  if (state.tool === 'pen' || state.penPoints?.length) _penTool.draw();
   if (state.cropRect && !state.cropping) _drawCropOverlay();
-  _syncCropFrame();
+  if (state.cropRect) _syncCropFrame();
   if (state.activeSnapGuides && state.activeSnapGuides.length) _drawSnapGuides();
-  _precisionGuides?.drawDocumentOverlay(state.mainCtx);
+  if (!state.drawing) _precisionGuides?.drawDocumentOverlay(state.mainCtx);
   _refreshSelectionOverlay();
-  _syncToolClearIndicators();
+  if (!state.drawing) _syncToolClearIndicators();
 }
 
 function composite() {
@@ -4333,7 +4345,14 @@ function _saveState(label, options = {}) {
     console.error('[gallery] saveState snapshot failed (continuing without this undo step):', e);
   }
   try { _invalidateWandCache(); } catch (e) { console.error('[gallery] invalidateWandCache:', e); }
-  try { _schedulePersist(); } catch (e) { console.error('[gallery] schedulePersist:', e); }
+  try {
+    state.documentRevision = (state.documentRevision || 0) + 1;
+    state.persistDirty = true;
+    _setDraftStatus('Unsaved', 'dirty');
+    if (!_draftSavingDisabled()) {
+      _schedulePersist();
+    }
+  } catch (e) { console.error('[gallery] schedulePersist:', e); }
   try { _refreshHistoryPanelIfOpen(); } catch (e) { console.error('[gallery] refreshHistoryPanel:', e); }
 }
 
@@ -4367,20 +4386,47 @@ function _writeActiveEditorSession() {
 function _setDraftStatus(label, stateName = '') {
   const el = document.getElementById('ge-draft-status');
   if (!el) return;
-  const normalizedState = stateName === 'saved' ? 'saved' : 'dirty';
-  const normalizedLabel = normalizedState === 'saved' ? 'Saved' : 'Unsaved';
+  const validStates = ['saved', 'dirty', 'pending', 'saving', 'error', 'paused'];
+  let normalizedState = stateName;
+  if (!validStates.includes(normalizedState)) {
+    if (stateName === 'saved' || label === 'Saved') normalizedState = 'saved';
+    else if (stateName === 'error' || /fail|error/i.test(label || '')) normalizedState = 'error';
+    else if (stateName === 'paused' || /paused/i.test(label || '')) normalizedState = 'paused';
+    else if (stateName === 'saving' || label === 'Saving…' || label === 'Saving...') normalizedState = 'saving';
+    else if (stateName === 'pending' || /saving soon/i.test(label || '')) normalizedState = 'pending';
+    else normalizedState = 'dirty';
+  }
+  const defaultLabels = {
+    saved: 'Saved',
+    dirty: 'Unsaved',
+    pending: 'Saving soon…',
+    saving: 'Saving…',
+    error: 'Save failed',
+    paused: 'Save paused',
+  };
+  const normalizedLabel = label || defaultLabels[normalizedState] || 'Unsaved';
   el.textContent = normalizedLabel;
-  el.dataset.state = stateName;
+  el.dataset.state = normalizedState;
   const iconHost = el.closest('#ge-save-menu-btn');
+  const iconKind = (normalizedState === 'error' || normalizedState === 'paused')
+    ? 'error'
+    : (normalizedState === 'saved' ? 'saved' : 'dirty');
+  // The icons are <svg>; SVGElement has no `hidden` property, so set the attribute.
   iconHost?.querySelectorAll('.ge-save-state-icon').forEach(icon => {
-    icon.hidden = !icon.classList.contains(`ge-save-state-${normalizedState}`);
+    icon.toggleAttribute('hidden', !icon.classList.contains(`ge-save-state-${iconKind}`));
   });
   const saveButton = document.getElementById('ge-save-menu-btn');
   if (saveButton) {
-    saveButton.title = normalizedState === 'error' ? 'Draft autosave needs attention' : `Draft status: ${normalizedLabel}`;
-    saveButton.setAttribute('aria-label', normalizedLabel);
+    if (normalizedState === 'error' || normalizedState === 'paused') {
+      saveButton.title = state.persistErrorMessage || `Draft autosave failed: ${normalizedLabel}`;
+      saveButton.setAttribute('aria-label', `Draft autosave failed: ${normalizedLabel}`);
+    } else {
+      saveButton.title = `Draft status: ${normalizedLabel}`;
+      saveButton.setAttribute('aria-label', `Draft status: ${normalizedLabel}`);
+    }
   }
 }
+try { window.__geSetDraftStatus = _setDraftStatus; } catch (_) {}
 
 function _clearActiveEditorSession() {
   try { sessionStorage.removeItem(ACTIVE_EDITOR_SESSION_KEY); } catch (_) {}
@@ -4403,11 +4449,20 @@ function _draftSavingDisabled() {
 function _schedulePersist() {
   if (_draftSavingDisabled()) return;
   if (!state.editorOpen || !state.layers.length) return;
-  if (state.persistTimer) clearTimeout(state.persistTimer);
-  _setDraftStatus('Saving soon…', 'pending');
+  if (state.persistTimer) { clearTimeout(state.persistTimer); state.persistTimer = null; }
+  if (state.persistRetryTimer) { clearTimeout(state.persistRetryTimer); state.persistRetryTimer = null; }
+  if (state.pendingStatusTimer) { clearTimeout(state.pendingStatusTimer); state.pendingStatusTimer = null; }
   // The first save establishes the recovery anchor. Start it immediately
   // when no server draft exists; subsequent edits can stay debounced.
   const delay = state.draftId ? PERSIST_DEBOUNCE_MS : 0;
+  if (delay > 0) {
+    state.pendingStatusTimer = setTimeout(() => {
+      state.pendingStatusTimer = null;
+      if (state.editorOpen) _setDraftStatus('Saving soon…', 'pending');
+    }, Math.min(200, Math.floor(delay / 2)));
+  } else {
+    _setDraftStatus('Saving soon…', 'pending');
+  }
   state.persistTimer = setTimeout(() => { state.persistTimer = null; _persistDraft(); }, delay);
 }
 
@@ -4591,6 +4646,8 @@ async function _persistDraft() {
   // Coalesce concurrent saves — if one's already in-flight, mark dirty
   // and let the running call kick off another when it returns.
   if (state.persistInFlight) { state.persistDirty = true; _setDraftStatus('Saving…', 'saving'); return; }
+  const currentRevision = state.documentRevision || 0;
+  state.persistingRevision = currentRevision;
   const sessionToken = state.editorSessionToken;
   const draftIdAtStart = state.draftId || null;
   const draftNameAtStart = state.draftName || 'Untitled';
@@ -4618,13 +4675,10 @@ async function _persistDraft() {
     };
     const serializedBody = JSON.stringify(body);
     if (serializedBody.length > _EDITOR_PROJECT_MAX_BYTES) {
-      const message = 'Draft autosave paused: this layered document exceeds the 256 MB safety limit. Export or flatten a copy before closing.';
-      if (isCurrentSession()) {
-        if (state.persistErrorMessage !== message && uiModule) uiModule.showToast(message, 9000);
-        state.persistErrorMessage = message;
-        _setDraftStatus('Save paused', 'error');
-      }
-      return;
+      _setDraftStatus('Save paused', 'error');
+      const err = new Error('Draft autosave paused: this layered document exceeds the 256 MB safety limit. Export or flatten a copy before closing.');
+      err.status = 413;
+      throw err;
     }
     const responseError = async (res, method) => {
       let detail = '';
@@ -4667,29 +4721,51 @@ async function _persistDraft() {
   };
   const savePromise = doSave();
   state.persistInFlight = savePromise
-    .catch((e) => {
-      console.warn('[ge] draft save failed', e);
-      if (!isCurrentSession()) return;
-      const message = e?.status === 413
-        ? 'Draft autosave paused: the document exceeds the configured storage limit.'
-        : `Draft autosave failed: ${e?.message || 'server error'}`;
-      if (state.persistErrorMessage !== message && uiModule) uiModule.showToast(message, 7000);
-      state.persistErrorMessage = message;
-      _setDraftStatus('Save failed', 'error');
-    })
     .then((out) => {
-      if (isCurrentSession()) state.persistInFlight = null;
       if (!isCurrentSession()) return;
+      state.savedRevision = Math.max(state.savedRevision || 0, currentRevision);
+      state.persistRetryCount = 0;
       if (out && out.id) {
         state.draftId = out.id;
         _writeActiveEditorSession();
       }
       state.persistErrorMessage = null;
-      if (!state.persistErrorMessage) _setDraftStatus('Saved', 'saved');
+      if ((state.documentRevision || 0) > state.savedRevision || state.persistDirty) {
+        state.persistDirty = true;
+        _setDraftStatus('Unsaved', 'dirty');
+      } else {
+        _setDraftStatus('Saved', 'saved');
+      }
       if (state.persistDirty) {
         state.persistDirty = false;
         _schedulePersist();
       }
+    })
+    .catch((e) => {
+      console.warn('[ge] draft save failed', e);
+      if (!isCurrentSession()) return;
+      state.persistDirty = true;
+      const isPaused = e?.status === 413;
+      const message = isPaused
+        ? (e?.message || 'Draft autosave paused: the document exceeds the configured storage limit.')
+        : `Draft autosave failed: ${e?.message || 'server error'}`;
+      if (state.persistErrorMessage !== message && uiModule) uiModule.showToast(message, isPaused ? 9000 : 7000);
+      state.persistErrorMessage = message;
+      _setDraftStatus(isPaused ? 'Save paused' : 'Save failed', isPaused ? 'paused' : 'error');
+      if (!isPaused && state.editorOpen) {
+        state.persistRetryCount = Math.min((state.persistRetryCount || 0) + 1, 5);
+        const retryDelay = Math.min(1000 * Math.pow(2, state.persistRetryCount), 15000);
+        if (state.persistRetryTimer) clearTimeout(state.persistRetryTimer);
+        state.persistRetryTimer = setTimeout(() => {
+          state.persistRetryTimer = null;
+          if (state.editorOpen && (state.persistDirty || (state.documentRevision || 0) > (state.savedRevision || 0))) {
+            _persistDraft();
+          }
+        }, retryDelay);
+      }
+    })
+    .finally(() => {
+      if (isCurrentSession()) state.persistInFlight = null;
     });
   return state.persistInFlight;
 }
@@ -5381,7 +5457,24 @@ async function _confirmRasterizeLayer(layer) {
   return true;
 }
 
+let _lastCursorRect = null;
+let _lastCursorRectTime = 0;
+
+function _invalidateCoordsCaches() {
+  invalidateCanvasCoordsCache();
+  _lastCursorRect = null;
+  _lastCursorRectTime = 0;
+}
+
 function _beginDraw(e) {
+  if (state.mainCanvas) {
+    // Prime canvas rect and cursor rect once before stroke begins
+    // to avoid synchronous layout reads during pointermove.
+    _canvasCoords(e, state.mainCanvas);
+    const now = performance.now();
+    _lastCursorRect = state.mainCanvas.getBoundingClientRect();
+    _lastCursorRectTime = now;
+  }
   // Move-tool auto-select (Photoshop parity): when the Auto-Select option is
   // on — or Ctrl/Cmd is held for a one-off — pick the topmost visible,
   // position-unlocked layer under the pointer before the drag. If the picked
@@ -5428,13 +5521,11 @@ function _beginDraw(e) {
   }
   if (_pixelPaintTools.has(state.tool) && !_getActiveMaskLayer() && !state.quickMaskActive &&
       ['text', 'shape', 'placed'].includes(layer?.kind)) {
-    // Paint tools need pixels: rasterize the text/shape/placed layer silently
-    // (it stays undoable) so the very first stroke or pour works, instead of
-    // bouncing the user through a rasterize dialog that can end up behind the
-    // canvas where it cannot be clicked. If rasterizing is not possible, fall
-    // back to the prompt.
-    if (!_rasterizeLayerNow(layer)) { void _offerRasterizeForTool(); return; }
-    // fall through — `layer` is a pixel layer now, so the tool runs below.
+    // Paint tools need pixels: prompt for confirmation before destructive rasterization.
+    // If user cancels, editable text/shape/placed layer is preserved intact.
+    // If user accepts, layer is converted with an undo boundary so it can be reverted.
+    void _confirmRasterizeLayer(layer);
+    return;
   }
   // Transform-tool drag (handle grab or move-fallback) — handler in
   // editor/tools/transform-drag.js.
@@ -5480,6 +5571,13 @@ function _beginDraw(e) {
   _strokeTool.tryBegin(e);
 }
 
+let _cursorRaf = null;
+let _pendingCursorEvent = null;
+const _cursorOverlayTools = new Set([
+  'eraser', 'pixel', 'inpaint', 'lasso', 'brush', 'clone', 'heal',
+  'smudge', 'dodge', 'burn', 'liquify', 'quickselect', 'objectselect'
+]);
+
 function _continueDraw(e) {
   if (state.tool === 'pen') return _penTool.drag(e);
   if (state.tool === 'path') return _pathTool.drag(e);
@@ -5496,10 +5594,40 @@ function _continueDraw(e) {
   // when it's actually over the canvas, otherwise hide it.
   const overCanvas = state.mainCanvas && e.target === state.mainCanvas;
   if (state.tool === 'eyedropper' && overCanvas) _eyedropperTool.preview(e);
-  if (['eraser', 'pixel', 'inpaint', 'lasso', 'brush', 'clone', 'heal', 'smudge', 'dodge', 'burn', 'liquify', 'quickselect', 'objectselect'].includes(state.tool) && state.mainCanvas) {
-    if (overCanvas) _updateBrushCursor(e);
-    else if (state.cursorEl) state.cursorEl.style.display = 'none';
+  if (_cursorOverlayTools.has(state.tool) && state.mainCanvas) {
+    const syncCursor = () => {
+      if (!overCanvas) {
+        if (state.cursorEl) state.cursorEl.style.display = 'none';
+        return;
+      }
+      if (state.drawing) {
+        _pendingCursorEvent = e;
+        if (!_cursorRaf) {
+          _cursorRaf = requestAnimationFrame(() => {
+            _cursorRaf = null;
+            if (_pendingCursorEvent) {
+              _updateBrushCursor(_pendingCursorEvent);
+              _pendingCursorEvent = null;
+            }
+          });
+        }
+      } else {
+        _updateBrushCursor(e);
+      }
+    };
+    // Mid-stroke, move the cursor only after the stroke has sampled the canvas
+    // rect: a style write first forces a synchronous style + layout pass of the
+    // whole editor on every pointer move, which made long strokes lag.
+    if (state.drawing) {
+      try { return _continueDrawTools(e); } finally { syncCursor(); }
+    }
+    syncCursor();
   }
+  return _continueDrawTools(e);
+}
+
+function _continueDrawTools(e) {
+  if (state.drawing) return _strokeTool.tryContinue(e);
   // Transform-tool hover-cursor + handle drag — handler in
   // editor/tools/transform-drag.js. Returns true when the drag is
   // consuming the event (rotation / resize); the hover-cursor pass
@@ -5514,17 +5642,13 @@ function _continueDraw(e) {
   if (state.tool === 'quickselect') return _quickSelectTool.drag(e);
   if (state.tool === 'objectselect') return _objectSelectTool.drag(e);
   if (state.tool === 'patch') return _patchTool.drag(e);
-  if (!state.drawing) {
-    if (state.moving) return _continueMove(e);
-    if (state.cropping || state.cropMoving) return _continueCrop(e);
-    return;
-  }
-  // In-progress stroke (brush / eraser / inpaint / clone) — handler in
-  // editor/tools/stroke.js.
-  _strokeTool.tryContinue(e);
+  if (state.moving) return _continueMove(e);
+  if (state.cropping || state.cropMoving) return _continueCrop(e);
 }
 
 function _endDraw(e) {
+  if (_cursorRaf) { cancelAnimationFrame(_cursorRaf); _cursorRaf = null; }
+  if (_pendingCursorEvent) { _updateBrushCursor(_pendingCursorEvent); _pendingCursorEvent = null; }
   if (_cursorLoupeVisible) _setCursorLoupe(false);
   if (state.tool === 'pen') return _penTool.end();
   if (state.tool === 'path') return _pathTool.end(e);
@@ -5543,6 +5667,7 @@ function _endDraw(e) {
   // Stroke end (brush / eraser / inpaint / clone) — handler in
   // editor/tools/stroke.js.
   _strokeTool.tryEnd(e);
+  _invalidateCoordsCaches();
 }
 
 // Floating popup that appears after an inpaint stroke so the user can
@@ -5579,19 +5704,33 @@ const _endStroke = _strokePipeline.endStroke;
 
 // ── Brush cursor overlay ──
 
-
 function _updateBrushCursor(e) {
   if (!state.mainCanvas) return;
-  const rect = state.mainCanvas.getBoundingClientRect();
+  const now = performance.now();
+  let rect;
+  if (_lastCursorRect && (state.drawing || (now - _lastCursorRectTime < 32))) {
+    rect = _lastCursorRect;
+  } else {
+    rect = state.mainCanvas.getBoundingClientRect();
+    _lastCursorRect = rect;
+    _lastCursorRectTime = now;
+  }
   const clientX = e.touches ? e.touches[0].clientX : e.clientX;
   const clientY = e.touches ? e.touches[0].clientY : e.clientY;
 
   if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return;
 
   if (!state.cursorEl) {
+    let layer = document.getElementById('ge-cursor-layer');
+    if (!layer) {
+      layer = document.createElement('div');
+      layer.id = 'ge-cursor-layer';
+      layer.style.cssText = 'position:fixed;inset:0;pointer-events:none;contain:strict;z-index:2147483647;';
+      document.body.appendChild(layer);
+    }
     state.cursorEl = document.createElement('div');
     state.cursorEl.className = 'ge-brush-cursor';
-    document.body.appendChild(state.cursorEl);
+    layer.appendChild(state.cursorEl);
   }
 
   // Lasso uses the feather radius (or a sensible default) so the circle
@@ -5613,14 +5752,23 @@ function _updateBrushCursor(e) {
   // or responsive layout changes the canvas independently of nominal zoom.
   const diameterX = basePx * (rect.width / Math.max(1, state.mainCanvas.width));
   const diameterY = basePx * (rect.height / Math.max(1, state.mainCanvas.height));
-  state.cursorEl.style.width = diameterX + 'px';
-  state.cursorEl.style.height = diameterY + 'px';
+  if (state._lastCursorDiameterX !== diameterX || state._lastCursorDiameterY !== diameterY) {
+    state._lastCursorDiameterX = diameterX;
+    state._lastCursorDiameterY = diameterY;
+    state.cursorEl.style.width = diameterX + 'px';
+    state.cursorEl.style.height = diameterY + 'px';
+  }
   state.cursorEl.classList.toggle('ge-brush-cursor--pixel', pixelBrush);
-  state.cursorEl.style.left = (clientX - diameterX / 2) + 'px';
-  state.cursorEl.style.top = (clientY - diameterY / 2) + 'px';
-  state.cursorEl.style.display = 'block';
-  state.cursorEl.dataset.clientX = String(clientX);
-  state.cursorEl.dataset.clientY = String(clientY);
+  state.cursorEl.style.transform = `translate3d(${clientX - diameterX / 2}px, ${clientY - diameterY / 2}px, 0)`;
+  if (state.cursorEl.style.display !== 'block') {
+    state.cursorEl.style.display = 'block';
+  }
+  state.cursorClientX = clientX;
+  state.cursorClientY = clientY;
+  if (!state.drawing) {
+    state.cursorEl.dataset.clientX = String(clientX);
+    state.cursorEl.dataset.clientY = String(clientY);
+  }
   if (state.tool === 'inpaint') {
     // Visual cue for paint vs erase mode. Ctrl+Alt held mid-hover also
     // flips the cursor so the user sees the effective mode before they
@@ -5641,9 +5789,13 @@ function _updateBrushCursor(e) {
     state.cursorEl.style.background = 'rgba(0,0,0,0.15)';
     state.cursorEl.style.borderStyle = 'solid';
   } else {
-    state.cursorEl.style.borderColor = state.tool === 'eraser' ? 'rgba(255,255,255,0.6)' : state.color;
-    state.cursorEl.style.background = 'transparent';
-    state.cursorEl.style.borderStyle = 'solid';
+    const borderColor = state.tool === 'eraser' ? 'rgba(255,255,255,0.6)' : state.color;
+    if (state._lastCursorBorderColor !== borderColor) {
+      state._lastCursorBorderColor = borderColor;
+      state.cursorEl.style.borderColor = borderColor;
+      state.cursorEl.style.background = 'transparent';
+      state.cursorEl.style.borderStyle = 'solid';
+    }
   }
 }
 
@@ -9476,6 +9628,7 @@ function _getFitZoom() {
 }
 
 function _applyZoom({ resetPan = false } = {}) {
+  _invalidateCoordsCaches();
   if (!state.mainCanvas) return;
   state.mainCanvas.style.width = (state.imgWidth * state.zoom) + 'px';
   state.mainCanvas.style.height = (state.imgHeight * state.zoom) + 'px';
@@ -9485,6 +9638,9 @@ function _applyZoom({ resetPan = false } = {}) {
   const area = state.container && state.container.querySelector('.ge-canvas-area');
   if (resetPan && area && area._resetPan) area._resetPan();
   _syncSelectionOverlay();
+  // The transform overlay is sized and placed for the zoom it was drawn at;
+  // a refit (e.g. the phone Layers sheet collapsing) must redraw it.
+  if (state.transformActive) _drawTransformHandles();
   _precisionGuides?.redrawRulers();
 }
 
@@ -10337,7 +10493,10 @@ function _buildEditor(container) {
       if (e) _eyedropperTool.preview(e);
     },
     syncZoomControls: () => _syncZoomControls(),
-    onViewportChange: () => _precisionGuides?.redrawRulers(),
+    onViewportChange: () => {
+      _precisionGuides?.redrawRulers();
+      if (state.transformActive) _drawTransformHandles();
+    },
     onTwoFingerTap: () => undo(),
     onThreeFingerTap: () => redo(),
   });
@@ -10405,7 +10564,7 @@ function _buildEditor(container) {
       composite();
     },
   });
-  const { rightPanel, controls, layerPanel, dock } = buildRightPanel({
+  const { rightPanel, controls, mobilePanels, layerPanel, dock } = buildRightPanel({
     controlsHTML: _controlsHTML,
     layerPanelHTML: _layerPanelHTML,
     extraPanels: [
@@ -10434,6 +10593,7 @@ function _buildEditor(container) {
   });
   editorBody.appendChild(rightPanel);
   panelVisibility.apply();
+  panelVisibility.subscribe(_invalidateCoordsCaches);
   window.gePanelVisibility = panelVisibility;
   // Remember the workspace/window layout the user last chose and restore it on
   // open, so the editor comes back the way they left it. A fresh session has no
@@ -10502,16 +10662,72 @@ function _buildEditor(container) {
     _preflight?.maybeOpen();
   } catch (_) {}
   try { _initControlKit(container); } catch (_) {}
-  // Tool options live in the options bar (Photoshop), not the dock. On
-  // desktop the controls panel is moved under the contextual strip so the
-  // dock is reserved for Color / Adjustments / Layers; on mobile
-  // right-panel.js already re-parents it into a bottom sheet.
-  if (window.innerWidth > 700 && controls) {
-    optionsBar.appendChild(controls);
-    controls.classList.add('ge-controls--in-options');
-    // The "..." overflow affordance is shown/hidden per tool inside
-    // renderOptionsBar (it only reveals the secondary brush rows).
-  }
+  let _lastLayoutDesktop = null;
+  const _syncResponsiveLayout = (force = false) => {
+    _invalidateCoordsCaches();
+    const isDesktop = window.innerWidth > 700;
+    if (!force && isDesktop === _lastLayoutDesktop) return;
+    _lastLayoutDesktop = isDesktop;
+
+    const footer = container.querySelector('.ge-editor-footer');
+    const hdr = container.querySelector('.ge-layers-header');
+    const fh = container.querySelector('.ge-footer-history');
+    const fz = container.querySelector('.ge-footer-zoom');
+    const setupBtn = document.getElementById('ge-setup-btn');
+    const aiBtn = document.getElementById('ge-ai-settings-btn');
+    const optionsBar = container.querySelector('.ge-options-bar');
+
+    if (isDesktop) {
+      // Reparent controls into optionsBar
+      if (controls && optionsBar && controls.parentElement !== optionsBar) {
+        optionsBar.appendChild(controls);
+      }
+      controls?.classList.add('ge-controls--in-options');
+      controls?.classList.remove('dismissed');
+      optionsBar?.classList.add('ge-options-bar--has-controls');
+
+      // Right panel dock mode
+      rightPanel?.classList.add('ge-right-panel--dock');
+      if (dock?.dock) dock.dock.style.display = '';
+      if (mobilePanels) mobilePanels.style.display = 'none';
+      const panelsBtn = layerPanel?.querySelector('.ge-layers-panels-btn');
+      if (panelsBtn) panelsBtn.style.display = 'none';
+
+      // Clear mobile footer docking on desktop
+      if (fh && footer && fh.parentElement !== footer) {
+        footer.insertBefore(fh, footer.firstChild);
+      }
+      _placeMobileFooter();
+    } else {
+      // Reparent controls into editor container (mobile sheet)
+      if (controls && controls.parentElement !== container) {
+        container.appendChild(controls);
+      }
+      controls?.classList.remove('ge-controls--in-options');
+      optionsBar?.classList.remove('ge-options-bar--has-controls');
+
+      // Right panel mobile sheet mode
+      rightPanel?.classList.remove('ge-right-panel--dock');
+      if (dock?.dock) dock.dock.style.display = 'none';
+      if (mobilePanels) mobilePanels.style.display = '';
+      const panelsBtn = layerPanel?.querySelector('.ge-layers-panels-btn');
+      if (panelsBtn) panelsBtn.style.display = '';
+
+      if (fh && hdr && fh.parentElement !== hdr) {
+        hdr.appendChild(fh);
+      }
+      // Dock footer flush to sheet on mobile
+      _placeMobileFooter();
+    }
+  };
+
+  _syncResponsiveLayout(true);
+  try {
+    const _mobileMql = window.matchMedia('(max-width: 700px)');
+    _mobileMql.addEventListener('change', () => _syncResponsiveLayout(true));
+  } catch (_) {}
+  window.addEventListener('resize', () => _syncResponsiveLayout(false), { passive: true });
+
   // Crop options: aspect-ratio presets (Free / Original / 1:1 / 4:5 / 16:9).
   // Choosing one locks new crop drags to the ratio and refits an existing
   // crop rect (centred, clamped to the canvas). Wired after the controls
@@ -11931,7 +12147,13 @@ function _buildEditor(container) {
     const flat = _aiEditSourceCanvas();
     const image = flat.toDataURL('image/png').split(',')[1];
     const requestId = 'qe-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8);
-    _startAiProgress(requestId);
+    const qeModel = _getSelectedQuickEditModel();
+    const endpointId = payload._endpoint || qeModel.endpoint || '';
+    if (endpointId) {
+      _startAiProgress(requestId, endpointId);
+    } else {
+      _startAiProgress(requestId);
+    }
     const body = JSON.stringify({ image, request_id: requestId, ...payload });
     // The image servers occasionally reject a request transiently (503 while a
     // model swaps, 502/504 gateways, dropped connections). Retry those a couple
@@ -13497,6 +13719,11 @@ export function openEditor(imageUrl, imageId, presetSize, displayName, draftId) 
   state.draftName = displayName || (presetSize ? `New ${presetSize.w}×${presetSize.h}` : 'Untitled');
   state.editorSessionToken += 1;
   state.editorOpen = true;
+  state.documentRevision = 0;
+  state.persistingRevision = 0;
+  state.savedRevision = 0;
+  state.persistRetryCount = 0;
+  if (state.persistRetryTimer) { clearTimeout(state.persistRetryTimer); state.persistRetryTimer = null; }
   _writeActiveEditorSession();
   state.layers = [];
   state.selectedLayerIds = [];
@@ -13547,6 +13774,8 @@ export function openEditor(imageUrl, imageId, presetSize, displayName, draftId) 
   _stopSelectionAnimation();
   window.__galleryEditLive = true;
   if (state.persistTimer) { clearTimeout(state.persistTimer); state.persistTimer = null; }
+  if (state.persistRetryTimer) { clearTimeout(state.persistRetryTimer); state.persistRetryTimer = null; }
+  if (state.pendingStatusTimer) { clearTimeout(state.pendingStatusTimer); state.pendingStatusTimer = null; }
   state.persistDirty = false;
   state.persistErrorMessage = null;
   state.persistInFlight = null;
@@ -13793,6 +14022,8 @@ export function closeEditor(options = {}) {
   // the editor mid-stroke doesn't lose work. The call is fire-and-forget;
   // the server commit lands shortly after the modal hides.
   if (state.persistTimer) { clearTimeout(state.persistTimer); state.persistTimer = null; }
+  if (state.persistRetryTimer) { clearTimeout(state.persistRetryTimer); state.persistRetryTimer = null; }
+  if (state.pendingStatusTimer) { clearTimeout(state.pendingStatusTimer); state.pendingStatusTimer = null; }
   if (state.layers.length) {
     try { _persistDraft(); } catch {}
   }
@@ -13831,6 +14062,7 @@ export function closeEditor(options = {}) {
     try { document.removeEventListener('click', h); } catch {}
   }
   if (state.cursorEl) { state.cursorEl.remove(); state.cursorEl = null; }
+  try { document.getElementById('ge-cursor-layer')?.remove(); } catch {}
   // Tear down all floating popups + the dock so closing the editor
   // doesn't leave stale chips/panels behind on top of the gallery.
   try { _closeFxMenu(); } catch {}

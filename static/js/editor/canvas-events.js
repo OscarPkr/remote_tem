@@ -44,6 +44,7 @@
  * }} ctx
  */
 import { state } from './state.js';
+import { invalidateCanvasCoordsCache } from './canvas-coords.js';
 import {
   applyCanvasPan,
   isDirectPanIntent,
@@ -58,6 +59,12 @@ export function wireCanvasEvents({ canvasArea, beginDraw, continueDraw, endDraw,
   canvasWindowBindings?.abort();
   canvasWindowBindings = new AbortController();
   const { signal } = canvasWindowBindings;
+
+  // Invalidate coordinate cache on layout, scroll, resize or orientation shifts
+  window.addEventListener('resize', invalidateCanvasCoordsCache, { signal, passive: true });
+  window.addEventListener('scroll', invalidateCanvasCoordsCache, { signal, passive: true });
+  window.addEventListener('orientationchange', invalidateCanvasCoordsCache, { signal, passive: true });
+  canvasArea.addEventListener('scroll', invalidateCanvasCoordsCache, { passive: true });
   let suppressMouseUntil = 0;
   // Tool-aware right-click menu on the image and the surrounding area.
   wireCanvasContextMenu(canvasArea, { signal });
@@ -90,7 +97,7 @@ export function wireCanvasEvents({ canvasArea, beginDraw, continueDraw, endDraw,
   window.addEventListener('mousemove', (e) => {
     if (Date.now() < suppressMouseUntil) return;
     // Only shield the raw-coordinate selection/crop rects from chrome.
-    if (isUiChrome(e) && directGestureActive()) return;
+    if (directGestureActive() && isUiChrome(e)) return;
     continueDraw(e);
   }, { signal });
   window.addEventListener('mouseup', (e) => {
@@ -240,11 +247,14 @@ export function wireCanvasEvents({ canvasArea, beginDraw, continueDraw, endDraw,
       const newZoom = Math.max(0.1, Math.min(5, multiStartZoom * ratio));
       if (Math.abs(newZoom - state.zoom) > 0.001) {
         state.zoom = newZoom;
+        // A pinch is an explicit zoom; layout refits must not undo it.
+        state.zoomViewMode = 'scale';
         state.mainCanvas.style.width = (state.imgWidth * state.zoom) + 'px';
         state.mainCanvas.style.height = (state.imgHeight * state.zoom) + 'px';
         const label = state.container.querySelector('.ge-zoom-label');
         if (label) label.textContent = Math.round(state.zoom * 100) + '%';
         syncZoomControls?.();
+        invalidateCanvasCoordsCache();
         onViewportChange?.();
       }
       const dx = info.cx - multiStartCenter.x;

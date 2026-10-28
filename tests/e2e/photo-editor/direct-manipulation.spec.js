@@ -1,6 +1,6 @@
 const { test, expect } = require('@playwright/test');
 const { selectTool } = require('./helpers.js');
-const { dragOnCanvas, editorState, flattenedPixelDigest, openBlankEditor } = require('./helpers.js');
+const { dragOnCanvas, editorState, flattenedPixelDigest, openBlankEditor, settledCanvasBox } = require('./helpers.js');
 
 test('tool switching cancels incomplete crop and selection gestures without stale edits', async ({ page }) => {
   await openBlankEditor(page, { width: 320, height: 240 }, 'Gesture cancellation');
@@ -75,13 +75,15 @@ test('touch crop and selection gestures complete through the shared lifecycle', 
   try {
     await openBlankEditor(page, { width: 320, height: 240 }, 'Touch gestures');
     const cdp = await context.newCDPSession(page);
-    const canvasBox = await page.locator('.ge-main-canvas').boundingBox();
     const touch = async (type, x, y) => cdp.send('Input.dispatchTouchEvent', {
       type,
       touchPoints: type === 'touchEnd' ? [] : [{ x, y, id: 1, radiusX: 6, radiusY: 6 }],
     });
 
     await selectTool(page, 'crop');
+    // Picking a tool minimizes the phone Layers sheet and refits the canvas;
+    // aim at where the canvas settles, as a finger would.
+    const canvasBox = await settledCanvasBox(page);
     await touch('touchStart', canvasBox.x + 35, canvasBox.y + 30);
     await touch('touchMove', canvasBox.x + 190, canvasBox.y + 145);
     await touch('touchEnd', canvasBox.x + 190, canvasBox.y + 145);
@@ -113,18 +115,24 @@ test('touch brush paints and undoes as one stroke', async ({ browser, browserNam
   try {
     await openBlankEditor(page, { width: 320, height: 240 }, 'Touch brush');
     const cdp = await context.newCDPSession(page);
-    const canvasBox = await page.locator('.ge-main-canvas').boundingBox();
     const touch = async (type, x, y) => cdp.send('Input.dispatchTouchEvent', {
       type,
       touchPoints: type === 'touchEnd' ? [] : [{ x, y, id: 1, radiusX: 6, radiusY: 6 }],
     });
     await selectTool(page, 'brush');
+    // Re-tapping the active tool collapses its controls sheet (canvas-first
+    // phone editing), which also uncovers the Layers sheet grab handle.
+    await selectTool(page, 'brush');
+    const canvasBox = await settledCanvasBox(page);
     const before = await flattenedPixelDigest(page);
     await touch('touchStart', canvasBox.x + canvasBox.width * 0.25, canvasBox.y + canvasBox.height * 0.5);
     await touch('touchMove', canvasBox.x + canvasBox.width * 0.75, canvasBox.y + canvasBox.height * 0.5);
     await touch('touchEnd', canvasBox.x + canvasBox.width * 0.75, canvasBox.y + canvasBox.height * 0.5);
     const after = await flattenedPixelDigest(page);
     expect(after).not.toEqual(before);
+    // History buttons live in the Layers sheet, which the tool pick minimized.
+    await page.locator('.ge-layers-grab').click();
+    await expect(page.locator('.ge-right-panel')).not.toHaveClass(/minimized/);
     await page.locator('#ge-undo').click();
     expect(await flattenedPixelDigest(page)).toEqual(before);
   } finally {

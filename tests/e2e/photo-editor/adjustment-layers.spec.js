@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { selectTool } = require('./helpers.js');
+const { chooseFilterAction, selectTool } = require('./helpers.js');
 const {
   dragOnCanvas,
   encodedImagePixelDigest,
@@ -11,7 +11,7 @@ const {
 } = require('./helpers.js');
 
 async function addAdjustment(page, type) {
-  await page.locator('#ge-add-layer').click();
+  await page.locator('#ge-add-fx').click();
   const menu = page.locator('.ge-add-layer-menu');
   await expect(menu).toBeVisible();
   await menu.locator(`[data-adjustment-type="${type}"]`).click();
@@ -252,8 +252,7 @@ test('retained Gaussian Blur survives flattening and draft reopen', async ({ pag
   await dragOnCanvas(page, { x: 0.2, y: 0.25 }, { x: 0.8, y: 0.7 });
   const before = await flattenedPixelDigest(page);
 
-  await page.locator('#ge-filter-menu-btn').click();
-  await page.locator('[data-filter-action="effect-blur-gaussian"]').click();
+  await chooseFilterAction(page, 'effect-blur-gaussian');
   await expect(page.locator('.ge-filter-modal')).toBeVisible();
   await page.locator('.ge-filter-row input[data-key="radius"]').fill('14');
   await page.locator('.ge-filter-modal [data-action="apply"]').click();
@@ -282,8 +281,7 @@ test('retained Gaussian Blur survives flattening and draft reopen', async ({ pag
 
 test('retained Sharpen keeps editable amount and survives draft reopen', async ({ page }) => {
   await openBlankEditor(page, { width: 320, height: 220 }, 'Retained sharpen E2E');
-  await page.locator('#ge-filter-menu-btn').click();
-  await page.locator('[data-filter-action="effect-preset-crisp-detail"]').click();
+  await chooseFilterAction(page, 'effect-preset-crisp-detail');
   await expect(page.locator('.ge-filter-modal')).toBeVisible();
   expect(await page.locator('.ge-filter-row input[data-key="amount"]').inputValue()).toBe('35');
   await page.locator('.ge-filter-row input[data-key="amount"]').fill('75');
@@ -308,16 +306,14 @@ test('retained overlay and shadow effects keep editable metadata', async ({ page
   await page.mouse.down();
   await page.mouse.move(canvasBox.x + 150, canvasBox.y + 140);
   await page.mouse.up();
-  await page.locator('#ge-filter-menu-btn').click();
-  await page.locator('[data-filter-action="effect-color-overlay"]').click();
+  await chooseFilterAction(page, 'effect-color-overlay');
   await expect(page.locator('.ge-filter-modal')).toBeVisible();
   await page.locator('.ge-filter-row input[type="color"]').fill('#336699');
   await page.locator('.ge-filter-row input[data-key="opacity"]').fill('35');
   await page.locator('.ge-filter-modal [data-action="apply"]').click();
   await page.locator('button[title="Add effect mask from selection"]').click();
 
-  await page.locator('#ge-filter-menu-btn').click();
-  await page.locator('[data-filter-action="effect-drop-shadow"]').click();
+  await chooseFilterAction(page, 'effect-drop-shadow');
   await expect(page.locator('.ge-filter-modal')).toBeVisible();
   await page.locator('.ge-filter-row input[data-key="blur"]').fill('18');
   await page.locator('.ge-filter-modal [data-action="apply"]').click();
@@ -348,8 +344,7 @@ test('retained Stroke uses layer alpha and persists its controls', async ({ page
   await openBlankEditor(page, { width: 320, height: 220 }, 'Retained stroke E2E');
   await selectTool(page, 'brush');
   await dragOnCanvas(page, { x: 0.25, y: 0.25 }, { x: 0.75, y: 0.7 });
-  await page.locator('#ge-filter-menu-btn').click();
-  await page.locator('[data-filter-action="effect-stroke"]').click();
+  await chooseFilterAction(page, 'effect-stroke');
   await expect(page.locator('.ge-filter-modal')).toBeVisible();
   await page.locator('.ge-filter-row input[data-key="width"]').fill('9');
   await page.locator('.ge-filter-modal [data-action="apply"]').click();

@@ -388,11 +388,13 @@ def test_quick_edit_has_an_agent_model_picker():
     assert "Recommended, not required" in AI_SETTINGS
     assert "function _getSelectedQuickEditAgentModel()" in EDITOR
     assert "getAgentModel: () => _getSelectedQuickEditAgentModel()," in EDITOR
-    # Local Qwen3.5-9B VL is the default; server default is the alternative.
+    # Local/hosted agent models are dynamically discovered via /api/editor/agent-models;
+    # private Tailscale/CGNAT IPs must not be hardcoded in frontend source.
     assert "export function resolveQuickEditAgentModel()" in models
     assert "export const QUICK_EDIT_AGENT_OPTIONS" in models
-    assert "Qwen3.5-9B VL · local" in models
-    assert "http://100.69.120.65:8097/v1::Qwen/Qwen3.5-9B" in models
+    assert "Server default (hosted planner)" in models
+    assert "100.69.120.65" not in models
+    assert "/api/editor/agent-models" in models
     assert "localStorage.setItem('ge-ai-command-agent-model', aiCommandAgentSelect.value)" in models
     assert "localStorage.getItem('ge-ai-command-agent-model')" in models
     # The request carries the agent model.

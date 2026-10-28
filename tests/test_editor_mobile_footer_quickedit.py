@@ -18,21 +18,10 @@ CSS = (ROOT / "static/css/13-image-editor.css").read_text(encoding="utf-8")
 EDITOR = (ROOT / "static/js/galleryEditor.js").read_text(encoding="utf-8")
 SW = (ROOT / "static/sw.js").read_text(encoding="utf-8")
 
-MOBILE_BLOCK = """@media (max-width: 700px) {
-  .ge-editor-footer {
-    display: none !important;
-  }
-  /* The Quick Edit card lifts over the layers sheet / keyboard; keep it above
-     every other editor asset (sheet headers, tool rail, popups) while lifted. */
-  .ge-ai-command {
-    z-index: 90;
-  }
-}"""
-
-
-def test_mobile_footer_is_removed():
-    assert MOBILE_BLOCK in CSS
-    assert ".ge-editor-footer {\n    display: none !important;" in CSS
+def test_mobile_footer_is_docked_flush_and_accessible():
+    assert ".ge-editor-footer" in CSS
+    assert "overflow-x: auto;" in CSS
+    assert ".ge-editor-footer {\n    display: none !important;" not in CSS
 
 
 def test_quick_edit_stacks_above_other_assets():

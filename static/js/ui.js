@@ -8,7 +8,7 @@ import themeModule from './theme.js?v=20260911organsrain1';
 import * as Modals from './modalManager.js';
 import spinnerModule from './spinner.js';
 import { registerMenuDismiss, dismissTopEscapeLayer, dismissOrRemove } from './escMenuStack.js';
-import { nextToolWindowZ, topToolWindowZ } from './toolWindowZOrder.js';
+import { nextToolWindowZ, topToolWindowZ, topPortalZ } from './toolWindowZOrder.js';
 
 let toastEl = null;
 let autoScrollEnabled = true;
@@ -793,10 +793,12 @@ export function styledConfirm(message, { confirmText = 'Confirm', cancelText = '
     const _prevFocus = document.activeElement;
     overlay.classList.remove('hidden');
     overlay.style.display = '';
+    overlay.style.zIndex = String(topPortalZ() + 1000);
 
     function cleanup(result) {
       overlay.classList.add('hidden');
       overlay.style.display = 'none';
+      overlay.style.zIndex = '';
       okBtn.removeEventListener('click', onOk);
       cancelBtn.removeEventListener('click', onCancel);
       altBtn.removeEventListener('click', onAlt);

@@ -1,10 +1,11 @@
 const { test, expect } = require('@playwright/test');
 const { selectTool } = require('./helpers.js');
-const { dragOnCanvas, editorState, openBlankEditor, reopenDraft, waitForDraft } = require('./helpers.js');
+const { dragOnCanvas, editorState, openBlankEditor, openOptionsMore, reopenDraft, waitForDraft } = require('./helpers.js');
 
 test('text edits directly on canvas and remains retained after reopen', async ({ page }) => {
   await openBlankEditor(page);
   await selectTool(page, 'text');
+  await openOptionsMore(page, 'text');
   await page.locator('#ge-text-frame-width').fill('260');
   const canvas = await page.locator('.ge-main-canvas').boundingBox();
   await page.mouse.click(canvas.x + canvas.width * 0.2, canvas.y + canvas.height * 0.2);
@@ -14,11 +15,13 @@ test('text edits directly on canvas and remains retained after reopen', async ({
   await editor.press('Control+Enter');
   await expect(editor).toHaveCount(0);
 
+  await openOptionsMore(page, 'text');
   await page.locator('#ge-text-letter-spacing').fill('3.5');
   await page.locator('#ge-text-line-height').fill('1.4');
   await page.locator('#ge-text-font').selectOption('Georgia');
   await page.locator('.ge-text-auto-width-option').click();
   await expect(page.locator('#ge-text-auto-width')).toBeChecked();
+  await openOptionsMore(page, 'text');
   await expect(page.locator('#ge-text-frame-width')).toBeDisabled();
   await page.locator('#ge-text-frame-height').fill('180');
   await page.locator('#ge-text-vertical-align').selectOption('bottom');
@@ -47,8 +50,13 @@ test('text paragraph controls remain usable in a narrow phone viewport', async (
   const section = page.locator('#ge-text-section');
   await expect(section).toBeVisible();
   expect(await section.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+  await openOptionsMore(page, 'text');
   await expect(page.locator('#ge-text-frame-height')).toBeVisible();
   await expect(page.locator('#ge-text-vertical-align')).toBeVisible();
+  expect(await page.locator('#ge-text-more').evaluate(el => {
+    const box = el.getBoundingClientRect();
+    return box.left >= 0 && box.right <= innerWidth + 1;
+  })).toBe(true);
 });
 
 test('rectangle ellipse line and polygon remain editable shape layers', async ({ page }) => {
@@ -71,6 +79,7 @@ test('rectangle ellipse line and polygon remain editable shape layers', async ({
   let current = await editorState(page);
   const shapes = current.layers.filter(layer => layer.kind === 'shape');
   expect(shapes.map(layer => layer.shape.type)).toEqual(types);
+  await openOptionsMore(page, 'shape');
   await page.locator('#ge-shape-sides').fill('7');
   await page.locator('#ge-shape-stroke-width').fill('6');
   await page.locator('#ge-shape-radius').fill('14');
@@ -96,6 +105,7 @@ test('rectangle ellipse line and polygon remain editable shape layers', async ({
 test('gradient shape fill remains editable after reopening the project', async ({ page }) => {
   await openBlankEditor(page);
   await selectTool(page, 'shape');
+  await openOptionsMore(page, 'shape');
   await expect(page.locator('#ge-shape-gradient-add-stop')).toBeHidden();
   await dragOnCanvas(page, { x: 0.2, y: 0.2 }, { x: 0.65, y: 0.55 });
   await page.locator('#ge-shape-gradient-angle').evaluate((angle) => {
@@ -110,6 +120,7 @@ test('gradient shape fill remains editable after reopening the project', async (
     angle.value = '35';
     angle.dispatchEvent(new Event('input', { bubbles: true }));
   });
+  await openOptionsMore(page, 'shape');
   await expect(page.locator('#ge-shape-gradient-add-stop')).toBeVisible();
 
   const before = await editorState(page);
@@ -143,6 +154,7 @@ test('shape gradients retain added stops through editing and reopen', async ({ p
   await openBlankEditor(page, { width: 360, height: 240 }, 'Multi-stop gradient E2E');
   await selectTool(page, 'shape');
   await dragOnCanvas(page, { x: 0.15, y: 0.2 }, { x: 0.75, y: 0.65 });
+  await openOptionsMore(page, 'shape');
   await page.locator('#ge-shape-fill-type').selectOption('linear-gradient');
   await page.evaluate(() => {
     for (const [id, value] of [['ge-shape-gradient-start', '#ff0000'], ['ge-shape-gradient-end', '#0000ff']]) {

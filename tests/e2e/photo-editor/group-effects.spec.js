@@ -1,5 +1,5 @@
 const { test, expect } = require('@playwright/test');
-const { selectTool } = require('./helpers.js');
+const { chooseFilterAction, selectTool } = require('./helpers.js');
 const fs = require('node:fs');
 const {
   compareExportPixels,
@@ -38,8 +38,7 @@ test('group retained effects edit, toggle, reorder surface, and survive reopen',
   const groupId = (await editorState(page)).groups[0].id;
   const groupRow = page.locator(`.ge-layer-group-row[data-group-id="${groupId}"]`);
 
-  await page.locator('.ge-layer-controls:visible .ge-layer-btn[title*="effect"]').click();
-  await page.locator('[data-filter-action="effect-blur-gaussian"]').click();
+  await chooseFilterAction(page, 'effect-blur-gaussian', '.ge-layer-controls:visible .ge-layer-btn[title*="effect"]');
   await expect(page.locator('.ge-filter-modal')).toBeVisible();
   await page.locator('.ge-filter-row input[data-key="radius"]').fill('14');
   await page.locator('.ge-filter-modal [data-action="apply"]').click();
@@ -84,8 +83,7 @@ test('group retained effects export the visible composite and survive reopen', a
   await page.locator('.ge-layer-item[data-layer-id]').filter({ hasText: 'Background' }).first().click({ modifiers: ['Control'] });
   await page.locator('#ge-group-selected').click();
 
-  await page.locator('.ge-layer-controls:visible .ge-layer-btn[title*="effect"]').click();
-  await page.locator('[data-filter-action="effect-color-overlay"]').click();
+  await chooseFilterAction(page, 'effect-color-overlay', '.ge-layer-controls:visible .ge-layer-btn[title*="effect"]');
   await expect(page.locator('.ge-filter-modal')).toBeVisible();
   await page.locator('.ge-filter-row input[type="color"]').fill('#336699');
   await page.locator('.ge-filter-row input[data-key="opacity"]').fill('40');

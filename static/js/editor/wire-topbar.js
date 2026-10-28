@@ -127,8 +127,8 @@ export function wireTopbar(deps) {
         (Math.abs(state.zoom - 1) < 0.001 && state.zoomViewMode !== 'fit')) fitZoom();
     else { state.zoom = 1; state.zoomViewMode = 'scale'; applyZoom(); }
   });
-  document.getElementById('ge-zoom-in')?.addEventListener('click', () => { state.zoom = Math.min(5, state.zoom * 1.25); applyZoom(); });
-  document.getElementById('ge-zoom-out')?.addEventListener('click', () => { state.zoom = Math.max(0.1, state.zoom / 1.25); applyZoom(); });
+  document.getElementById('ge-zoom-in')?.addEventListener('click', () => { state.zoom = Math.min(5, state.zoom * 1.25); state.zoomViewMode = 'scale'; applyZoom(); });
+  document.getElementById('ge-zoom-out')?.addEventListener('click', () => { state.zoom = Math.max(0.1, state.zoom / 1.25); state.zoomViewMode = 'scale'; applyZoom(); });
 
   // Export / Download / Project Save / Project Load.
   document.getElementById('ge-export-gallery')?.addEventListener('click', exportToGallery);

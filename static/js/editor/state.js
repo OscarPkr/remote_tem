@@ -400,10 +400,15 @@ export const state = {
   // Loading-overlay element (whirlpool + label).
   editorLoadingEl: null,
 
-  // ── Draft persistence ──
+  // ── Draft persistence & revision tracking ──
   draftId: null,
   draftName: '',
   documentId: null,
+  documentRevision: 0,
+  persistingRevision: 0,
+  savedRevision: 0,
+  persistRetryTimer: null,
+  persistRetryCount: 0,
   persistTimer: null,
   // Current PUT/POST promise so concurrent saves can chain.
   persistInFlight: null,

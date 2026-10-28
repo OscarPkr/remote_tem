@@ -242,7 +242,13 @@ export function buildToolbar({ currentTool, onSelectTool, onClearSelection }) {
                   : soft >= 70
                     ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="6.5" fill="currentColor" opacity="0.3"/><circle cx="12" cy="12" r="6.5"/></svg>'
                     : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="12" cy="12" r="6.5" fill="currentColor" opacity="0.65"/><circle cx="12" cy="12" r="6.5"/></svg>';
-              presetItem.insertAdjacentHTML('beforeend', `<span class="ge-tool-icon">${presetIcon}</span><span class="ge-tool-flyout-label">${preset.name}</span>`);
+              const icon = document.createElement('span');
+              icon.className = 'ge-tool-icon';
+              icon.innerHTML = presetIcon;
+              const label = document.createElement('span');
+              label.className = 'ge-tool-flyout-label';
+              label.textContent = preset.name;
+              presetItem.append(icon, label);
               presetItem.addEventListener('click', (ev) => {
                 ev.stopPropagation();
                 setInner(face, 'brush');

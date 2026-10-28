@@ -223,15 +223,23 @@ test('mobile touch input can grab every transform handle', async ({ browser, bro
     const handlePoint = id => page.evaluate(async handleId => {
       const { state } = await import('/static/js/editor/state.js');
       const { transformFrameGeometry } = await import('/static/js/editor/transform-frame-geometry.js');
-      const geometry = transformFrameGeometry({
+      const frame = {
         centerX: state.transformCenter.x,
         centerY: state.transformCenter.y,
         width: state.transformPendingW,
         height: state.transformPendingH,
         rotation: state.transformPendingRot,
-      }, { zoom: state.zoom, rotationInside: handleId === 'rot' });
-      const handle = geometry.handles.find(item => item.id === handleId);
+      };
       const rect = state.mainCanvas.getBoundingClientRect();
+      const outside = transformFrameGeometry(frame, { zoom: state.zoom }).rotationHandle;
+      const x = rect.left + outside.x * rect.width / state.mainCanvas.width;
+      const y = rect.top + outside.y * rect.height / state.mainCanvas.height;
+      const area = state.container.querySelector('.ge-canvas-area').getBoundingClientRect();
+      const popup = state.transformPopup?.getBoundingClientRect();
+      const rotationInside = y < area.top + 6 || x < area.left + 6 || x > area.right - 6 ||
+        !!(popup && x >= popup.left && x <= popup.right && y >= popup.top && y <= popup.bottom);
+      const geometry = transformFrameGeometry(frame, { zoom: state.zoom, rotationInside });
+      const handle = geometry.handles.find(item => item.id === handleId);
       return {
         x: rect.left + handle.x * rect.width / state.mainCanvas.width,
         y: rect.top + handle.y * rect.height / state.mainCanvas.height,
@@ -365,4 +373,43 @@ test('transform handle keeps tracking when the pointer crosses the right panel',
     return state.transformPendingW;
   });
   expect(after).toBeGreaterThan(setup.width);
+});
+
+test('phone transform overlay follows the canvas through refits and zoom', async ({ browser }) => {
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+    isMobile: true,
+    hasTouch: true,
+    serviceWorkers: 'block',
+  });
+  const page = await context.newPage();
+  try {
+    await openBlankEditor(page, { width: 640, height: 480 }, 'Phone transform overlay');
+    const fitBefore = await page.evaluate(async () => (await import('/static/js/editor/state.js')).state.zoom);
+    await selectTool(page, 'transform');
+    await expect(page.locator('#ge-transform-section')).toBeVisible();
+    const alignment = () => page.evaluate(async () => {
+      const { state } = await import('/static/js/editor/state.js');
+      const overlay = state.transformOverlay.getBoundingClientRect();
+      const canvas = state.mainCanvas.getBoundingClientRect();
+      return {
+        zoom: state.zoom,
+        overlayScale: overlay.width / state.transformOverlay.width,
+        covers: overlay.left <= canvas.left + 1 && overlay.top <= canvas.top + 1
+          && overlay.right >= canvas.right - 1 && overlay.bottom >= canvas.bottom - 1,
+      };
+    });
+    // Selecting Transform collapses the Layers sheet, which refits the canvas.
+    await expect.poll(async () => (await alignment()).zoom).not.toBe(fitBefore);
+    let current = await alignment();
+    expect(Math.abs(current.overlayScale - current.zoom)).toBeLessThan(0.002);
+    expect(current.covers).toBe(true);
+
+    await page.locator('#ge-zoom-in').evaluate(button => button.click());
+    await expect.poll(async () => (await alignment()).zoom).toBeGreaterThan(current.zoom);
+    current = await alignment();
+    expect(Math.abs(current.overlayScale - current.zoom)).toBeLessThan(0.002);
+  } finally {
+    await context.close();
+  }
 });

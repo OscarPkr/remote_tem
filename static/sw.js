@@ -7,7 +7,7 @@
 //   - Other static assets (images/fonts/libs): cache-first with bg refresh.
 //   - API / non-GET: never cached.
 // Bump CACHE_NAME whenever the precache list or SW logic changes.
-const CACHE_NAME = 'odysseus-v1113-pr40-editor-precache';
+const CACHE_NAME = 'odysseus-v1114-pr40-editor-precache';
 
 // KaTeX resolves these from its own stylesheet, so caching the CSS without them
 // gives offline math fallback glyphs instead of proper typesetting.
@@ -74,6 +74,8 @@ const PRECACHE = [
   '/static/js/fileHandler.js?v=20260909mobileattachmentedit1',
   '/static/js/voiceRecorder.js',
   '/static/js/actionMenuOrder.js',
+  '/static/js/platform.js',
+  '/static/js/modelSort.js',
   '/static/js/models.js',
   '/static/js/rag.js',
   '/static/js/presets.js?v=20260908personaname1',
@@ -364,11 +366,29 @@ self.addEventListener('activate', (e) => {
   );
 });
 
+// Offline fallback for /static/ JS/CSS. /static is a public, unauthenticated
+// mount whose bytes do not depend on the request, but CORS adds `Vary: Origin`
+// and module imports send an Origin header that install-time fetches omit, so a
+// strict match hides the precached copy. Ignore Vary only for entries in this
+// worker's own cache whose sole Vary header is Origin.
+async function cachedStaticFile(request) {
+  const cache = await caches.open(CACHE_NAME);
+  const exact = await cache.match(request);
+  if (exact) return exact;
+  const variesOnlyOnOrigin = response => (response.headers.get('Vary') || '')
+    .split(',').map(name => name.trim().toLowerCase()).filter(Boolean)
+    .every(name => name === 'origin');
+  const candidates = await cache.matchAll(request, { ignoreVary: true });
+  return candidates.find(variesOnlyOnOrigin) || Response.error();
+}
+
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
 
   // Never touch API calls or non-GET.
   if (url.pathname.startsWith('/api/') || e.request.method !== 'GET') return;
+  // Only this origin's own files are cached; anything else goes to the network.
+  if (url.origin !== self.location.origin) return;
 
   // HTML navigation: network-first app shell — but ONLY for the SPA root.
   // Other navigations (e.g. a deep-linked /static/*.html page) must go to the
@@ -394,10 +414,10 @@ self.addEventListener('fetch', (e) => {
       fetch(e.request).then(res => {
         if (res && res.ok) {
           const copy = res.clone();
-          caches.open(CACHE_NAME).then(cache => cache.put(e.request, copy));
+          caches.open(CACHE_NAME).then(cache => cache.put(e.request, copy)).catch(() => {});
         }
         return res;
-      }).catch(() => caches.match(e.request))
+      }).catch(() => cachedStaticFile(e.request))
     );
     return;
   }

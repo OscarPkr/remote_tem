@@ -1948,7 +1948,8 @@ export function createLayerPanelRenderer(deps) {
           });
           const sName = document.createElement('span');
           sName.className = 'ge-layer-name ge-adj-sub-name';
-          sName.innerHTML = `<span class="ge-adj-sub-icon">◌</span><span>${effectLabel(effect.type)}</span>`;
+          sName.innerHTML = '<span class="ge-adj-sub-icon">◌</span><span></span>';
+          sName.lastElementChild.textContent = effectLabel(effect.type);
           sName.title = 'Edit effect (drag onto another layer to copy)';
           sName.addEventListener('click', event => {
             event.stopPropagation();

@@ -28,10 +28,10 @@ const GRADIENTS = [
   ['Spectrum', ['#ff0000', '#ffff00', '#00ff00', '#00ffff', '#0000ff', '#ff00ff']],
 ];
 
-function el(tag, className, html) {
+function el(tag, className, text) {
   const node = document.createElement(tag);
   if (className) node.className = className;
-  if (html != null) node.innerHTML = html;
+  if (text != null) node.textContent = text;
   return node;
 }
 

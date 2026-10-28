@@ -50,7 +50,7 @@ import {
 import { drawHistogram } from './histogram.js';
 import { parseCubeLut, generateCubeLut } from './cube-lut.js';
 
-export function createAdjPopupSystem({ composite, saveState, renderLayerPanel, getAdjustmentSource = null }) {
+export function createAdjPopupSystem({ composite, saveState, renderLayerPanel, getAdjustmentSource = null, schedulePersist = null }) {
   function suppressLayerGhostTap() {
     window.__geSuppressLayerTapUntil = Date.now() + 650;
   }
@@ -511,6 +511,7 @@ export function createAdjPopupSystem({ composite, saveState, renderLayerPanel, g
       composite();
       renderLayerPanel();
       closeAdjPopup();
+      schedulePersist?.();
     });
   }
 
@@ -535,8 +536,14 @@ export function createAdjPopupSystem({ composite, saveState, renderLayerPanel, g
       if (!p.channels[channel]) p.channels[channel] = defaultAdjParams('levels').channels[channel];
       return p.channels[channel];
     };
+    // Params come from project files and drafts, which only validate the
+    // adjustment type; coerce anything interpolated into markup below.
+    const finite = value => (Number.isFinite(Number(value)) ? Number(value) : 0);
+    const hexColor = (value, fallback) => (/^#[0-9a-f]{6}$/i.test(value) ? value : fallback);
     const revertIcon = '<svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>';
-    const sliderRow = (key, label, min, max, value, suffix, defaultValue) => `
+    const sliderRow = (key, label, min, max, rawValue, suffix, defaultValue) => {
+      const value = finite(rawValue);
+      return `
       <div class="ge-adj-row" data-adj-key="${key}"${defaultValue != null ? ` data-default="${defaultValue}"` : ''}>
         <label>${label}</label>
         <input type="range" min="${min}" max="${max}" value="${value}" data-key="${key}" />
@@ -544,6 +551,7 @@ export function createAdjPopupSystem({ composite, saveState, renderLayerPanel, g
         <button class="ge-adj-revert" type="button" title="Reset this slider" data-revert-key="${key}">${revertIcon}</button>
       </div>
     `;
+    };
     if (type === 'brightness-contrast') {
       const bSlider = Math.round((p.brightness - 1) * 100);
       const cSlider = Math.round((p.contrast - 1) * 100);
@@ -692,7 +700,7 @@ export function createAdjPopupSystem({ composite, saveState, renderLayerPanel, g
       });
     } else if (type === 'color-balance') {
       // Color-tinted slider ends so the user sees what direction does what.
-      const cbRow = (key, leftCol, rightCol, label, value) => `
+      const cbRow = (key, leftCol, rightCol, label, rawValue, value = finite(rawValue)) => `
       <div class="ge-adj-row ge-adj-cb-row" data-adj-key="${key}">
         <span class="ge-adj-cb-dot" style="background:${leftCol}"></span>
         <input type="range" min="-100" max="100" value="${value}" data-key="${key}" />
@@ -749,6 +757,9 @@ export function createAdjPopupSystem({ composite, saveState, renderLayerPanel, g
         buildAdjBody(layer, type, body, popEl);
       });
     } else if (type === 'gradient-map') {
+      const gradientDefaults = defaultAdjParams('gradient-map');
+      p.shadows = hexColor(p.shadows, gradientDefaults.shadows);
+      p.highlights = hexColor(p.highlights, gradientDefaults.highlights);
       body.innerHTML = `
         <div class="ge-gradient-map-preview" style="--ge-gradient-start:${p.shadows};--ge-gradient-end:${p.highlights}"></div>
         <div class="ge-gradient-color-row">
@@ -789,7 +800,7 @@ export function createAdjPopupSystem({ composite, saveState, renderLayerPanel, g
       body.innerHTML = `
         <div class="ge-adj-row">
           <label>Color</label>
-          <input type="color" data-photo-key="color" value="${p.color || '#ec8a00'}">
+          <input type="color" data-photo-key="color" value="${hexColor(p.color, '#ec8a00')}">
         </div>
         ${sliderRow('density', 'Density', 0, 100, Math.round(p.density ?? 25), '%')}
         <label class="ge-adj-toggle-row"><span>Preserve luminosity</span><input type="checkbox" data-photo-preserve${p.preserve_luminosity ? ' checked' : ''}><span class="ge-toggle-track"></span></label>
@@ -838,7 +849,7 @@ export function createAdjPopupSystem({ composite, saveState, renderLayerPanel, g
       const presetLabels = { none: 'None', teal_orange: 'Teal & Orange', cold: 'Cold', warm: 'Warm', high_contrast: 'High Contrast', sepia: 'Sepia' };
       const strength = p.strength == null ? 100 : p.strength;
       const hasCube = !!(p.cube && p.cube.size && p.cube.data);
-      const lutName = hasCube ? `Loaded LUT · ${p.cube.size}³` : 'No .cube loaded';
+      const lutName = hasCube ? `Loaded LUT · ${finite(p.cube.size)}³` : 'No .cube loaded';
       body.innerHTML = `
         <label class="ge-adj-channel-field">Lookup preset
           <select class="ge-adj-lut-select">
@@ -971,6 +982,8 @@ export function createAdjPopupSystem({ composite, saveState, renderLayerPanel, g
     } else if (type === 'color-lookup') {
       p.strength = raw; display = raw + '%';
     } else if (type === 'white-balance') {
+      p[key] = raw;
+    } else if (type === 'vibrance') {
       p[key] = raw;
     } else if (type === 'black-white') {
       p[key] = raw;

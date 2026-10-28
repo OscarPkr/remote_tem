@@ -1043,8 +1043,8 @@ def test_editor_agent_model_override_is_first_candidate(monkeypatch):
 
     monkeypatch.setattr(eam, "local_bases", lambda: ["http://local1"])
     monkeypatch.setattr(eam, "local_model", lambda: "LMODEL")
-    cands = eam._candidates(None, "http://ovr::OVERRIDE")
-    assert cands[0] == {"base": "http://ovr", "model": "OVERRIDE", "headers": None,
+    cands = eam._candidates(None, "http://local1::OVERRIDE")
+    assert cands[0] == {"base": "http://local1", "model": "OVERRIDE", "headers": None,
                         "source": "override"}
     assert any(c["source"] == "local" and c["base"] == "http://local1" for c in cands)
 

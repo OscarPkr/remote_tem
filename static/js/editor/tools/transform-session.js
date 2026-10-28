@@ -241,11 +241,13 @@ export function createTransformSession({
     }
     if (state.transformPopup) {
       try {
+        state.transformPopup.closest('.ge-controls')?.classList.remove('ge-transform-active');
         state.transformPopup.innerHTML = '';
         state.transformPopup.style.display = 'none';
       } catch {}
       state.transformPopup = null;
     }
+    document.querySelectorAll('.ge-controls.ge-transform-active').forEach(c => c.classList.remove('ge-transform-active'));
   }
 
   let mobileBoundsHandler = null;
@@ -285,6 +287,11 @@ export function createTransformSession({
     // bar) instead of a floating popup over the canvas.
     const pop = document.getElementById('ge-transform-section');
     if (!pop) return;
+    const parentControls = pop.closest('.ge-controls');
+    if (parentControls) {
+      parentControls.classList.add('ge-transform-active');
+      parentControls.classList.remove('dismissed');
+    }
     pop.innerHTML = `<div class="ge-transform-popup">${transformPopupHTML()}</div>`;
     const title = pop.querySelector('.ge-adj-title');
     if (title && state.transformTarget === 'selection') title.textContent = 'Transform Selection';

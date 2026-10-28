@@ -20,8 +20,9 @@ def test_editor_paste_owns_clipboard_images_while_editor_open():
     """
     src = SRC.read_text(encoding="utf-8")
     assert "wireClipboardAndDrop" in src
-    # The bail-out must be scoped to targets inside the editor.
-    assert "const insideEditor = target && container && container.contains(target);" in src
+    # The bail-out must be scoped to targets inside the editor, and must not
+    # throw for a paste whose target is not a Node (e.g. dispatched at window).
+    assert "const insideEditor = target instanceof Node && !!container && container.contains(target);" in src
     assert (
         "if (insideEditor && (target.isContentEditable || "
         "target.closest?.('input, textarea, select'))) return;"

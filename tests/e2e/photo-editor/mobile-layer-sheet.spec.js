@@ -121,6 +121,10 @@ test('mobile touch mask editing supports undo and persists through reload', asyn
   const painted = await editorState(page);
   const paintedLayer = painted.layers.find(layer => layer.masks.length);
   expect(paintedLayer.masks[0].pixelHash).not.toBe(before);
+  // History controls live in the layers header, which is hidden while the
+  // sheet is minimized for painting. Reopen it as a phone user would.
+  await page.locator('.ge-layers-grab').click();
+  await expect(page.locator('.ge-right-panel')).not.toHaveClass(/minimized/);
   await page.locator('#ge-undo').click();
   expect((await editorState(page)).layers.find(layer => layer.masks.length).masks[0].pixelHash)
     .toBe(before);
@@ -207,6 +211,8 @@ test('mobile touch moves an unlinked layer mask without moving its layer', async
   expect(movedLayer.offset).toEqual(beforeLayer.offset);
   expect(movedLayer.masks[0].offset.x).not.toBe(beforeLayer.masks[0].offset.x);
   expect(movedLayer.masks[0].offset.y).not.toBe(beforeLayer.masks[0].offset.y);
+  await page.locator('.ge-layers-grab').click();
+  await expect(page.locator('.ge-right-panel')).not.toHaveClass(/minimized/);
   await page.locator('#ge-undo').click();
   expect((await editorState(page)).layers.find(layer => layer.id === layerId).masks[0].offset)
     .toEqual(beforeLayer.masks[0].offset);

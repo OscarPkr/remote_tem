@@ -102,23 +102,12 @@ def test_bucket_tool_is_registered_and_wired():
     assert "bucketTolerance: 32" in state
 
 
-def test_bucket_rasterizes_a_pixel_layer_in_one_click():
-    # A text/shape/placed layer used to bounce the user through a rasterize
-    # dialog that could then sit behind the canvas, so the bucket looked broken.
-    # Now the layer is rasterized silently (undoable) and filled in one click.
+def test_paint_tools_require_confirmation_before_rasterizing():
     editor = (ROOT / "static/js/galleryEditor.js").read_text()
-    assert "function _rasterizeLayerNow(layer) {" in editor
+    assert "async function _confirmRasterizeLayer(layer) {" in editor
     assert '_saveState(`Rasterize "${layer.name}"`);' in editor
-    assert "if (!_rasterizeLayerNow(layer)) { void _offerRasterizeForTool(); return; }" in editor
-    assert "if (!_pixelPaintTools.has(toolId)) void _offerRasterizeForTool(toolId);" in editor
-
-
-def test_all_paint_tools_rasterize_silently_instead_of_prompting():
-    # Clone/heal/brush/etc. hit the same rasterize prompt on text/shape/placed
-    # layers, so every paint tool now rasterizes silently and continues.
-    editor = (ROOT / "static/js/galleryEditor.js").read_text()
-    assert "// fall through — `layer` is a pixel layer now, so the tool runs below." in editor
     assert "if (_pixelPaintTools.has(state.tool) && !_getActiveMaskLayer() && !state.quickMaskActive &&" in editor
+    assert "void _confirmRasterizeLayer(layer);" in editor
 
 
 def test_smudge_and_dodge_icons_are_distinct():

@@ -10,6 +10,16 @@
  * the Window > Workspace submenu (wire-extra-menus.js).
  */
 export function wireSubmenuToggles(menu) {
+  menu.addEventListener('mouseover', (e) => {
+    if (e.target.closest('.ge-menu-parent, .ge-submenu')) {
+      menu.classList.add('ge-flyout-open');
+    }
+  });
+  menu.addEventListener('mouseleave', () => {
+    if (!menu.querySelector('.ge-menu-parent.open')) {
+      menu.classList.remove('ge-flyout-open');
+    }
+  });
   menu.addEventListener('click', (e) => {
     const parent = e.target.closest('.ge-menu-parent');
     if (!parent) return;

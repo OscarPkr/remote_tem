@@ -106,12 +106,15 @@ test('transform selection moves, scales, rotates, cancels, and preserves layer p
   await page.waitForTimeout(250);
   await page.locator('#ge-selection-menu-btn').click();
   await page.locator('[data-selection-action="transform"]').click();
+  await expect(page.locator('#ge-transform-section')).toBeVisible();
   const mobileSection = await page.locator('#ge-transform-section').boundingBox();
   expect(mobileSection.x).toBeGreaterThanOrEqual(0);
   expect(mobileSection.y).toBeGreaterThanOrEqual(0);
   expect(mobileSection.x + mobileSection.width).toBeLessThanOrEqual(390);
   expect(mobileSection.y + mobileSection.height).toBeLessThanOrEqual(844);
   await page.locator('#ge-transform-cancel-btn').click();
+  await expect.poll(() => page.evaluate(async () => (await import('/static/js/editor/state.js')).state.transformActive)).toBe(false);
+  expect((await editorState(page)).selection.pixelHash).toBe(original.selection.pixelHash);
 });
 
 test('named selections support reselect, load, delete, and server-draft reopen', async ({ page }) => {

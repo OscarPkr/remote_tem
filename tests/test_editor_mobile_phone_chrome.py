@@ -19,8 +19,11 @@ def test_phone_menu_bar_compaction_rules_present():
     assert ".ge-topbar-left .ge-stacked-btn {" in CSS
     assert "font-size: 11px;" in CSS
     assert "padding: 0 6px !important;" in CSS
-    assert ".ge-topbar.ge-topbar-compact #ge-draft-status {" in CSS
-    assert "display: none;" in CSS
+    # Compaction drops the Save action label only. The draft status is the
+    # button's role="status" live region (its icon is aria-hidden), so it must
+    # stay rendered; interaction-contract.spec.js checks it at 390px.
+    assert ".ge-topbar.ge-topbar-compact #ge-save-menu-btn .ge-save-action-label { display: none !important; }" in CSS
+    assert not re.search(r"ge-topbar-compact\s+#ge-draft-status\s*\{[^}]*display:\s*none", CSS)
 
 
 def test_sw_cache_name_is_version_agnostic_pattern():

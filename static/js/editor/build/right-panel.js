@@ -181,7 +181,7 @@ export function buildRightPanel({ controlsHTML, layerPanelHTML, extraPanels = []
   // entries in a compact `<select>` overlay reachable from a "Panels"
   // button in the layers header, without touching the peek/expand model.
   let mobilePanels = null;
-  if (!useDock && Array.isArray(extraPanels) && extraPanels.length) {
+  if (Array.isArray(extraPanels) && extraPanels.length) {
     const mDock = buildDock({
       entries: extraPanels,
       persistKey: 'ge-dock-active',
@@ -218,7 +218,9 @@ export function buildRightPanel({ controlsHTML, layerPanelHTML, extraPanels = []
         overlay.hidden = !overlay.hidden;
       });
       hdr.appendChild(panelsBtn);
+      if (useDock) panelsBtn.style.display = 'none';
     }
+    if (useDock) overlay.style.display = 'none';
     mobilePanels = overlay;
   }
 
@@ -226,7 +228,7 @@ export function buildRightPanel({ controlsHTML, layerPanelHTML, extraPanels = []
   // The panels are only re-parented, so every existing selector and
   // listener keeps working; switching tabs just toggles `hidden`.
   let dock = null;
-  if (useDock) {    rightPanel.classList.add('ge-right-panel--dock');
+  if (Array.isArray(extraPanels) && extraPanels.length) {
     dock = buildDock({
       entries: [
         ...(Array.isArray(extraPanels) ? extraPanels : []),
@@ -239,11 +241,12 @@ export function buildRightPanel({ controlsHTML, layerPanelHTML, extraPanels = []
       onCloseGroup,
     });
     rightPanel.appendChild(dock.dock);
-    // Layers stays pinned below the dock so the layer list is always
-    // visible while editing (Photoshop-style), regardless of the active
-    // dock tab. Only the tool options + studio panels live in tabs.
-    rightPanel.appendChild(layerPanel);
+    if (!useDock) dock.dock.style.display = 'none';
   }
+  if (useDock) {
+    rightPanel.classList.add('ge-right-panel--dock');
+  }
+  rightPanel.appendChild(layerPanel);
 
   // Horizontal drag handle on the LEFT edge of the right panel — drag
   // left to widen, right to narrow. Persists chosen width in
@@ -286,5 +289,5 @@ export function buildRightPanel({ controlsHTML, layerPanelHTML, extraPanels = []
     } catch {}
   });
 
-  return { rightPanel, controls, layerPanel, panelResize, dock };
+  return { rightPanel, controls, layerPanel, panelResize, dock, mobilePanels };
 }

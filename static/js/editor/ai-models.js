@@ -82,10 +82,9 @@ export function resolveQuickEditAgentModel() {
   return { agent, endpoint, label: ((opt && opt.textContent) || '').trim() };
 }
 
-// Quick Edit agent (planner) model options. Kept small + explicit; the local
-// Qwen3.5-9B VL is the default. `value` encodes "<endpoint>::<model>".
+// Quick Edit agent (planner) model options. Kept small + explicit;
+// dynamically populated from /api/editor/agent-models.
 export const QUICK_EDIT_AGENT_OPTIONS = [
-  { value: 'http://100.69.120.65:8097/v1::Qwen/Qwen3.5-9B', label: 'Qwen3.5-9B VL · local' },
   { value: 'default', label: 'Server default (hosted planner)' },
 ];
 
@@ -167,12 +166,29 @@ export function wireAIModelSelectors({ container, apiBase, openCookbookForImg2im
   const aiCommandAgentSelect = document.getElementById('ge-ai-command-agent-model');
   if (aiInpaintSelect) aiInpaintSelect.addEventListener('change', () => updateFooterEditModel());
   if (aiCommandSelect) aiCommandSelect.addEventListener('change', () => updateFooterEditModel());
-  // The Quick Edit agent (planner) picker is static for now (local VL default,
-  // server default option); restore/save its choice from localStorage.
-  const populateAgentSelect = () => {
+  // The Quick Edit agent (planner) picker: dynamically populates from
+  // /api/editor/agent-models; restore/save choice from localStorage.
+  const populateAgentSelect = async () => {
     if (!aiCommandAgentSelect) return;
+    const prevVal = aiCommandAgentSelect.value;
+    let agentOptions = [...QUICK_EDIT_AGENT_OPTIONS];
+    try {
+      const res = await fetch(`${apiBase}/api/editor/agent-models`);
+      if (res.ok) {
+        const data = await res.json();
+        const serverModels = data.models || [];
+        for (const m of serverModels) {
+          const optVal = `${m.source === 'local' ? 'local' : (m.endpoint_id ? String(m.endpoint_id) : (m.base_url || ''))}::${m.id}`;
+          const label = m.label || m.id;
+          if (!agentOptions.some(o => o.value === optVal)) {
+            agentOptions.push({ value: optVal, label });
+          }
+        }
+      }
+    } catch (_) {}
+
     aiCommandAgentSelect.innerHTML = '';
-    for (const opt of QUICK_EDIT_AGENT_OPTIONS) {
+    for (const opt of agentOptions) {
       const el = document.createElement('option');
       el.value = opt.value;
       el.textContent = opt.label;
@@ -182,6 +198,8 @@ export function wireAIModelSelectors({ container, apiBase, openCookbookForImg2im
       const saved = localStorage.getItem('ge-ai-command-agent-model');
       if (saved && [...aiCommandAgentSelect.options].some(o => o.value === saved)) {
         aiCommandAgentSelect.value = saved;
+      } else if (prevVal && [...aiCommandAgentSelect.options].some(o => o.value === prevVal)) {
+        aiCommandAgentSelect.value = prevVal;
       }
     } catch {}
     if (!aiCommandAgentSelect._agentWired) {
@@ -196,16 +214,17 @@ export function wireAIModelSelectors({ container, apiBase, openCookbookForImg2im
   // select nor the inpaint select nor any per-tool select).
   if (!aiGenSelect && !aiInpaintSelect && !aiCommandSelect && !aiCommandAgentSelect &&
       !document.querySelector('select.ge-tool-model')) return;
-  populateAgentSelect();
+  void populateAgentSelect();
 
   async function loadAIModels(opts = {}) {
     try {
       const selectBaseUrl = opts.selectBaseUrl || '';
       const prevGenValue = aiGenSelect?.value || '';
       const prevInpaintValue = aiInpaintSelect?.value || '';
-      const res = await fetch(`${apiBase}/api/model-endpoints`);
+      const res = await fetch(`${apiBase}/api/editor/image-models`);
       if (!res.ok) throw new Error(`Could not load image models (${res.status})`);
-      const endpoints = await res.json();
+      const data = await res.json();
+      const modelsList = data.models || [];
       if (aiGenSelect) aiGenSelect.innerHTML = '<option value="">None</option>';
       if (aiInpaintSelect) aiInpaintSelect.innerHTML = '<option value="">Auto</option>';
       if (aiCommandSelect) aiCommandSelect.innerHTML = '<option value="">Auto (default)</option>';
@@ -215,59 +234,52 @@ export function wireAIModelSelectors({ container, apiBase, openCookbookForImg2im
       let selectedGen = null;
       let selectedInpaint = null;
       const loaded = [];
-      for (const ep of endpoints) {
-        if (!ep.is_enabled) continue;
-        const hasListedModels = Array.isArray(ep.models) && ep.models.length;
-        const models = hasListedModels ? sortModelIds(ep.models) : [''];
-        const isImageEndpoint = (ep.model_type || '').toLowerCase() === 'image';
-        // Image/inpaint endpoints can be called by URL even when their
-        // /models cache is still empty, so don't strand a freshly served
-        // Cookbook model as "(offline)" in the editor picker.
-        const epUsable = !!ep.online || isImageEndpoint;
-        for (const modelId of models) {
-          const caps = modelCaps(modelId || ep.name, ep.name, ep.model_type);
-          if (!caps.gen && !caps.inpaint) continue;
-          // Encode "<base_url>::<model_id>" so the value carries both pieces.
-          const value = `${ep.base_url}::${modelId}`;
-          const shortModel = modelId ? String(modelId).split('/').pop() : (ep.name || ep.base_url);
-          const epHint = modelId && ep.name && ep.name !== modelId ? ` · ${ep.name}` : '';
-          const label = `${shortModel}${epHint}${epUsable ? '' : ' (offline)'}`;
-          loaded.push({ value, label, gen: caps.gen, inpaint: caps.inpaint, usable: epUsable, endpoint: ep.base_url, model: modelId });
-          if (caps.gen && aiGenSelect) {
+      for (const m of modelsList) {
+        const modelId = m.id || '';
+        const caps = modelCaps(modelId, m.provider, m.kind);
+        const canGen = Boolean(caps.gen || m.kind === 'generate');
+        const canInpaint = Boolean(caps.inpaint || m.kind === 'edit');
+        if (!canGen && !canInpaint) continue;
+
+        // Use opaque endpoint_id if available; fallback to provider name or base_url for admin
+        const endpointKey = m.endpoint_id ? String(m.endpoint_id) : (m.base_url || '');
+        const value = endpointKey ? `${endpointKey}::${modelId}` : modelId;
+        const shortModel = modelId ? String(modelId).split('/').pop() : (m.label || m.provider);
+        const epHint = m.provider && m.provider !== modelId && m.provider !== 'image' ? ` · ${m.provider}` : '';
+        const label = `${shortModel}${epHint}`;
+        const epUsable = true;
+        loaded.push({ value, label, gen: canGen, inpaint: canInpaint, usable: epUsable, endpoint: endpointKey, model: modelId });
+        if (canGen && aiGenSelect) {
+          const opt = document.createElement('option');
+          opt.value = value;
+          opt.textContent = label;
+          opt.disabled = !epUsable;
+          aiGenSelect.appendChild(opt);
+          if (epUsable && !firstGen) firstGen = value;
+          if (epUsable && selectBaseUrl && (endpointKey === selectBaseUrl || m.base_url === selectBaseUrl) && !selectedGen) selectedGen = value;
+        }
+        if (canInpaint && aiInpaintSelect) {
+          const opt = document.createElement('option');
+          opt.value = value;
+          opt.textContent = label;
+          opt.disabled = !epUsable;
+          aiInpaintSelect.appendChild(opt);
+          if (epUsable && selectBaseUrl && (endpointKey === selectBaseUrl || m.base_url === selectBaseUrl) && !selectedInpaint) selectedInpaint = value;
+        }
+        if (canInpaint || canGen) {
+          for (const ts of perToolSelects) {
             const opt = document.createElement('option');
             opt.value = value;
             opt.textContent = label;
             opt.disabled = !epUsable;
-            aiGenSelect.appendChild(opt);
-            if (epUsable && !firstGen) firstGen = value;
-            if (epUsable && selectBaseUrl && ep.base_url === selectBaseUrl && !selectedGen) selectedGen = value;
+            ts.appendChild(opt);
           }
-          if (caps.inpaint && aiInpaintSelect) {
+          if (aiCommandSelect) {
             const opt = document.createElement('option');
             opt.value = value;
             opt.textContent = label;
             opt.disabled = !epUsable;
-            aiInpaintSelect.appendChild(opt);
-            if (epUsable && selectBaseUrl && ep.base_url === selectBaseUrl && !selectedInpaint) selectedInpaint = value;
-          }
-          // Per-tool selectors get every img2img-capable entry. Both
-          // caps.inpaint AND caps.gen models work for harmonize /
-          // style / upscale (anything that can do img2img).
-          if (caps.inpaint || caps.gen) {
-            for (const ts of perToolSelects) {
-              const opt = document.createElement('option');
-              opt.value = value;
-              opt.textContent = label;
-              opt.disabled = !epUsable;
-              ts.appendChild(opt);
-            }
-            if (aiCommandSelect) {
-              const opt = document.createElement('option');
-              opt.value = value;
-              opt.textContent = label;
-              opt.disabled = !epUsable;
-              aiCommandSelect.appendChild(opt);
-            }
+            aiCommandSelect.appendChild(opt);
           }
         }
       }
@@ -374,7 +386,7 @@ export function wireAIModelSelectors({ container, apiBase, openCookbookForImg2im
       wireServe(aiInpaintSelect);
       wireServe(aiCommandSelect);
       document.querySelectorAll('select.ge-tool-model').forEach(wireServe);
-      populateAgentSelect();
+      void populateAgentSelect();
       updateFooterEditModel();
       _aiModelsStatus = { ready: false, models: [], error: String(e?.message || e), at: Date.now() };
       try { window.dispatchEvent(new CustomEvent('ge:ai-models-status')); } catch {}
@@ -387,6 +399,7 @@ export function wireAIModelSelectors({ container, apiBase, openCookbookForImg2im
       return;
     }
     loadAIModels({ selectBaseUrl: e.detail?.baseUrl || '' });
+    void populateAgentSelect();
   };
   window.addEventListener('ge:model-endpoints-updated', onModelEndpointsUpdated);
   // Re-fetch the model list when the user opens the inpaint dropdown,

@@ -77,7 +77,8 @@ export function wireClipboardAndDrop({
     // inside the gallery modal's role="dialog" modal-content, so that would
     // swallow every paste (including the internal Clipboard + Ctrl+V).
     const target = e.target;
-    const insideEditor = target && container && container.contains(target);
+    // A paste dispatched at window has a non-Node target; contains() would throw.
+    const insideEditor = target instanceof Node && !!container && container.contains(target);
     if (insideEditor && (target.isContentEditable || target.closest?.('input, textarea, select'))) return;
 
     const imageItem = Array.from(e.clipboardData?.items || []).find(item => item.type.startsWith('image/'));

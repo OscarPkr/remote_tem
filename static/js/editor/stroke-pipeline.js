@@ -12,15 +12,21 @@ function toolSettings(tool) {
   return { opacity: state.brushOpacity, flow: state.brushFlow, softness: state.brushSoftness };
 }
 
+let _lastColor = null;
+let _lastTransparentColor = null;
 function transparentColor(color) {
+  if (color === _lastColor && _lastTransparentColor) return _lastTransparentColor;
+  _lastColor = color;
   if (color.startsWith('#')) {
     const raw = color.slice(1);
     const expanded = raw.length === 3 ? raw.split('').map(char => char + char).join('') : raw;
     const rgb = [0, 2, 4].map(index => parseInt(expanded.slice(index, index + 2), 16));
-    return `rgba(${rgb.join(',')},0)`;
+    _lastTransparentColor = `rgba(${rgb.join(',')},0)`;
+    return _lastTransparentColor;
   }
   const match = color.match(/rgba?\(([^)]+)\)/);
-  return match ? `rgba(${match[1].split(',').slice(0, 3).join(',')},0)` : 'rgba(0,0,0,0)';
+  _lastTransparentColor = match ? `rgba(${match[1].split(',').slice(0, 3).join(',')},0)` : 'rgba(0,0,0,0)';
+  return _lastTransparentColor;
 }
 
 function circleStamp(ctx, x, y, radius, softness, color, alpha, operation) {

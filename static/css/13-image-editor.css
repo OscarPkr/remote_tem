@@ -111,7 +111,9 @@
   flex: 0 0 auto;
   flex-wrap: nowrap;
   row-gap: 4px;
-  min-height: 40px;
+  height: 44px;
+  min-height: 44px;
+  max-height: 44px;
   padding: 4px 10px;
   box-sizing: border-box;
   border-bottom: 1px solid var(--border);
@@ -206,9 +208,19 @@
      pushed to the right edge. */
   flex: 1 1 auto;
 }
+/* When transform section is active in controls, suppress any underlying tool section
+   so transform controls (Cancel, Apply, X, Y, W, H) have the full width and are not
+   overlapped or crowded by tool options (e.g. marquee invert/erase buttons). */
+.ge-controls.ge-transform-active > div:not(#ge-transform-section),
+.ge-controls:has(#ge-transform-section:not([style*="display:none"]):not([style*="display: none"])) > div:not(#ge-transform-section),
+.ge-controls--in-options:has(#ge-transform-section:not([style*="display:none"]):not([style*="display: none"])) > div:not(#ge-transform-section) {
+  display: none !important;
+}
 /* The Text tool's option set is too wide for the thin strip: let the bar grow
    and wrap onto extra rows instead of clipping the trailing fields. */
 .ge-options-bar.ge-options-tall {
+  height: auto;
+  max-height: none;
   flex-wrap: wrap;
   align-items: center;
   overflow-y: visible;
@@ -254,7 +266,7 @@
    right after the caret instead of leaving a wide gap. */
 .ge-controls--in-options #ge-brush-controls { flex: 0 0 auto; }
 .ge-controls--in-options .ge-control-row {
-  margin: 0;
+  margin: 0 !important;
   flex: 0 0 auto;
   display: flex;
   flex-direction: row;
@@ -488,8 +500,12 @@
 }
 .ge-opt-empty { font-size: 11px; opacity: 0.5; }
 .ge-options-empty .ge-options-sep { display: none; }
+/* An editor opened at phone width keeps its tool controls in their own bottom
+   sheet, so the strip has nothing to show. One opened wider than 700px moves
+   the controls into this strip; hiding it then would strand every tool control
+   (tablet widths of 701-820px, or a window narrowed after opening). */
 @media (max-width: 820px) {
-  .ge-options-bar { display: none; }
+  .ge-options-bar:not(:has(.ge-controls--in-options)) { display: none; }
 }
 
 /* Document tab strip (Photoshop-style) — names the open document and
@@ -4198,7 +4214,11 @@ body.ge-editor-open textarea.ge-direct-text-editor {
   flex-direction: column;
   gap: 2px;
 }
-.ge-save-state-icon { display: none; }
+.ge-save-state-icon { display: inline-block; vertical-align: middle; }
+.ge-save-state-icon[hidden] { display: none !important; }
+.ge-save-state-saved { color: var(--fg); }
+.ge-save-state-dirty { color: var(--accent, var(--red)); }
+.ge-save-state-error { color: var(--danger, #ef4444); }
 .ge-save-label { white-space: nowrap; min-width: 0; }
 /* Save button: glyph on its own row, then the SAVE action label and the
    live draft-status chip share the second row. */
@@ -6341,6 +6361,10 @@ button .spinner-whirlpool {
   box-shadow: 0 0 0 1px rgba(0,0,0,0.72);
   display: none;
   box-sizing: border-box;
+  contain: strict;
+  will-change: transform;
+  top: 0;
+  left: 0;
 }
 /* Pixel brush: a hard square footprint instead of a feathered circle. */
 .ge-brush-cursor.ge-brush-cursor--pixel {
@@ -6622,6 +6646,7 @@ button .spinner-whirlpool {
   }
   .ge-right-panel.expanded {
     transform: translateY(0);
+    z-index: 100;
   }
   /* Minimized: panel slides almost fully off-screen — only a thin
      handle strip remains visible so the user can swipe back up. */
@@ -8134,7 +8159,12 @@ input.ge-ctl-check:focus-visible {
 }
 .ge-setup-btn:hover { background: rgba(255, 255, 255, 0.1); color: #fff; }
 @media (max-width: 700px) {
+  /* Cover the phone viewport rather than the small, scrollable canvas area;
+     the layers sheet otherwise hides the checklist's lower controls. */
+  .ge-preflight { position: fixed; }
   .ge-preflight-card { padding: 13px 14px; }
+  .ge-preflight-foot { flex-wrap: wrap; }
+  .ge-preflight-start { white-space: nowrap; }
 }
 
 /* ── Quick Edit — premium look ────────────────────────────────────────── */
@@ -8296,17 +8326,37 @@ input.ge-ctl-check:focus-visible {
     gap: 6px;
     padding: 3px 6px;
     overflow: hidden;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    flex-wrap: nowrap;
+    white-space: nowrap;
     min-width: 0;
+  }
+  .ge-editor-footer::-webkit-scrollbar {
+    display: none;
   }
   .ge-editor-footer .ge-status-tool,
   .ge-editor-footer .ge-status-model,
   .ge-editor-footer .ge-canvas-size {
     display: none;
   }
-  .ge-footer-history { margin-right: 2px; }
-  .ge-footer-zoom { gap: 3px; min-width: 0; }
+  .ge-footer-history {
+    margin-right: 2px;
+    flex-shrink: 0;
+  }
+  .ge-footer-zoom {
+    gap: 3px;
+    min-width: 0;
+    flex-shrink: 0;
+    margin-left: 0;
+  }
   .ge-footer-zoom > .ge-btn,
   .ge-footer-history > .ge-btn { min-width: 26px; }
+  .ge-setup-btn {
+    flex-shrink: 0;
+  }
   /* Float the footer above the peek/expanded layers sheet so its zoom/setup
      controls stay tappable (position/left/right/bottom set in JS). */
   .ge-editor-footer.ge-footer-floating {
@@ -8317,13 +8367,42 @@ input.ge-ctl-check:focus-visible {
   }
 }
 
-/* Phones: the floating zoom/Setup footer collides with the peek/expanded
-   layers sheet and the Quick Edit card, so remove it entirely on phones.
-   Undo/Redo/History already live in the layers-sheet header, and pinch-zoom
-   replaces the zoom buttons. */
+/* Mobile layers header layout */
 @media (max-width: 700px) {
-  .ge-editor-footer {
-    display: none !important;
+  .ge-layers-header {
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+    flex-wrap: nowrap;
+    white-space: nowrap;
+    gap: 4px;
+    padding-right: 8px;
+  }
+  .ge-layers-header::-webkit-scrollbar {
+    display: none;
+  }
+  .ge-layers-header .ge-footer-zoom {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    flex-shrink: 0;
+  }
+  .ge-layers-header .ge-footer-zoom > .ge-btn,
+  .ge-layers-header .ge-footer-history > .ge-btn {
+    min-width: 28px;
+    min-height: 28px;
+  }
+  .ge-layers-header .ge-setup-btn {
+    flex-shrink: 0;
+    min-height: 28px;
+    padding: 3px 8px;
+    font-size: 11px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: color-mix(in srgb, var(--panel) 85%, var(--fg) 15%);
+    color: var(--fg);
+    cursor: pointer;
   }
   /* The Quick Edit card lifts over the layers sheet / keyboard; keep it above
      every other editor asset (sheet headers, tool rail, popups) while lifted. */
@@ -8579,6 +8658,7 @@ body.ge-editor-open .toast.toast-transform-hint {
   /* Keep the floating editor footer from stacking on the Quick Edit card. The
      card owns the bottom of the canvas while it is open, so the footer (zoom /
      Setup / AI settings) hides until it closes. */
+  body.ge-qe-open .ge-editor-footer.ge-footer-floating,
   body:has(.ge-ai-command:not(.ge-ai-command-collapsed)) .ge-editor-footer.ge-footer-floating {
     display: none;
   }
@@ -8657,15 +8737,13 @@ body.ge-editor-open .toast.toast-transform-hint {
   }
 }
 
-/* Phone menu bar: tighten the Photoshop menus and keep the Save control
-   icon-only so the twelve menus + Import + Save are not crowded. */
+/* Phone menu bar: tighten the Photoshop menus. The compact topbar already
+   drops the Save action label; the draft status stays visible because it is
+   the save button's only announced (role="status") save state. */
 @media (max-width: 700px) {
   .ge-topbar-left .ge-stacked-btn {
     font-size: 11px;
     padding: 0 6px !important;
-  }
-  .ge-topbar.ge-topbar-compact #ge-draft-status {
-    display: none;
   }
 }
 
@@ -9675,12 +9753,15 @@ body.ge-editor-open .tour-hint {
 }
 /* The dropdowns clip overflow to draw the custom scroll thumb; release the
    clip while a flyout is open/hovered so it can extend past the menu edge. */
+.ge-filter-menu.ge-flyout-open,
 .ge-filter-menu:has(.ge-menu-parent.open),
 .ge-filter-menu:has(.ge-menu-parent:hover),
 .ge-filter-menu:has(.ge-submenu:hover),
+.ge-image-menu.ge-flyout-open,
 .ge-image-menu:has(.ge-menu-parent.open),
 .ge-image-menu:has(.ge-menu-parent:hover),
 .ge-image-menu:has(.ge-submenu:hover),
+.ge-selection-menu.ge-flyout-open,
 .ge-selection-menu:has(.ge-menu-parent.open),
 .ge-selection-menu:has(.ge-menu-parent:hover),
 .ge-selection-menu:has(.ge-submenu:hover) {
@@ -9689,6 +9770,7 @@ body.ge-editor-open .tour-hint {
   mask-image: none;
 }
 /* The Window menu's Workspace flyout needs the same clip release. */
+.ge-window-menu.ge-flyout-open,
 .ge-window-menu:has(.ge-menu-parent.open),
 .ge-window-menu:has(.ge-menu-parent:hover),
 .ge-window-menu:has(.ge-submenu:hover) {

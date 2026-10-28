@@ -274,7 +274,11 @@ export function createStudioPanels({
       return;
     }
     shapeLayers.slice().reverse().forEach(layer => {
-      const button = el('button', 'ge-channel-row', `<span class="ge-channel-name">${layer.shape.type === 'path' ? 'Path' : layer.shape.type} · ${layer.name || layer.id.slice(0, 6)}</span>`);
+      const button = el('button', 'ge-channel-row');
+      const name = document.createElement('span');
+      name.className = 'ge-channel-name';
+      name.textContent = `${layer.shape.type === 'path' ? 'Path' : layer.shape.type} · ${layer.name || layer.id.slice(0, 6)}`;
+      button.appendChild(name);
       button.type = 'button';
       button.addEventListener('click', () => { onSelectLayer(layer.id); renderPaths(); });
       pathBody.appendChild(button);
