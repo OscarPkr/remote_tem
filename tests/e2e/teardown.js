@@ -1,20 +1,60 @@
 const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 
-module.exports = async () => {
+const repoRoot = path.resolve(__dirname, '..', '..');
+const defaultResultsDir = path.join(repoRoot, 'test-results');
+const defaultReportDir = path.join(repoRoot, 'playwright-report');
+const defaultSanitizerScript = path.join(repoRoot, 'scripts', 'sanitize_trace_artifacts.py');
+
+/**
+ * Confine dynamic paths to explicitly allowed test directories.
+ */
+function validateTestPath(targetPath, allowedBases, label) {
+  if (!targetPath || typeof targetPath !== 'string') return null;
+  const resolved = path.resolve(targetPath);
+  const isAllowed = allowedBases.some((base) => {
+    const resolvedBase = path.resolve(base);
+    return resolved.startsWith(resolvedBase + path.sep) || resolved === resolvedBase;
+  });
+  if (!isAllowed) {
+    throw new Error(`Security rejection: ${label} path "${targetPath}" is outside allowed test directories`);
+  }
+  return resolved;
+}
+
+module.exports = async (options = {}) => {
+  // If options is a Playwright FullConfig object, ignore it and use safe defaults
+  const isPlaywrightConfig = options && (options.configFile || options.rootDir);
+  const testOpts = (!isPlaywrightConfig && typeof options === 'object') ? options : {};
+
+  // Confine cleanup of PHOTO_EDITOR_E2E_DATA_DIR:
+  // Strictly require it to be within an OS temporary directory and match the expected test prefix
   const dataDirectory = process.env.PHOTO_EDITOR_E2E_DATA_DIR;
-  if (dataDirectory) {
+  if (dataDirectory && typeof dataDirectory === 'string') {
     try {
-      fs.rmSync(dataDirectory, { recursive: true, force: true });
+      const resolvedData = path.resolve(dataDirectory);
+      const allowedTmpBases = [os.tmpdir(), '/var/tmp', '/tmp'].map((b) => path.resolve(b));
+      const isTmp = allowedTmpBases.some((base) => resolvedData.startsWith(base + path.sep));
+      const baseName = path.basename(resolvedData);
+      if (isTmp && baseName.startsWith('odysseus-photo-editor-e2e-')) {
+        fs.rmSync(resolvedData, { recursive: true, force: true });
+      }
     } catch (_) {}
   }
 
   // Secure default tracing: never publish trace archives in CI or without explicit opt-in.
   // When traces are not opted-in, purge all archives unconditionally.
   // When local opt-in tracing is active, run the strict fail-closed structured sanitizer.
-  const resultsDir = process.env.ODYSSEUS_TEST_RESULTS_DIR || path.join(__dirname, '..', '..', 'test-results');
-  const reportDir = process.env.ODYSSEUS_TEST_REPORT_DIR || path.join(__dirname, '..', '..', 'playwright-report');
+  const allowedBases = [defaultResultsDir, defaultReportDir, os.tmpdir(), '/var/tmp', '/tmp'];
+  const resultsDir = testOpts.resultsDir
+    ? validateTestPath(testOpts.resultsDir, allowedBases, 'resultsDir')
+    : defaultResultsDir;
+  const reportDir = testOpts.reportDir
+    ? validateTestPath(testOpts.reportDir, allowedBases, 'reportDir')
+    : defaultReportDir;
+
   if (fs.existsSync(reportDir)) {
     try {
       fs.rmSync(reportDir, { recursive: true, force: true });
@@ -65,8 +105,11 @@ module.exports = async () => {
       purgeSensitiveArtifacts(resultsDir);
     } else {
       const python = process.env.ODYSSEUS_TEST_PYTHON || 'python';
-      const sanitizerScript = process.env.ODYSSEUS_TEST_SANITIZER_SCRIPT || path.join(__dirname, '..', '..', 'scripts', 'sanitize_trace_artifacts.py');
-      const timeout = Number(process.env.ODYSSEUS_TEST_SANITIZER_TIMEOUT_MS) || 30_000;
+      const sanitizerScript = testOpts.sanitizerScript
+        ? validateTestPath(testOpts.sanitizerScript, [path.join(repoRoot, 'scripts'), os.tmpdir(), '/var/tmp', '/tmp'], 'sanitizerScript')
+        : defaultSanitizerScript;
+      const rawTimeout = Number(testOpts.timeout) || 30_000;
+      const timeout = Math.max(100, Math.min(rawTimeout, 120_000));
       let sanitizerSucceeded = false;
       try {
         execFileSync(python, [sanitizerScript, resultsDir], {

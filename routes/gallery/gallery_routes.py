@@ -2195,10 +2195,9 @@ def setup_gallery_routes() -> APIRouter:
         ok, reason = check_outbound_url(base, block_private=block_private)
         if not ok:
             # CodeQL #1203: Never expose internal addresses, resolver errors or raw
-            # exception details to clients. Log useful diagnostic server-side without
-            # printing credentials or raw destination URLs, and return a stable generic response.
-            safe_reason = re.sub(r"://([^:@\s]+):([^@\s]+)@", r"://\1:[REDACTED]@", str(reason))
-            logger.warning("edit-progress endpoint rejected: %s", safe_reason)
+            # exception details to clients or logs. Use a stable diagnostic message
+            # without interpolating untrusted exception content or destination strings.
+            logger.warning("edit-progress endpoint rejected: outbound URL policy check failed")
             return {"available": False, "reason": "endpoint URL rejected"}
 
         if not base.endswith("/v1"):

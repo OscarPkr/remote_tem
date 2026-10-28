@@ -230,17 +230,19 @@ def test_edit_progress_blocks_private_ip_when_policy_enabled(mock_provider_liste
 
 
 def test_edit_progress_rejection_does_not_expose_exception_details_or_secrets(mock_provider_listener, caplog):
-    """CodeQL #1203: Outbound URL rejection must never leak exception strings or internal destinations."""
+    """CodeQL #1203: Outbound URL rejection must never leak exception strings, tokens or internal destinations into responses or logs."""
     db = SessionLocal()
     ep_id = "ep-test-sensitive-exception"
     synthetic_secret = "synthetic-resolver-secret-marker-42"
+    synthetic_token = "synthetic-token-xyz-999"
+    synthetic_query_secret = "synthetic-query-key-777"
     internal_host = "cluster-internal-worker.prod.corp"
     internal_ip = "10.128.0.42"
     try:
         ep = ModelEndpoint(
             id=ep_id,
             name="Internal Worker Endpoint",
-            base_url=f"http://user:{synthetic_secret}@{internal_host}:8000",
+            base_url=f"http://user:{synthetic_secret}@{internal_host}:8000?api_key={synthetic_query_secret}",
             model_type="image",
             is_enabled=True,
             owner="alice",
@@ -261,7 +263,7 @@ def test_edit_progress_rejection_does_not_expose_exception_details_or_secrets(mo
 
         synthetic_rejection_reason = (
             f"host does not resolve: [Errno -2] Name or service not known: "
-            f"http://user:{synthetic_secret}@{internal_host} -> {internal_ip}"
+            f"http://custom_user:custom_pass@{internal_host} -> {internal_ip} with token={synthetic_token}"
         )
 
         with patch("routes.gallery.gallery_routes.require_privilege", return_value="alice"):
@@ -277,18 +279,27 @@ def test_edit_progress_rejection_does_not_expose_exception_details_or_secrets(mo
         # 2. No synthetic secrets or internal host details exposed to API client
         resp_str = json.dumps(resp)
         assert synthetic_secret not in resp_str
+        assert synthetic_token not in resp_str
+        assert synthetic_query_secret not in resp_str
         assert internal_host not in resp_str
         assert internal_ip not in resp_str
         assert "Errno" not in resp_str
         assert "resolve" not in resp_str
+        assert "custom_pass" not in resp_str
 
         # 3. No outbound HTTP request occurred
         assert len(TrackingPollHandler.requests_received) == 0
 
-        # 4. Server-side log recorded rejection diagnostic without raw credentials
-        assert any("edit-progress endpoint rejected" in rec.message for rec in caplog.records)
-        for rec in caplog.records:
-            assert synthetic_secret not in rec.message
+        # 4. Server-side log uses a stable message without interpolating untrusted exception or destination strings
+        log_text = " ".join(rec.message for rec in caplog.records)
+        assert "edit-progress endpoint rejected: outbound URL policy check failed" in log_text
+        assert synthetic_secret not in log_text
+        assert synthetic_token not in log_text
+        assert synthetic_query_secret not in log_text
+        assert internal_host not in log_text
+        assert internal_ip not in log_text
+        assert "Errno" not in log_text
+        assert "custom_pass" not in log_text
     finally:
         db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).delete()
         db.commit()
