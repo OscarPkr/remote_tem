@@ -3551,6 +3551,56 @@ def test_every_compactly_offered_preview_tool_has_valid_policy_permitted_call():
         assert decision.allowed, f'{name}: {decision.reason}'
 
 
+def test_photo_editor_tools_require_explicit_turn_family_authorization():
+    # Positive: permitted photo editor workflow with turn authorization
+    for tool, args, prompt in (
+        ('run_editor_command', {'op': 'document.info'}, 'inspect the document'),
+        ('run_editor_command', {'op': 'adjustments.apply', 'params': {'type': 'brightness-contrast'}}, 'make it brighter'),
+        ('ai_edit_image', {'op': 'remove-bg'}, 'remove background'),
+    ):
+        allowed = evaluate_preview_call(
+            tool, args, prompt,
+            turn_authorized_families={'photo_editor'},
+        )
+        assert allowed.allowed, f"Expected {tool} to be allowed with photo_editor turn authority: {allowed.reason}"
+
+    # Negative: unauthorized preview (unauthorized family, empty families, or cross-family) fails closed
+    for unauth_families in (frozenset(), {'notes'}, {'email'}, {'calendar'}, {'search_browser'}):
+        denied_info = evaluate_preview_call(
+            'run_editor_command', {'op': 'document.info'}, 'inspect the document',
+            turn_authorized_families=unauth_families,
+        )
+        assert not denied_info.allowed
+        assert denied_info.reason == 'write_family_not_authorized'
+
+        denied_edit = evaluate_preview_call(
+            'run_editor_command', {'op': 'adjustments.apply', 'params': {'type': 'brightness-contrast'}},
+            'make it brighter',
+            turn_authorized_families=unauth_families,
+        )
+        assert not denied_edit.allowed
+        assert denied_edit.reason == 'write_family_not_authorized'
+
+        denied_ai = evaluate_preview_call(
+            'ai_edit_image', {'op': 'remove-bg'}, 'remove background',
+            turn_authorized_families=unauth_families,
+        )
+        assert not denied_ai.allowed
+        assert denied_ai.reason == 'write_family_not_authorized'
+
+    for prompt in ('inspect the document', "don't edit the image"):
+        denied = evaluate_preview_call(
+            'run_editor_command', {'op': 'adjustments.apply', 'params': {'type': 'brightness-contrast'}},
+            prompt, turn_authorized_families={'photo_editor'},
+        )
+        assert not denied.allowed
+        assert denied.reason == 'write_family_not_authorized'
+
+    denied = evaluate_preview_call('manage_notes', {'action': 'add', 'content': 'x'},
+                                   'make it brighter', turn_authorized_families={'photo_editor'})
+    assert not denied.allowed
+
+
 def test_full_compact_inventory_contains_pipeline_for_exact_session_contract():
     from src.turn_contract import resolve_full_inventory_contract
 

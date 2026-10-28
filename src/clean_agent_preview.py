@@ -3881,6 +3881,9 @@ def evaluate_preview_call(name, args, user_text='', *, allow_execute_code=False,
                 or bare in BROKERED_JOB_TOOLS
                 or (contract_required and bare in {'edit_image', 'generate_image'})
                 or (contract_required and bare == 'create_document' and standalone_code_request(user_text))
+                # The editor command is conservatively classified as a write;
+                # document.info is a read even when the user requested no edit.
+                or (bare == 'run_editor_command' and args.get('op') == 'document.info')
             )
         )
         if family not in authorized and not contextual_revision and not contract_scoped_mutation and not fixture_delete and not offered_private_action:

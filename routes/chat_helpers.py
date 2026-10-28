@@ -569,6 +569,16 @@ async def auto_name_session(session_manager, sess):
         if not first_msg:
             return
 
+        from src.owner_identity import is_request_sentinel_owner
+        owner = getattr(sess, "owner", None)
+        invalid_owner = (
+            not isinstance(owner, str) or not owner.strip()
+            or owner != owner.strip() or is_request_sentinel_owner(owner)
+        )
+        if invalid_owner:
+            session_manager.update_session_name(sess.id, fallback_session_title(first_msg))
+            return
+
         endpoint_url = str(getattr(sess, "endpoint_url", "") or "")
         model_name = str(getattr(sess, "model", "") or "")
 
