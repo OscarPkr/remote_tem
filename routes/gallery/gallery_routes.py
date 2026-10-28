@@ -2194,7 +2194,12 @@ def setup_gallery_routes() -> APIRouter:
         block_private = os.getenv("IMAGE_BLOCK_PRIVATE_IPS", "false").lower() == "true"
         ok, reason = check_outbound_url(base, block_private=block_private)
         if not ok:
-            return {"available": False, "reason": f"endpoint URL rejected: {reason}"}
+            # CodeQL #1203: Never expose internal addresses, resolver errors or raw
+            # exception details to clients. Log useful diagnostic server-side without
+            # printing credentials or raw destination URLs, and return a stable generic response.
+            safe_reason = re.sub(r"://([^:@\s]+):([^@\s]+)@", r"://\1:[REDACTED]@", str(reason))
+            logger.warning("edit-progress endpoint rejected: %s", safe_reason)
+            return {"available": False, "reason": "endpoint URL rejected"}
 
         if not base.endswith("/v1"):
             base += "/v1"

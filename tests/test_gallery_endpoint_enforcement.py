@@ -220,9 +220,119 @@ def test_edit_progress_blocks_private_ip_when_policy_enabled(mock_provider_liste
 
         assert isinstance(resp, dict)
         assert resp["available"] is False
-        assert "rejected" in str(resp.get("reason"))
+        assert resp.get("reason") == "endpoint URL rejected"
         # Zero outbound polling because private IP was blocked by policy!
         assert len(TrackingPollHandler.requests_received) == 0
+    finally:
+        db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).delete()
+        db.commit()
+        db.close()
+
+
+def test_edit_progress_rejection_does_not_expose_exception_details_or_secrets(mock_provider_listener, caplog):
+    """CodeQL #1203: Outbound URL rejection must never leak exception strings or internal destinations."""
+    db = SessionLocal()
+    ep_id = "ep-test-sensitive-exception"
+    synthetic_secret = "synthetic-resolver-secret-marker-42"
+    internal_host = "cluster-internal-worker.prod.corp"
+    internal_ip = "10.128.0.42"
+    try:
+        ep = ModelEndpoint(
+            id=ep_id,
+            name="Internal Worker Endpoint",
+            base_url=f"http://user:{synthetic_secret}@{internal_host}:8000",
+            model_type="image",
+            is_enabled=True,
+            owner="alice",
+            cached_models=json.dumps(["sd-v1"]),
+        )
+        db.merge(ep)
+        db.commit()
+
+        router = setup_gallery_routes()
+        route = next(r for r in router.routes if r.path == "/api/image/edit-progress")
+
+        req = create_gallery_request(
+            "GET",
+            "/api/image/edit-progress",
+            query_params={"request_id": "req-safe-test", "endpoint_id": ep_id},
+            user="alice",
+        )
+
+        synthetic_rejection_reason = (
+            f"host does not resolve: [Errno -2] Name or service not known: "
+            f"http://user:{synthetic_secret}@{internal_host} -> {internal_ip}"
+        )
+
+        with patch("routes.gallery.gallery_routes.require_privilege", return_value="alice"):
+            with patch("src.url_safety.check_outbound_url", return_value=(False, synthetic_rejection_reason)):
+                TrackingPollHandler.requests_received = []
+                resp = asyncio.run(route.endpoint(req))
+
+        # 1. Operation is rejected with a stable generic reason
+        assert isinstance(resp, dict)
+        assert resp["available"] is False
+        assert resp.get("reason") == "endpoint URL rejected"
+
+        # 2. No synthetic secrets or internal host details exposed to API client
+        resp_str = json.dumps(resp)
+        assert synthetic_secret not in resp_str
+        assert internal_host not in resp_str
+        assert internal_ip not in resp_str
+        assert "Errno" not in resp_str
+        assert "resolve" not in resp_str
+
+        # 3. No outbound HTTP request occurred
+        assert len(TrackingPollHandler.requests_received) == 0
+
+        # 4. Server-side log recorded rejection diagnostic without raw credentials
+        assert any("edit-progress endpoint rejected" in rec.message for rec in caplog.records)
+        for rec in caplog.records:
+            assert synthetic_secret not in rec.message
+    finally:
+        db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).delete()
+        db.commit()
+        db.close()
+
+
+def test_edit_progress_valid_endpoint_succeeds(mock_provider_listener, monkeypatch):
+    """Valid authorized endpoint allows progress polling and returns provider payload."""
+    monkeypatch.setenv("IMAGE_BLOCK_PRIVATE_IPS", "false")
+    db = SessionLocal()
+    ep_id = "ep-test-valid-progress"
+    try:
+        ep = ModelEndpoint(
+            id=ep_id,
+            name="Valid SD Provider",
+            base_url=mock_provider_listener,
+            model_type="image",
+            is_enabled=True,
+            owner="alice",
+            cached_models=json.dumps(["sd-v1"]),
+        )
+        db.merge(ep)
+        db.commit()
+
+        router = setup_gallery_routes()
+        route = next(r for r in router.routes if r.path == "/api/image/edit-progress")
+
+        req = create_gallery_request(
+            "GET",
+            "/api/image/edit-progress",
+            query_params={"request_id": "valid-progress-req", "endpoint_id": ep_id},
+            user="alice",
+        )
+
+        with patch("routes.gallery.gallery_routes.require_privilege", return_value="alice"):
+            TrackingPollHandler.requests_received = []
+            resp = asyncio.run(route.endpoint(req))
+
+        assert isinstance(resp, dict)
+        assert resp["available"] is True
+        assert resp.get("progress") == 50
+        # Exactly one outbound request to the provider progress route
+        assert len(TrackingPollHandler.requests_received) == 1
+        assert TrackingPollHandler.requests_received[0].endswith("/images/progress/valid-progress-req")
     finally:
         db.query(ModelEndpoint).filter(ModelEndpoint.id == ep_id).delete()
         db.commit()

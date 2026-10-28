@@ -1,6 +1,6 @@
 const fs = require('node:fs');
 const path = require('node:path');
-const { execSync } = require('node:child_process');
+const { execFileSync } = require('node:child_process');
 
 module.exports = async () => {
   const dataDirectory = process.env.PHOTO_EDITOR_E2E_DATA_DIR;
@@ -13,8 +13,8 @@ module.exports = async () => {
   // Secure default tracing: never publish trace archives in CI or without explicit opt-in.
   // When traces are not opted-in, purge all archives unconditionally.
   // When local opt-in tracing is active, run the strict fail-closed structured sanitizer.
-  const resultsDir = path.join(__dirname, '..', '..', 'test-results');
-  const reportDir = path.join(__dirname, '..', '..', 'playwright-report');
+  const resultsDir = process.env.ODYSSEUS_TEST_RESULTS_DIR || path.join(__dirname, '..', '..', 'test-results');
+  const reportDir = process.env.ODYSSEUS_TEST_REPORT_DIR || path.join(__dirname, '..', '..', 'playwright-report');
   if (fs.existsSync(reportDir)) {
     try {
       fs.rmSync(reportDir, { recursive: true, force: true });
@@ -65,12 +65,14 @@ module.exports = async () => {
       purgeSensitiveArtifacts(resultsDir);
     } else {
       const python = process.env.ODYSSEUS_TEST_PYTHON || 'python';
-      const sanitizerScript = path.join(__dirname, '..', '..', 'scripts', 'sanitize_trace_artifacts.py');
+      const sanitizerScript = process.env.ODYSSEUS_TEST_SANITIZER_SCRIPT || path.join(__dirname, '..', '..', 'scripts', 'sanitize_trace_artifacts.py');
+      const timeout = Number(process.env.ODYSSEUS_TEST_SANITIZER_TIMEOUT_MS) || 30_000;
       let sanitizerSucceeded = false;
       try {
-        execSync(`${JSON.stringify(python)} ${JSON.stringify(sanitizerScript)} ${JSON.stringify(resultsDir)}`, {
+        execFileSync(python, [sanitizerScript, resultsDir], {
           stdio: 'ignore',
-          timeout: 30_000,
+          timeout,
+          shell: false,
         });
         sanitizerSucceeded = true;
       } catch (_) {
